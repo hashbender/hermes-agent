@@ -1,0 +1,20 @@
+{
+  "upstream": "NousResearch/hermes-agent",
+  "fork": "hashbender/hermes-agent",
+  "since_pr": 55884,
+  "runner_large": "tenki-standard-large-plus-16c-32g",
+  "runner_medium": "tenki-standard-medium-4c-8g",
+  "pr_ci_bases": [
+    "main"
+  ],
+  "decouple": {
+    "subs": [
+      [
+        "    if: needs.detect.outputs.python == 'true'\n    uses: ./.github/workflows/contributor-check.yml",
+        "    if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.python == 'true'\n    uses: ./.github/workflows/contributor-check.yml"
+      ]
+    ],
+    "gate_jobs": [],
+    "accept_skipped": true
+  }
+}
