@@ -36,6 +36,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # Anthropic
     ("anthropic/claude-opus-4.8",              ""),
     ("anthropic/claude-opus-4.8-fast",         "2x price, higher output speed"),
+    ("anthropic/claude-sonnet-5",              ""),
     ("anthropic/claude-sonnet-4.6",            ""),
     ("anthropic/claude-haiku-4.5",             ""),
     # OpenAI
@@ -177,6 +178,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "nous": [
         # Anthropic
         "anthropic/claude-opus-4.8",
+        "anthropic/claude-sonnet-5",
         "anthropic/claude-sonnet-4.6",
         "anthropic/claude-haiku-4.5",
         # OpenAI
@@ -251,6 +253,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-4.1",
         "gpt-4o",
         "gpt-4o-mini",
+        "claude-sonnet-5",
         "claude-sonnet-4.6",
         "claude-sonnet-4",
         "claude-sonnet-4.5",
@@ -343,6 +346,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
+        "claude-sonnet-5",
         "claude-sonnet-4-6",
         "claude-opus-4-5-20251101",
         "claude-sonnet-4-5-20250929",
@@ -1355,7 +1359,15 @@ def fetch_openrouter_models(
         remote = get_curated_openrouter_models()
     except Exception:
         remote = None
-    fallback = list(remote) if remote else list(OPENROUTER_MODELS)
+    remote_list = list(remote) if remote else []
+    fallback = list(remote_list)
+    seen_fallback = {mid for mid, _ in fallback}
+    for mid, desc in OPENROUTER_MODELS:
+        if mid not in seen_fallback:
+            fallback.append((mid, desc))
+            seen_fallback.add(mid)
+    if not fallback:
+        fallback = list(OPENROUTER_MODELS)
     preferred_ids = [mid for mid, _ in fallback]
 
     try:
@@ -1382,9 +1394,14 @@ def fetch_openrouter_models(
         live_by_id[mid] = item
 
     curated: list[tuple[str, str]] = []
+    fallback_desc_by_id = {mid: desc for mid, desc in fallback}
     for preferred_id in preferred_ids:
         live_item = live_by_id.get(preferred_id)
         if live_item is None:
+            # OpenRouter's live /models feed can lag newly-routed models even
+            # after the route is usable. Keep curated manifest entries visible
+            # rather than letting a stale live catalog hide them.
+            curated.append((preferred_id, fallback_desc_by_id.get(preferred_id, "")))
             continue
         # Hide models that don't advertise tool-calling support — hermes-agent
         # requires it and surfacing them leads to immediate runtime failures
@@ -1421,9 +1438,13 @@ def get_curated_nous_model_ids() -> list[str]:
         remote = get_curated_nous_models()
     except Exception:
         remote = None
-    if remote:
-        return list(remote)
-    return list(_PROVIDER_MODELS.get("nous", []))
+    merged = list(remote) if remote else []
+    seen = {mid.lower() for mid in merged}
+    for mid in _PROVIDER_MODELS.get("nous", []):
+        if mid.lower() not in seen:
+            merged.append(mid)
+            seen.add(mid.lower())
+    return merged
 
 
 # ---------------------------------------------------------------------------
