@@ -34,7 +34,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     outputs:
       python: ${{ steps.classify.outputs.python }}
       frontend: ${{ steps.classify.outputs.frontend }}
@@ -150,7 +150,7 @@ jobs:
       # we don't require docker to pass rn because it's so slow lol
       # - docker
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - name: Evaluate job results
         env:
@@ -176,7 +176,7 @@ jobs:
     name: CI timing report
     needs: [all-checks-pass, docker]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
