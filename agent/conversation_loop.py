@@ -792,6 +792,10 @@ def run_conversation(
             # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
             if "finish_reason" in api_msg:
                 api_msg.pop("finish_reason")
+            # Remove timestamp - internal SessionDB/display metadata, not part of
+            # the OpenAI Chat Completions wire format. Strict OpenAI-compatible
+            # gateways (e.g. OpenCode Go + Kimi) reject unknown message fields.
+            api_msg.pop("timestamp", None)
             # Strip internal thinking-prefill marker
             api_msg.pop("_thinking_prefill", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
