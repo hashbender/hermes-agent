@@ -2469,6 +2469,53 @@ async def get_learning_graph(profile: Optional[str] = None):
         raise HTTPException(status_code=500, detail="Failed to build learning graph")
 
 
+class LearningNodeRef(BaseModel):
+    id: str
+    profile: Optional[str] = None
+
+
+class LearningNodeEdit(BaseModel):
+    id: str
+    content: str
+    profile: Optional[str] = None
+
+
+@app.get("/api/learning/node")
+async def get_learning_node(id: str, profile: Optional[str] = None):
+    """Current content of a journey node (skill SKILL.md or memory chunk), for an edit prefill."""
+    from agent.learning_mutations import node_detail
+
+    with _profile_scope(profile):
+        res = node_detail(id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=res.get("message", "not found"))
+    return res
+
+
+@app.delete("/api/learning/node")
+async def delete_learning_node(body: LearningNodeRef):
+    """Delete a journey node — skills are archived (restorable), memories removed."""
+    from agent.learning_mutations import delete_node
+
+    with _profile_scope(body.profile):
+        res = delete_node(body.id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("message", "delete failed"))
+    return res
+
+
+@app.put("/api/learning/node")
+async def update_learning_node(body: LearningNodeEdit):
+    """Rewrite a journey node's content (SKILL.md or memory chunk)."""
+    from agent.learning_mutations import edit_node
+
+    with _profile_scope(body.profile):
+        res = edit_node(body.id, body.content)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("message", "edit failed"))
+    return res
+
+
 def _safe_call(mod, fn_name: str, default):
     try:
         fn = getattr(mod, fn_name, None)
@@ -12790,13 +12837,21 @@ def mount_spa(application: FastAPI):
     and the SPA's runtime ``__HERMES_BASE_PATH__`` honour that prefix
     without rebuilding the bundle.
     """
-    if not WEB_DIST.exists():
+    # `hermes serve` is the headless backend: it must NEVER serve the browser
+    # SPA, even if a dist is lying around from a prior `dashboard`/build. Take
+    # the no-frontend path so only the JSON-RPC/WS/API surface is reachable.
+    _headless = os.environ.get("HERMES_SERVE_HEADLESS") == "1"
+    if _headless or not WEB_DIST.exists():
+        _msg = (
+            "Headless backend (hermes serve): web UI disabled — use "
+            "`hermes dashboard` for the browser UI."
+            if _headless
+            else "Frontend not built. Run: cd web && npm run build"
+        )
+
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
-            return JSONResponse(
-                {"error": "Frontend not built. Run: cd web && npm run build"},
-                status_code=404,
-            )
+            return JSONResponse({"error": _msg}, status_code=404)
         return
 
     _index_path = WEB_DIST / "index.html"
@@ -13951,6 +14006,7 @@ def start_server(
     open_browser: bool = True,
     allow_public: bool = False,
     initial_profile: str = "",
+    headless: bool = False,
 ):
     """Start the web UI server.
 
@@ -13958,6 +14014,10 @@ def start_server(
     URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
     — used when a profile alias (``<profile> dashboard``) routes to the
     machine dashboard.
+
+    ``headless`` is the ``serve`` path: the JSON-RPC/WS backend with no UI
+    build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
+    the banner announces the bind rather than a browser URL.
     """
     import uvicorn
 
@@ -14103,8 +14163,17 @@ def start_server(
             app.state.bound_port = actual_port
 
             _write_dashboard_ready_file(actual_port)
-            print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)
-            print(f"  Hermes Web UI → http://{host}:{actual_port}")
+            # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
+            # plain backend, not a dashboard, so it announces a neutral token;
+            # `dashboard` keeps the legacy one. The desktop matches either.
+            ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
+            print(f"{ready_token} port={actual_port}", flush=True)
+            if headless:
+                # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
+                # advertise a paste-and-connect URL, just announce the bind.
+                print(f"  Hermes backend listening on {host}:{actual_port}")
+            else:
+                print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop

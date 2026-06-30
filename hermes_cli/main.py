@@ -11648,6 +11648,11 @@ def cmd_dashboard(args):
         remaining = _find_stale_dashboard_pids()
         sys.exit(1 if remaining else 0)
 
+    # `serve` is the headless backend: no UI build, no SPA mount, neutral
+    # ready sentinel. Resolved once and threaded through the re-exec, the
+    # build gate, and start_server.
+    _headless_backend = getattr(args, "headless_backend", False)
+
     # ── Unified profile launch routing ────────────────────────────────
     # The dashboard is a MACHINE management surface: it can read/write any
     # profile via the per-request ?profile= scoping. Running one dashboard
@@ -11693,7 +11698,9 @@ def cmd_dashboard(args):
         reexec_argv = [
             sys.executable, "-m", "hermes_cli.main",
             "-p", "default",
-            "dashboard",
+            # Preserve the lean serve path across the re-exec so a named-profile
+            # `serve` doesn't silently rebuild the UI as `dashboard`.
+            "serve" if _headless_backend else "dashboard",
             "--port", str(args.port),
             "--host", args.host,
             "--open-profile", _launch_profile,
@@ -11762,7 +11769,11 @@ def cmd_dashboard(args):
     # backend is the desktop's primary entrypoint and needs the same.
     _sync_bundled_skills_quietly()
 
-    if "HERMES_WEB_DIST" not in os.environ and not getattr(args, "skip_build", False):
+    if _headless_backend:
+        # Don't build the SPA, and tell mount_spa() (read at web_server import
+        # below) to disable it even if a stray dist exists. Set it first.
+        os.environ["HERMES_SERVE_HEADLESS"] = "1"
+    elif "HERMES_WEB_DIST" not in os.environ and not getattr(args, "skip_build", False):
         if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
             sys.exit(1)
     elif getattr(args, "skip_build", False):
@@ -11835,6 +11846,7 @@ def cmd_dashboard(args):
         open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
         initial_profile=getattr(args, "open_profile", "") or "",
+        headless=_headless_backend,
     )
 
 
@@ -11925,6 +11937,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "config", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
@@ -12860,6 +12873,27 @@ def main():
         _register_pets_cli(pets_parser)
     except Exception as _exc:
         logging.getLogger(__name__).debug("pets CLI wiring failed: %s", _exc)
+
+    # =========================================================================
+    # journey command — learned skills + memories over time, in the terminal
+    # =========================================================================
+    journey_parser = subparsers.add_parser(
+        "journey",
+        aliases=["learning", "memory-graph"],
+        help="Timeline of learned skills + memories over time",
+        description=(
+            "A terminal rendition of the desktop Star Map / Memory Graph: a "
+            "timeline bar chart of learned skills and memories over time "
+            "(oldest at top, newest at bottom) plus a playable constellation "
+            "scrubber. Mirrors the TUI `/journey` overlay and the desktop panel."
+        ),
+    )
+    try:
+        from hermes_cli.journey import register_cli as _register_journey_cli
+
+        _register_journey_cli(journey_parser)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("journey CLI wiring failed: %s", _exc)
 
     # =========================================================================
     # memory command  (parser built in hermes_cli/subcommands/memory.py)
