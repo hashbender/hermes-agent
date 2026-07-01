@@ -38,6 +38,7 @@ from tools.tenki_config import (
 logger = logging.getLogger(__name__)
 _SNAPSHOT_STORE = get_hermes_home() / "tenki_snapshots.json"
 _SNAPSHOT_NAMESPACE = "direct"
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _load_snapshots() -> dict:
@@ -83,6 +84,25 @@ def _delete_snapshot(task_id: str, snapshot_id: str | None = None) -> None:
             updated = True
     if updated:
         _save_snapshots(snapshots)
+
+
+def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in forward_env or []:
+        if not isinstance(item, str):
+            logger.warning("Ignoring non-string tenki_forward_env entry: %r", item)
+            continue
+        name = item.strip()
+        if not name:
+            continue
+        if not _ENV_NAME_RE.match(name):
+            logger.warning("Ignoring invalid tenki_forward_env entry: %r", item)
+            continue
+        if name not in seen:
+            normalized.append(name)
+            seen.add(name)
+    return normalized
 
 
 def _safe_name(value: str, *, fallback: str = "default", max_len: int = 48) -> str:
@@ -239,6 +259,7 @@ class TenkiEnvironment(BaseEnvironment):
         idle_timeout: int = 0,
         pause_retention: int = 0,
         sync_hermes_home: bool = False,
+        forward_env: list[str] | None = None,
     ):
         super().__init__(cwd=cwd, timeout=timeout)
 
@@ -280,6 +301,7 @@ class TenkiEnvironment(BaseEnvironment):
         self._max_duration = max_duration
         self._idle_timeout = idle_timeout
         self._pause_retention = pause_retention
+        self._forward_env = _normalize_forward_env_names(forward_env)
         self._remote_home = "/home/tenki"
         if self._persistent:
             self._snapshot_restore_id, self._snapshot_restore_from_legacy_key = (
@@ -363,8 +385,14 @@ class TenkiEnvironment(BaseEnvironment):
         Hermes uses the resolved token to create the parent sandbox. Forward
         the same credential into the sandbox so code running there can create
         child Tenki sandboxes without relying on synced host dotfiles.
+        ``terminal.tenki_forward_env`` is the explicit allowlist for
+        task-specific credentials such as GitHub tokens; the generic
+        ``terminal.env_passthrough`` allowlist is also honored for skill
+        variables that are not protected by Hermes' provider-secret blocklist.
         """
         env: dict[str, str] = {}
+        env.update(self._resolve_forwarded_env(self._forward_env))
+        env.update(self._passthrough_env())
         if self._auth_token:
             env["TENKI_AUTH_TOKEN"] = self._auth_token
             if self._auth_token.startswith("sk-"):
@@ -376,6 +404,37 @@ class TenkiEnvironment(BaseEnvironment):
         if self._project_id:
             env["TENKI_PROJECT_ID"] = self._project_id
         return env
+
+    @staticmethod
+    def _resolve_forwarded_env(keys: list[str] | set[str] | tuple[str, ...]) -> dict[str, str]:
+        if not keys:
+            return {}
+        try:
+            from hermes_cli.config import get_env_value
+        except Exception:
+            get_env_value = None
+
+        env: dict[str, str] = {}
+        for key in keys:
+            value = os.getenv(key)
+            if not value and get_env_value is not None:
+                try:
+                    value = get_env_value(key)
+                except Exception:
+                    value = ""
+            if value:
+                env[key] = value
+        return env
+
+    @staticmethod
+    def _passthrough_env() -> dict[str, str]:
+        try:
+            from tools.env_passthrough import get_all_passthrough
+
+            keys = sorted(get_all_passthrough())
+        except Exception:
+            keys = []
+        return TenkiEnvironment._resolve_forwarded_env(keys)
 
     def _create_client(self):
         if self._client is None:

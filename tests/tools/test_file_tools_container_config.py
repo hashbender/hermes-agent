@@ -37,6 +37,7 @@ def _make_env_config(**overrides):
         "tenki_idle_timeout": 600,
         "tenki_pause_retention": 3600,
         "tenki_sync_hermes_home": True,
+        "tenki_forward_env": ["GITHUB_TOKEN"],
     }
     base.update(overrides)
     return base
@@ -107,6 +108,7 @@ class TestFileToolsContainerConfig:
         assert cc.get("tenki_idle_timeout") == 600
         assert cc.get("tenki_pause_retention") == 3600
         assert cc.get("tenki_sync_hermes_home") is True
+        assert cc.get("tenki_forward_env") == ["GITHUB_TOKEN"]
 
     def test_cwd_only_raw_task_override_reaches_file_environment(self):
         """CWD-only task overrides collapse to default but must keep their cwd."""
@@ -163,3 +165,4 @@ class TestExecuteCodeContainerConfig:
         assert cc["tenki_idle_timeout"] == 600
         assert cc["tenki_pause_retention"] == 3600
         assert cc["tenki_sync_hermes_home"] is True
+        assert cc["tenki_forward_env"] == ["GITHUB_TOKEN"]

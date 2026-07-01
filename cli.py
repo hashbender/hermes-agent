@@ -412,6 +412,7 @@ def load_cli_config() -> Dict[str, Any]:
             "tenki_idle_timeout": 0,
             "tenki_pause_retention": 0,
             "tenki_sync_hermes_home": False,
+            "tenki_forward_env": [],
             "docker_volumes": [],  # host:container volume mounts for Docker backend
             "docker_mount_cwd_to_workspace": False,  # explicit opt-in only; default off for sandbox isolation
         },
@@ -639,6 +640,7 @@ def load_cli_config() -> Dict[str, Any]:
         "tenki_idle_timeout": "TERMINAL_TENKI_IDLE_TIMEOUT",
         "tenki_pause_retention": "TERMINAL_TENKI_PAUSE_RETENTION",
         "tenki_sync_hermes_home": "TERMINAL_TENKI_SYNC_HERMES_HOME",
+        "tenki_forward_env": "TERMINAL_TENKI_FORWARD_ENV",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",

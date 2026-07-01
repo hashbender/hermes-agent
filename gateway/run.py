@@ -1459,6 +1459,7 @@ if _config_path.exists():
                 "tenki_idle_timeout": "TERMINAL_TENKI_IDLE_TIMEOUT",
                 "tenki_pause_retention": "TERMINAL_TENKI_PAUSE_RETENTION",
                 "tenki_sync_hermes_home": "TERMINAL_TENKI_SYNC_HERMES_HOME",
+                "tenki_forward_env": "TERMINAL_TENKI_FORWARD_ENV",
                 "ssh_host": "TERMINAL_SSH_HOST",
                 "ssh_user": "TERMINAL_SSH_USER",
                 "ssh_port": "TERMINAL_SSH_PORT",

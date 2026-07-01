@@ -201,6 +201,16 @@ def _clear_tenki_auth_env(monkeypatch):
     monkeypatch.delenv("TENKI_API_KEY", raising=False)
 
 
+def _clear_env_passthrough_cache():
+    try:
+        import tools.env_passthrough as env_passthrough
+
+        env_passthrough.clear_env_passthrough()
+        env_passthrough._config_passthrough = None
+    except Exception:
+        pass
+
+
 def test_tenki_cli_auth_token_is_normalized_for_sdk_cookie_auth(monkeypatch, tmp_path):
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
@@ -308,6 +318,85 @@ def test_tenki_environment_forwards_api_key_alias_to_sandbox(monkeypatch, tmp_pa
     assert kwargs["env"]["TENKI_AUTH_TOKEN"] == "sk-test-key"
     assert kwargs["env"]["TENKI_API_KEY"] == "sk-test-key"
     env.cleanup()
+
+
+def test_tenki_environment_honors_tenki_forward_env_from_process_env(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    _clear_env_passthrough_cache()
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    monkeypatch.setenv("GH_TOKEN", "gho-process")
+    (tmp_path / "config.yaml").write_text(
+        "auth_token: tok-secret\n",
+        encoding="utf-8",
+    )
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="gh-token", forward_env=["GH_TOKEN"])
+
+    assert _FakeSandboxFactory.created_kwargs[0]["env"]["GH_TOKEN"] == "gho-process"
+    env.execute("echo ok", timeout=5)
+    assert env._sandbox.start_calls[-1][1]["env"]["GH_TOKEN"] == "gho-process"
+    env.cleanup()
+    _clear_env_passthrough_cache()
+
+
+def test_tenki_environment_honors_tenki_forward_env_from_hermes_dotenv(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    _clear_env_passthrough_cache()
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    (tmp_path / ".env").write_text("GITHUB_TOKEN=ghp-dotenv\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        "auth_token: tok-secret\n",
+        encoding="utf-8",
+    )
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="github-token", forward_env=["GITHUB_TOKEN"])
+
+    assert _FakeSandboxFactory.created_kwargs[0]["env"]["GITHUB_TOKEN"] == "ghp-dotenv"
+    env.execute("echo ok", timeout=5)
+    assert env._sandbox.start_calls[-1][1]["env"]["GITHUB_TOKEN"] == "ghp-dotenv"
+    env.cleanup()
+    _clear_env_passthrough_cache()
+
+
+def test_tenki_environment_honors_safe_env_passthrough(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    _clear_env_passthrough_cache()
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    monkeypatch.setenv("CUSTOM_TASK_ENV", "task-value")
+    (tmp_path / "config.yaml").write_text(
+        "auth_token: tok-secret\n"
+        "terminal:\n"
+        "  env_passthrough:\n"
+        "    - CUSTOM_TASK_ENV\n",
+        encoding="utf-8",
+    )
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="safe-passthrough")
+
+    assert _FakeSandboxFactory.created_kwargs[0]["env"]["CUSTOM_TASK_ENV"] == "task-value"
+    env.execute("echo ok", timeout=5)
+    assert env._sandbox.start_calls[-1][1]["env"]["CUSTOM_TASK_ENV"] == "task-value"
+    env.cleanup()
+    _clear_env_passthrough_cache()
 
 
 def test_tenki_environment_snapshots_when_persistent(monkeypatch, tmp_path):

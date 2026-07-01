@@ -125,6 +125,7 @@ terminal:
   tenki_workspace_id: ""                                                    # Blank falls back to Tenki CLI config
   tenki_project_id: ""                                                      # Blank falls back to Tenki CLI config
   tenki_sync_hermes_home: false                                             # Opt-in sync of selected ~/.hermes files
+  tenki_forward_env: []                                                     # Explicit host env vars to forward into Tenki
 ```
 
 For cloud sandboxes such as Modal, Daytona, and Tenki, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later. Tenki defaults to `container_persistent: false` so sandboxes are terminated when Hermes cleans them up; when persistence is enabled, Hermes pauses and later resumes the matching Tenki sandbox.
@@ -391,6 +392,7 @@ terminal:
   tenki_idle_timeout: 0
   tenki_pause_retention: 0
   tenki_sync_hermes_home: false   # Opt in only if child sandboxes need selected ~/.hermes files
+  tenki_forward_env: []           # Explicit credentials like GITHUB_TOKEN / GH_TOKEN
 ```
 
 **Required:** Tenki CLI login, `TENKI_AUTH_TOKEN`, or `TENKI_API_KEY`. Hermes also reads the Tenki CLI config for the current workspace and project IDs.
@@ -400,6 +402,8 @@ terminal:
 **Sudo:** Tenki sandboxes use the sandbox's own sudoers policy. Hermes never prompts for or forwards the host `SUDO_PASSWORD` to Tenki. The default Tenki image supports passwordless sudo.
 
 **Optional `.hermes` sync:** Set `tenki_sync_hermes_home: true` if a Tenki sandbox needs the same selected credential, skill, and cache files that Modal and Daytona receive. Leave it off when Tenki is only an execution sandbox and secrets should remain with the supervisor process.
+
+**Credential forwarding:** `terminal.env_passthrough` intentionally blocks common credential names such as `GITHUB_TOKEN` and `GH_TOKEN`. For Git or package-manager tokens that must be visible inside Tenki sandboxes, list the variable names in `terminal.tenki_forward_env`; Hermes resolves them from your current shell first, then `~/.hermes/.env`.
 
 **Fully remote supervisor pattern:** To make Hermes itself live remotely, run the Hermes process inside a long-lived Tenki supervisor sandbox and configure that process with `terminal.backend: tenki`. The supervisor owns `~/.hermes`, model credentials, sessions, memory, and gateway/dashboard processes. Terminal, file, `execute_code`, and delegated subagent execution then create child Tenki sandboxes on demand. Give the supervisor Tenki credentials with `tenki login`, `TENKI_AUTH_TOKEN`, or `TENKI_API_KEY`; child sandboxes do not need host sudo passwords.
 

@@ -229,6 +229,7 @@ These variables configure the [Tool Gateway](/user-guide/features/tool-gateway) 
 | `TERMINAL_TENKI_IDLE_TIMEOUT` | Tenki sandbox idle timeout in seconds; converted to minutes for the SDK (`0` disables explicit idle timeout) |
 | `TERMINAL_TENKI_PAUSE_RETENTION` | Tenki pause retention duration in seconds (`0` uses Tenki default) |
 | `TERMINAL_TENKI_SYNC_HERMES_HOME` | Opt-in sync of selected `~/.hermes` credentials, skills, and cache files into Tenki sandboxes (`true`/`false`, default: `false`) |
+| `TERMINAL_TENKI_FORWARD_ENV` | JSON array of env var names to explicitly forward into Tenki sandboxes. Use this for task credentials such as `GITHUB_TOKEN`; values are resolved from the shell first, then `~/.hermes/.env`. |
 | `TERMINAL_TIMEOUT` | Command timeout in seconds |
 | `TERMINAL_LIFETIME_SECONDS` | Max lifetime for terminal sessions in seconds |
 | `TERMINAL_CWD` | Deprecated direct override for gateway/cron terminal sessions. Prefer `terminal.cwd` in `config.yaml`; CLI still uses the launch directory. |

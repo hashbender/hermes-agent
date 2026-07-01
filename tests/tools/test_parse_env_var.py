@@ -39,6 +39,14 @@ class TestParseEnvVar:
             config = _tt_mod._get_env_config()
             assert config["docker_forward_env"] == ["GITHUB_TOKEN", "NPM_TOKEN"]
 
+    def test_get_env_config_parses_tenki_forward_env_json(self):
+        with patch.dict("os.environ", {
+            "TERMINAL_ENV": "tenki",
+            "TERMINAL_TENKI_FORWARD_ENV": '["GITHUB_TOKEN", "GH_TOKEN"]',
+        }, clear=False):
+            config = _tt_mod._get_env_config()
+            assert config["tenki_forward_env"] == ["GITHUB_TOKEN", "GH_TOKEN"]
+
     def test_create_environment_passes_docker_forward_env(self):
         fake_env = object()
         with patch.object(_tt_mod, "_DockerEnvironment", return_value=fake_env) as mock_docker:
@@ -52,6 +60,22 @@ class TestParseEnvVar:
 
         assert result is fake_env
         assert mock_docker.call_args.kwargs["forward_env"] == ["GITHUB_TOKEN"]
+
+    def test_create_environment_passes_tenki_forward_env(self):
+        import tools.environments.tenki as tenki_module
+
+        fake_env = object()
+        with patch.object(tenki_module, "TenkiEnvironment", return_value=fake_env) as mock_tenki:
+            result = _tt_mod._create_environment(
+                "tenki",
+                image="",
+                cwd="/home/tenki",
+                timeout=180,
+                container_config={"tenki_forward_env": ["GITHUB_TOKEN", "GH_TOKEN"]},
+            )
+
+        assert result is fake_env
+        assert mock_tenki.call_args.kwargs["forward_env"] == ["GITHUB_TOKEN", "GH_TOKEN"]
 
     def test_falls_back_to_default(self):
         with patch.dict("os.environ", {}, clear=False):

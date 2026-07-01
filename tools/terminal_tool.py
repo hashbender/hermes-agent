@@ -1273,6 +1273,11 @@ def _get_env_config() -> Dict[str, Any]:
         docker_env = {}
         docker_extra_args = []
 
+    if env_type == "tenki":
+        tenki_forward_env = _parse_env_var("TERMINAL_TENKI_FORWARD_ENV", "[]", json.loads, "valid JSON")
+    else:
+        tenki_forward_env = []
+
     # Default cwd: local uses the host's current directory, ssh uses the
     # remote home, and everything else starts in the backend's default
     # root-like cwd.
@@ -1329,6 +1334,7 @@ def _get_env_config() -> Dict[str, Any]:
         "tenki_idle_timeout": _parse_env_var("TERMINAL_TENKI_IDLE_TIMEOUT", "0"),
         "tenki_pause_retention": _parse_env_var("TERMINAL_TENKI_PAUSE_RETENTION", "0"),
         "tenki_sync_hermes_home": os.getenv("TERMINAL_TENKI_SYNC_HERMES_HOME", "false").lower() in {"true", "1", "yes"},
+        "tenki_forward_env": tenki_forward_env,
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1414,6 +1420,7 @@ def _container_config_from_env_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
         "tenki_pause_retention": config.get("tenki_pause_retention", 0),
         "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
+        "tenki_forward_env": config.get("tenki_forward_env", []),
     }
 
 
@@ -1570,6 +1577,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             idle_timeout=cc.get("tenki_idle_timeout", 0),
             pause_retention=cc.get("tenki_pause_retention", 0),
             sync_hermes_home=cc.get("tenki_sync_hermes_home", False),
+            forward_env=cc.get("tenki_forward_env", []),
         )
 
     elif env_type == "ssh":

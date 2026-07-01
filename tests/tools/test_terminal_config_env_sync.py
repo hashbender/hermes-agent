@@ -391,6 +391,7 @@ def test_tenki_config_is_bridged_everywhere():
         "tenki_idle_timeout": "TERMINAL_TENKI_IDLE_TIMEOUT",
         "tenki_pause_retention": "TERMINAL_TENKI_PAUSE_RETENTION",
         "tenki_sync_hermes_home": "TERMINAL_TENKI_SYNC_HERMES_HOME",
+        "tenki_forward_env": "TERMINAL_TENKI_FORWARD_ENV",
     }
     for key, env_var in tenki_keys.items():
         assert key in _cli_env_map_keys()
