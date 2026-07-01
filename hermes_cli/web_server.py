@@ -548,7 +548,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "terminal.backend": {
         "type": "select",
         "description": "Terminal execution backend",
-        "options": ["local", "docker", "ssh", "modal", "daytona", "tenki", "singularity"],
+        "options": ["local", "docker", "ssh", "modal", "daytona", "singularity"],
     },
     "terminal.modal_mode": {
         "type": "select",
@@ -2467,53 +2467,6 @@ async def get_learning_graph(profile: Optional[str] = None):
     except Exception:
         _log.exception("GET /api/learning/graph failed")
         raise HTTPException(status_code=500, detail="Failed to build learning graph")
-
-
-class LearningNodeRef(BaseModel):
-    id: str
-    profile: Optional[str] = None
-
-
-class LearningNodeEdit(BaseModel):
-    id: str
-    content: str
-    profile: Optional[str] = None
-
-
-@app.get("/api/learning/node")
-async def get_learning_node(id: str, profile: Optional[str] = None):
-    """Current content of a journey node (skill SKILL.md or memory chunk), for an edit prefill."""
-    from agent.learning_mutations import node_detail
-
-    with _profile_scope(profile):
-        res = node_detail(id)
-    if not res.get("ok"):
-        raise HTTPException(status_code=404, detail=res.get("message", "not found"))
-    return res
-
-
-@app.delete("/api/learning/node")
-async def delete_learning_node(body: LearningNodeRef):
-    """Delete a journey node — skills are archived (restorable), memories removed."""
-    from agent.learning_mutations import delete_node
-
-    with _profile_scope(body.profile):
-        res = delete_node(body.id)
-    if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("message", "delete failed"))
-    return res
-
-
-@app.put("/api/learning/node")
-async def update_learning_node(body: LearningNodeEdit):
-    """Rewrite a journey node's content (SKILL.md or memory chunk)."""
-    from agent.learning_mutations import edit_node
-
-    with _profile_scope(body.profile):
-        res = edit_node(body.id, body.content)
-    if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("message", "edit failed"))
-    return res
 
 
 def _safe_call(mod, fn_name: str, default):
@@ -6239,13 +6192,19 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
         read_hermes_oauth_credentials = None  # type: ignore
         _HERMES_OAUTH_FILE = None  # type: ignore
 
+    try:
+        from hermes_cli.auth import is_source_suppressed as _is_source_suppressed
+    except ImportError:
+        def _is_source_suppressed(provider_id: str, source: str) -> bool:  # type: ignore[misc]
+            return False
+
     hermes_creds = None
     if read_hermes_oauth_credentials:
         try:
             hermes_creds = read_hermes_oauth_credentials()
         except Exception:
             hermes_creds = None
-    if hermes_creds and hermes_creds.get("accessToken"):
+    if hermes_creds and hermes_creds.get("accessToken") and not _is_source_suppressed("anthropic", "hermes_pkce"):
         return {
             "logged_in": True,
             "source": "hermes_pkce",
@@ -6274,7 +6233,7 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
 
     for var in env_var_order:
         value = (get_env_value(var) if get_env_value else None) or os.getenv(var)
-        if not value:
+        if not value or _is_source_suppressed("anthropic", f"env:{var}"):
             continue
         suffix = format_secret_source_suffix(var) if format_secret_source_suffix else ""
         return {
@@ -6295,6 +6254,12 @@ def _claude_code_only_status() -> Dict[str, Any]:
     Claude Code subscription tokens are actively flowing into Hermes even
     when they also have a separate Hermes-managed PKCE login.
     """
+    try:
+        from hermes_cli.auth import is_source_suppressed
+        if is_source_suppressed("anthropic", "claude_code"):
+            return {"logged_in": False, "source": None}
+    except Exception:
+        pass
     try:
         from agent.anthropic_adapter import read_claude_code_credentials
         creds = read_claude_code_credentials()
@@ -6553,6 +6518,24 @@ def _oauth_provider_disconnect_hint(provider: Dict[str, Any], status: Dict[str, 
     return None
 
 
+def _oauth_provider_hidden_by_suppression(provider_id: str) -> bool:
+    """Return True when the user explicitly suppressed a synthetic Accounts row."""
+    try:
+        from hermes_cli.auth import is_source_suppressed
+    except ImportError:
+        return False
+    if provider_id == "claude-code":
+        return is_source_suppressed("anthropic", "claude_code")
+    if provider_id == "anthropic":
+        return (
+            is_source_suppressed("anthropic", "hermes_pkce")
+            and is_source_suppressed("anthropic", "env:ANTHROPIC_API_KEY")
+            and is_source_suppressed("anthropic", "env:ANTHROPIC_TOKEN")
+            and is_source_suppressed("anthropic", "env:CLAUDE_CODE_OAUTH_TOKEN")
+        )
+    return False
+
+
 def _build_oauth_catalog() -> list[Dict[str, Any]]:
     """Build the Accounts-tab provider list.
 
@@ -6630,6 +6613,8 @@ async def list_oauth_providers(profile: Optional[str] = None):
     with _profile_scope(profile):
         providers = []
         for p in _build_oauth_catalog():
+            if _oauth_provider_hidden_by_suppression(p["id"]):
+                continue
             status = _resolve_provider_status(p["id"], p.get("status_fn"))
             disconnect_hint = _oauth_provider_disconnect_hint(p, status)
             providers.append({
