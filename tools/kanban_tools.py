@@ -967,9 +967,11 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     Subscription paths:
 
     - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``
-      and ``HERMES_SESSION_CHAT_ID`` are set in ContextVars by the
+      and ``HERMES_SESSION_CHAT_ID``/``HERMES_SESSION_CHAT_TYPE`` are set in ContextVars by the
       messaging gateway before agent dispatch. The notification poller
-      already keys off these, so we just register a row.
+      already keys off these, so we just register a row. ``chat_type`` is
+      persisted so the later creator wake reconstructs the exact session key
+      shape (DMs use ``:dm:<chat_id>``; groups/threads use different shapes).
 
     - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
       are intentionally cleared (TUI is a single-channel local UI, not
@@ -1026,6 +1028,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             platform = "tui"
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
@@ -1037,7 +1040,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
-            thread_id=thread_id, user_id=user_id,
+            thread_id=thread_id, user_id=user_id, chat_type=chat_type,
             notifier_profile=notifier_profile,
         )
         return True
