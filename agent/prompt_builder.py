@@ -42,6 +42,70 @@ logger = logging.getLogger(__name__)
 
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 
+# ── Wire #7: caller-side severity map (Mothership #47 Ruling B) ──────────
+# The shared threat library marks C2 / promptware / framework patterns as
+# WARN-class in its own comments ("we WARN, not block", threat_patterns.py),
+# but this caller historically flattened every finding to a hard block. This
+# map restores the library's documented intent at the caller: a context-scope
+# C2 finding WARNS with content preserved; genuine injection / identity-hijack
+# findings still hard-block.
+#
+# Policy: default-block, allowlist-warn. A file is blocked unless EVERY finding
+# is warn-class. One block-class hit blocks the whole file.
+#
+# The warn-set is security-critical: a dropped or typo'd ID silently blocks a
+# legitimate file. So it is self-verified against the source table at import
+# (Keystone: disk is truth, including for the allowlist). The tuple-native
+# severity field is a separate upstream PR, not built here.
+_WARN_CLASS_FINDINGS = frozenset({
+    "c2_node_registration",
+    "c2_heartbeat",
+    "c2_task_pull",
+    "c2_network_connect",
+    "forced_action",
+    "anti_forensic_oneliner",
+    "anti_forensic_disk",
+    "env_var_unset_agent",
+    "known_c2_framework",
+    "c2_explicit",
+    "c2_explicit_long",
+})
+
+
+def _verify_warn_set_against_source() -> None:
+    """Fail loudly at import if _WARN_CLASS_FINDINGS drifts from the source table.
+
+    Reads the C2-through-framework warn-class region of threat_patterns.py and
+    confirms the hardcoded warn-set equals the set of context-scope IDs in that
+    region, both directions. A missing ID would silently downgrade a legitimate
+    file to a hard block under default-block policy; an extra ID is a typo or
+    stale entry that also silently hard-blocks. Either raises.
+    """
+    import re
+    from pathlib import Path
+    import tools.threat_patterns as _tp
+
+    src = Path(_tp.__file__).read_text()
+    start = src.index("C2 / Brainworm-style promptware")
+    end = src.index("Exfiltration via curl")
+    region = src[start:end]
+    source_ids = set(re.findall(r'"([a-z0-9_]+)",\s*"context"', region))
+
+    missing = source_ids - _WARN_CLASS_FINDINGS
+    extra = _WARN_CLASS_FINDINGS - source_ids
+    if missing or extra:
+        raise RuntimeError(
+            "prompt_builder warn-set drift from source table. "
+            f"In source but not warn-set (would silently hard-block): {sorted(missing)}. "
+            f"In warn-set but not source (typo or stale entry): {sorted(extra)}. "
+            "Fix _WARN_CLASS_FINDINGS to match threat_patterns.py exactly, or "
+            "if the tuple-native severity PR landed, revisit this check."
+        )
+
+
+_verify_warn_set_against_source()
+
+
 
 def _scan_context_content(content: str, filename: str) -> str:
     """Scan context file content for injection. Returns sanitized content.
@@ -56,8 +120,22 @@ def _scan_context_content(content: str, filename: str) -> str:
     """
     findings = _scan_for_threats(content, scope="context")
     if findings:
-        logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
-        return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
+        block_class = [f for f in findings if f not in _WARN_CLASS_FINDINGS]
+        if block_class:
+            # Default-block: any non-warn finding hard-blocks the whole file.
+            logger.warning(
+                "Context file %s blocked: %s", filename, ", ".join(findings)
+            )
+            return (
+                f"[BLOCKED: {filename} contained potential prompt injection "
+                f"({', '.join(block_class)}). Content not loaded.]"
+            )
+        # All findings warn-class: preserve content, log the warning.
+        logger.warning(
+            "Context file %s warn-class findings (content preserved): %s",
+            filename,
+            ", ".join(findings),
+        )
 
     return content
 
@@ -88,15 +166,12 @@ def _find_hermes_md(cwd: Path) -> Optional[Path]:
     stop_at = _find_git_root(cwd)
     current = cwd.resolve()
 
-    # When there is no git root, only check cwd itself – walking parents
-    # could pick up a .hermes.md planted in /tmp, /home, etc.
-    search_dirs = [current, *current.parents] if stop_at else [current]
-
-    for directory in search_dirs:
+    for directory in [current, *current.parents]:
         for name in _HERMES_MD_NAMES:
             candidate = directory / name
             if candidate.is_file():
                 return candidate
+        # Stop walking at the git root (or filesystem root).
         if stop_at and directory == stop_at:
             break
     return None
@@ -874,7 +949,7 @@ WSL_ENVIRONMENT_HINT = (
 # runs. For these backends, host info (Windows/Linux/macOS, $HOME, cwd) is
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
-    "docker", "singularity", "modal", "daytona", "tenki", "ssh",
+    "docker", "singularity", "modal", "daytona", "ssh",
     "managed_modal",
 })
 
@@ -889,7 +964,6 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "modal": "a Modal sandbox (Linux)",
     "managed_modal": "a managed Modal sandbox (Linux)",
     "daytona": "a Daytona workspace (Linux)",
-    "tenki": "a Tenki sandbox (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
 }
 
@@ -930,7 +1004,8 @@ def _probe_remote_backend(env_type: str) -> str | None:
     try:
         # Import locally: tools/ imports are heavy and only relevant when a
         # non-local backend is actually configured.
-        from tools.terminal_tool import _create_environment, _get_env_config  # type: ignore
+        from tools.terminal_tool import _get_env_config  # type: ignore
+        from tools.environments import get_environment  # type: ignore
     except Exception as e:
         logger.debug("Backend probe unavailable (import failed): %s", e)
         _BACKEND_PROBE_CACHE[cache_key] = ""
@@ -938,70 +1013,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
 
     try:
         config = _get_env_config()
-        # Build the environment the same way tools/terminal_tool.py does for a
-        # live command: select the backend image, then assemble ssh/container
-        # config from the env-derived dict. (There is no `get_environment`
-        # factory — the real entry point is `_create_environment`.)
-        if env_type == "docker":
-            image = config.get("docker_image", "")
-        elif env_type == "singularity":
-            image = config.get("singularity_image", "")
-        elif env_type == "modal":
-            image = config.get("modal_image", "")
-        elif env_type == "daytona":
-            image = config.get("daytona_image", "")
-        elif env_type == "tenki":
-            image = config.get("tenki_image", "")
-        else:
-            image = ""
-
-        ssh_config = None
-        if env_type == "ssh":
-            ssh_config = {
-                "host": config.get("ssh_host", ""),
-                "user": config.get("ssh_user", ""),
-                "port": config.get("ssh_port", 22),
-                "key": config.get("ssh_key", ""),
-                "persistent": config.get("ssh_persistent", False),
-            }
-
-        container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "tenki"}:
-            container_config = {
-                "container_cpu": config.get("container_cpu", 1),
-                "container_memory": config.get("container_memory", 5120),
-                "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
-                "modal_mode": config.get("modal_mode", "auto"),
-                "docker_volumes": config.get("docker_volumes", []),
-                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                "docker_forward_env": config.get("docker_forward_env", []),
-                "docker_env": config.get("docker_env", {}),
-                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                "docker_extra_args": config.get("docker_extra_args", []),
-                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                "tenki_project_id": config.get("tenki_project_id", ""),
-                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
-            }
-
-        env = _create_environment(
-            env_type=env_type,
-            image=image,
-            cwd=config.get("cwd", ""),
-            timeout=config.get("timeout", 180),
-            ssh_config=ssh_config,
-            container_config=container_config,
-            task_id="prompt-backend-probe",
-            host_cwd=config.get("host_cwd"),
-        )
+        env = get_environment(config)
         # Single-line POSIX probe — works on any Unixy backend. Wrapped in
         # `2>/dev/null` so a missing binary doesn't pollute the output.
         probe_cmd = (
@@ -1065,7 +1077,7 @@ def build_environment_hints() -> str:
       and a Windows-only note that `terminal` shells out to bash, not
       PowerShell).
     - For **remote / sandbox** terminal backends (docker, singularity,
-      modal, daytona, tenki, ssh): host info is **suppressed**
+      modal, daytona, ssh): host info is **suppressed**
       because the agent's tools can't touch the host — only the backend
       matters. A live probe inside the backend reports its OS, user, $HOME,
       and cwd. Falls back to a static summary if the probe fails.
