@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+_LOCAL_MODEL_DISCOVERY_BODY_LIMIT = 2 * 1024 * 1024
 
 from hermes_cli import auth as auth_mod
 from agent.credential_pool import CredentialPool, PooledCredential, get_custom_provider_pool_key, load_pool
@@ -245,18 +248,44 @@ def _anthropic_base_url_override_ok(base_url: str) -> bool:
     return False
 
 
+def _read_local_model_discovery_json(response: Any) -> Dict[str, Any]:
+    """Parse a local /models response without buffering an unbounded body."""
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > _LOCAL_MODEL_DISCOVERY_BODY_LIMIT:
+            raise ValueError(
+                "local model discovery response exceeded "
+                f"{_LOCAL_MODEL_DISCOVERY_BODY_LIMIT} bytes"
+            )
+        chunks.append(chunk)
+
+    raw = b"".join(chunks)
+    if not raw.strip():
+        return {}
+    encoding = getattr(response, "encoding", None) or "utf-8"
+    parsed = json.loads(raw.decode(encoding, errors="replace"))
+    if not isinstance(parsed, dict):
+        raise ValueError("local model discovery response was not a JSON object")
+    return parsed
+
+
 def _auto_detect_local_model(base_url: str) -> str:
     """Query a local server for its model name when only one model is loaded."""
     if not base_url:
         return ""
+    resp = None
     try:
         import requests
         url = base_url.rstrip("/")
         if not url.endswith("/v1"):
             url += "/v1"
-        resp = requests.get(url + "/models", timeout=5)
+        resp = requests.get(url + "/models", timeout=5, stream=True)
         if resp.ok:
-            models = resp.json().get("data", [])
+            models = _read_local_model_discovery_json(resp).get("data", [])
             if len(models) == 1:
                 model_id = models[0].get("id", "")
                 if model_id:
@@ -265,6 +294,10 @@ def _auto_detect_local_model(base_url: str) -> str:
         # Log instead of silently swallowing — aids debugging when
         # local model auto-detection fails unexpectedly.
         logger.debug("Auto-detect model from %s failed: %s", base_url, exc)
+    finally:
+        close = getattr(resp, "close", None)
+        if callable(close):
+            close()
     return ""
 
 
@@ -1539,6 +1572,39 @@ def resolve_runtime_provider(
             target_model=target_model,
         )
         return azure_runtime
+
+    # Vertex AI: OAuth2-token provider (Gemini via the OpenAI-compatible
+    # endpoint). Resolve BEFORE the custom-runtime / credential-pool / generic
+    # paths. The credential *path* (GOOGLE_APPLICATION_CREDENTIALS /
+    # VERTEX_CREDENTIALS_PATH) must never reach the credential pool or the
+    # generic api_key resolver — those would treat the file path as a static
+    # API key. Instead we mint a short-lived OAuth2 access token here and hand
+    # it to the standard OpenAI client as api_key, with base_url computed from
+    # the project ID + region. The token is re-minted per call (5-min refresh
+    # margin) by get_vertex_config(); mid-session expiry is additionally
+    # recovered on 401 by run_agent._try_refresh_vertex_client_credentials().
+    if requested_provider in ("vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"):
+        from agent.vertex_adapter import get_vertex_config
+
+        token, base_url = get_vertex_config()
+        if not token or not base_url:
+            raise AuthError(
+                "Vertex AI credentials could not be resolved. Vertex uses "
+                "OAuth2 (not a static API key): provide a service-account JSON "
+                "via GOOGLE_APPLICATION_CREDENTIALS (or VERTEX_CREDENTIALS_PATH) "
+                "in ~/.hermes/.env, or run 'gcloud auth application-default "
+                "login' for ADC. Set the GCP project/region under vertex: in "
+                "config.yaml if they aren't embedded in the credentials. "
+                "Install the extra with: pip install 'hermes-agent[vertex]'."
+            )
+        return {
+            "provider": "vertex",
+            "api_mode": "chat_completions",
+            "base_url": base_url.rstrip("/"),
+            "api_key": token,
+            "source": "vertex-oauth",
+            "requested_provider": requested_provider,
+        }
 
     custom_runtime = _resolve_named_custom_runtime(
         requested_provider=requested_provider,
