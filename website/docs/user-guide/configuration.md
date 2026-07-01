@@ -108,11 +108,11 @@ Before that stash step, Hermes also restores tracked `package-lock.json` diffs l
 
 ## Terminal Backend Configuration
 
-Hermes supports seven terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, a Tenki sandbox, or a Singularity/Apptainer container.
+Hermes supports six terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, or a Singularity/Apptainer container.
 
 ```yaml
 terminal:
-  backend: local    # local | docker | ssh | modal | daytona | tenki | singularity
+  backend: local    # local | docker | ssh | modal | daytona | singularity
   cwd: "."          # Gateway/cron working directory (CLI always uses launch dir)
   timeout: 180      # Per-command timeout in seconds
   home_mode: auto   # auto | real | profile — subprocess HOME policy
@@ -120,14 +120,9 @@ terminal:
   singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"  # Container image for Singularity backend
   modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"                 # Container image for Modal backend
   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"               # Container image for Daytona backend
-  tenki_image: ""                                                           # Optional Tenki image/template; blank uses Tenki default
-  tenki_api_endpoint: "https://api.tenki.cloud"
-  tenki_workspace_id: ""                                                    # Blank falls back to Tenki CLI config
-  tenki_project_id: ""                                                      # Blank falls back to Tenki CLI config
-  tenki_sync_hermes_home: false                                             # Opt-in sync of selected ~/.hermes files
 ```
 
-For cloud sandboxes such as Modal, Daytona, and Tenki, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later. Tenki defaults to `container_persistent: false` so sandboxes are terminated when Hermes cleans them up; when persistence is enabled, Hermes pauses and later resumes the matching Tenki sandbox.
+For cloud sandboxes such as Modal and Daytona, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later.
 
 ### Backend Overview
 
@@ -138,7 +133,6 @@ For cloud sandboxes such as Modal, Daytona, and Tenki, `container_persistent: tr
 | **ssh** | Remote server via SSH | Network boundary | Remote dev, powerful hardware |
 | **modal** | Modal cloud sandbox | Full (cloud VM) | Ephemeral cloud compute, evals |
 | **daytona** | Daytona workspace | Full (cloud container) | Managed cloud dev environments |
-| **tenki** | Tenki sandbox | Full (cloud sandbox) | On-demand cloud compute |
 | **singularity** | Singularity/Apptainer container | Namespaces (--containall) | HPC clusters, shared machines |
 
 ### Local Backend
@@ -372,36 +366,6 @@ terminal:
 
 **Disk limit:** Daytona enforces a 10 GiB maximum. Requests above this are capped with a warning.
 
-### Tenki Backend
-
-Runs commands in a [Tenki](https://tenki.cloud) sandbox. Hermes creates sandboxes on demand and terminates them by default.
-
-```yaml
-terminal:
-  backend: tenki
-  cwd: "/home/tenki"
-  container_persistent: false      # Default for Tenki
-  tenki_api_endpoint: "https://api.tenki.cloud"
-  tenki_workspace_id: ""           # Falls back to Tenki CLI config
-  tenki_project_id: ""             # Falls back to Tenki CLI config
-  tenki_allow_inbound: false
-  tenki_allow_outbound: true
-  tenki_max_duration: 3600
-  tenki_idle_timeout: 0
-  tenki_pause_retention: 0
-  tenki_sync_hermes_home: false   # Opt in only if child sandboxes need selected ~/.hermes files
-```
-
-**Required:** Tenki CLI login, `TENKI_AUTH_TOKEN`, or `TENKI_API_KEY`. Hermes also reads the Tenki CLI config for the current workspace and project IDs.
-
-**Persistence:** Tenki is terminate-only by default. Set `container_persistent: true` only if you intentionally want Hermes to pause and resume a task-named sandbox.
-
-**Sudo:** Tenki sandboxes use the sandbox's own sudoers policy. Hermes never prompts for or forwards the host `SUDO_PASSWORD` to Tenki. The default Tenki image supports passwordless sudo.
-
-**Optional `.hermes` sync:** Set `tenki_sync_hermes_home: true` if a Tenki sandbox needs the same selected credential, skill, and cache files that Modal and Daytona receive. Leave it off when Tenki is only an execution sandbox and secrets should remain with the supervisor process.
-
-**Fully remote supervisor pattern:** To make Hermes itself live remotely, run the Hermes process inside a long-lived Tenki supervisor sandbox and configure that process with `terminal.backend: tenki`. The supervisor owns `~/.hermes`, model credentials, sessions, memory, and gateway/dashboard processes. Terminal, file, `execute_code`, and delegated subagent execution then create child Tenki sandboxes on demand. Give the supervisor Tenki credentials with `tenki login`, `TENKI_AUTH_TOKEN`, or `TENKI_API_KEY`; child sandboxes do not need host sudo passwords.
-
 ### Singularity/Apptainer Backend
 
 Runs commands in a [Singularity/Apptainer](https://apptainer.org) container. Designed for HPC clusters and shared machines where Docker isn't available.
@@ -432,14 +396,13 @@ If terminal commands fail immediately or the terminal tool is reported as disabl
 - **SSH** — Both `TERMINAL_SSH_HOST` and `TERMINAL_SSH_USER` must be set. Hermes logs a clear error if either is missing.
 - **Modal** — Needs `MODAL_TOKEN_ID` env var or `~/.modal.toml`. Run `hermes doctor` to check.
 - **Daytona** — Needs `DAYTONA_API_KEY`. The Daytona SDK handles server URL configuration.
-- **Tenki** — Needs Tenki CLI login or `TENKI_AUTH_TOKEN`/`TENKI_API_KEY`. Workspace/project can come from the Tenki CLI config or `terminal.tenki_workspace_id` / `terminal.tenki_project_id`.
 - **Singularity** — Needs `apptainer` or `singularity` in `$PATH`. Common on HPC clusters.
 
 When in doubt, set `terminal.backend` back to `local` and verify that commands run there first.
 
 ### Remote-to-Host File Sync on Teardown
 
-For the **SSH**, **Modal**, **Daytona**, and **Tenki** backends (anywhere the agent's working tree lives on a different machine than the host running Hermes), Hermes tracks files the agent touched inside the remote sandbox and, on session teardown / sandbox cleanup, **syncs the modified files back to the host** under `~/.hermes/cache/remote-syncs/<session-id>/`. Tenki also supports opt-in selected `.hermes` credential/skill/cache sync with `terminal.tenki_sync_hermes_home: true`; it is disabled by default.
+For the **SSH**, **Modal**, and **Daytona** backends (anywhere the agent's working tree lives on a different machine than the host running Hermes), Hermes tracks files the agent touched inside the remote sandbox and, on session teardown / sandbox cleanup, **syncs the modified files back to the host** under `~/.hermes/cache/remote-syncs/<session-id>/`.
 
 - Triggers on: session close, `/new`, `/reset`, gateway message timeout, `delegate_task` subagent completion when the child used a remote backend.
 - Covers the whole tree the agent modified, not just files it explicitly opened. Additions, edits, and deletions are all captured.
@@ -952,16 +915,19 @@ For Claude on **native Anthropic**, **OpenRouter**, and **Nous Portal**, Hermes 
 
 The Qwen Cloud (Alibaba DashScope) upstream caps cache TTL at 5 minutes, so Hermes uses the 5-minute breakpoint TTL there instead. Other Claude-via-third-party paths (AWS Bedrock, Azure Foundry) fall back to the provider's own caching defaults. xAI Grok uses a separate session-pinned conversation-id mechanism — see [xAI prompt caching](/integrations/providers#xai-grok--responses-api--prompt-caching).
 
-No knob exists to disable this — caching is always-on and saves money even on single-turn conversations because the system prompt alone is a meaningful fraction of the input token count.
+Caching is on by default and saves money even on single-turn conversations because the system prompt alone is a meaningful fraction of the input token count. It can be turned off entirely with the `enabled` knob below when a strict provider rejects `cache_control` markers.
 
-The one explicit knob is the cache TTL tier Hermes requests on Anthropic-style breakpoints:
+The explicit knobs are whether caching runs at all and the cache TTL tier Hermes requests on Anthropic-style breakpoints:
 
 ```yaml
 prompt_caching:
+  enabled: true    # set false to stop sending cache_control markers entirely
   cache_ttl: "5m"   # "5m" or "1h" (Anthropic-supported tiers); other values are ignored
 ```
 
 `cache_ttl` selects the breakpoint TTL Hermes attaches for Claude via the native Anthropic API, OpenRouter, and Nous Portal. Only the two Anthropic-supported tiers (`"5m"`, `"1h"`) are honored — any other value is ignored. Providers with their own caps (e.g. Qwen Cloud, which maxes at 5 minutes) still clamp to what the upstream allows.
+
+`enabled` defaults to `true`. Set it to `false` as an escape hatch for strict Anthropic-compatible proxies that inject their own `cache_control` markers server-side — stacking those on top of Hermes' breakpoints can exceed Anthropic's 4-breakpoint limit and return HTTP 400 `"A maximum of 4 blocks with cache_control may be provided"`. Disabling caching on that setup passes requests through without client-side markers so the proxy manages its own.
 
 ## Auxiliary Models
 
