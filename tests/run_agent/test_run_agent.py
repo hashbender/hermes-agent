@@ -55,6 +55,46 @@ def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
 
 
+def test_run_conversation_dict_returns_include_final_response():
+    """Structurally enforce final_response on dict returns from run_conversation().
+
+    This parses source, including nested helpers, so it requires the .py file
+    to be available. It guards key presence and literal None values; runtime
+    tests still cover branch-specific values.
+    """
+    from agent import conversation_loop
+
+    try:
+        source = inspect.getsource(conversation_loop.run_conversation)
+    except OSError as exc:
+        pytest.skip(f"run_conversation source is unavailable: {exc}")
+    tree = ast.parse(source)
+    missing = []
+    literal_none = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Dict):
+            continue
+        keys = [
+            key.value if isinstance(key, ast.Constant) else None
+            for key in node.value.keys
+        ]
+        if "final_response" not in keys:
+            missing.append(node.lineno)
+            continue
+        value = node.value.values[keys.index("final_response")]
+        if isinstance(value, ast.Constant) and value.value is None:
+            literal_none.append(node.lineno)
+
+    assert missing == [], (
+        "run_conversation() dict returns must preserve the final_response "
+        f"contract; missing at source-local lines {missing}"
+    )
+    assert literal_none == [], (
+        "run_conversation() dict returns must expose actionable final_response "
+        f"text instead of literal None; literal None at source-local lines {literal_none}"
+    )
+
+
 @pytest.fixture()
 def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
@@ -3944,6 +3984,65 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_duplicate_completed_tool_call_id_halts_without_replaying_result(self, agent):
+        self._setup_agent(agent)
+        first = _mock_tool_call(name="web_search", arguments='{"query":"pwd"}', call_id="c1")
+        replay = _mock_tool_call(name="web_search", arguments='{"query":"pwd"}', call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[first])
+        resp2 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[replay])
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"results": ["pwd"]}') as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("run pwd")
+
+        assert mock_handle_function_call.call_count == 1
+        assert result["turn_exit_reason"] == "guardrail_halt"
+        assert result["guardrail"]["code"] == "duplicate_completed_tool_call"
+        assert "re-issued a completed web_search tool_call_id" in result["final_response"]
+        tool_msgs = [
+            m for m in result["messages"]
+            if m.get("role") == "tool" and m.get("tool_call_id") == "c1"
+        ]
+        assert len(tool_msgs) == 1
+
+    def test_mixed_fresh_and_replayed_tool_calls_executes_fresh_without_halting(self, agent):
+        """A turn that mixes a replayed completed call with a FRESH call must
+        drop only the replay, still execute the fresh call, and NOT halt."""
+        self._setup_agent(agent)
+        # Turn 1: one fresh call c1 (executes, records a tool result).
+        first = _mock_tool_call(name="web_search", arguments='{"query":"pwd"}', call_id="c1")
+        # Turn 2: replay of completed c1 + a genuinely NEW call c2.
+        replay = _mock_tool_call(name="web_search", arguments='{"query":"pwd"}', call_id="c1")
+        fresh = _mock_tool_call(name="web_search", arguments='{"query":"ls"}', call_id="c2")
+        # Turn 3: model finishes with a normal answer after c2 executes.
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[first])
+        resp2 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[replay, fresh])
+        resp3 = _mock_response(content="done", finish_reason="stop", tool_calls=None)
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"results": ["ok"]}') as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("run commands")
+
+        # No halt — the turn completes normally.
+        assert result["turn_exit_reason"] != "guardrail_halt"
+        # c1 (fresh in turn 1) + c2 (fresh in turn 2) executed once each;
+        # the replayed c1 in turn 2 was dropped, NOT re-executed.
+        executed_ids = [
+            call.kwargs["tool_call_id"] for call in mock_handle_function_call.call_args_list
+        ]
+        assert executed_ids == ["c1", "c2"]
+        assert result["final_response"] == "done"
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -5379,6 +5478,7 @@ class TestRetryExhaustion:
         assert result.get("failed") is True
         assert "error" in result
         assert "Invalid API response" in result["error"]
+        assert result.get("final_response") == result["error"]
 
     def test_content_filter_refusal_surfaced_not_retried(self, agent):
         """A model refusal must be surfaced immediately, NOT laundered into
