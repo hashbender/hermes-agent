@@ -548,7 +548,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "terminal.backend": {
         "type": "select",
         "description": "Terminal execution backend",
-        "options": ["local", "docker", "ssh", "modal", "daytona", "tenki", "singularity"],
+        "options": ["local", "docker", "ssh", "modal", "daytona", "singularity"],
     },
     "terminal.modal_mode": {
         "type": "select",
@@ -12117,6 +12117,17 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
 
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
+
+    forwarded_host = (ws.headers.get("x-forwarded-host", "") or "").split(",", 1)[0].strip()
+    if forwarded_host and _is_accepted_host(parsed.netloc, forwarded_host):
+        # Reverse-proxy tunnels (Cloudflare Tunnel, Tailscale Funnel, ngrok,
+        # Caddy, etc.) commonly rewrite Host to the local bind address so the
+        # HTTP Host guard passes, but browsers keep the immutable public Origin
+        # (https://dashboard.example.com).  When the proxy tells us the public
+        # host it forwarded, accept that same host as the Origin target.  This
+        # preserves the DNS-rebinding check for arbitrary cross-site origins
+        # while allowing legitimate tunneled WebSocket upgrades.
+        return None
 
     if not _is_accepted_host(parsed.netloc, bound_host):
         return f"origin_mismatch origin={origin} bound={bound_host}"
