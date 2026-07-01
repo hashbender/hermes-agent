@@ -408,8 +408,11 @@ def test_run_agent_dispatch_forces_background():
 
     with patch("tools.delegate_tool.delegate_task", _fake_delegate):
         agent = _FakeAgent()
-        run_agent.AIAgent._dispatch_delegate_task(agent, {"goal": "x"})
+        run_agent.AIAgent._dispatch_delegate_task(
+            agent, {"goal": "x", "timeout_seconds": 900}
+        )
         assert captured["background"] is True
+        assert captured["timeout_seconds"] == 900
 
         run_agent.AIAgent._dispatch_delegate_task(
             agent, {"tasks": [{"goal": "a"}, {"goal": "b"}]}
@@ -587,5 +590,4 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
 

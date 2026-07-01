@@ -481,6 +481,28 @@ def _get_child_timeout() -> Optional[float]:
     return DEFAULT_CHILD_TIMEOUT
 
 
+_CHILD_TIMEOUT_UNSET = object()
+
+
+def _parse_child_timeout_override(
+    value: Any, field_name: str = "timeout_seconds"
+) -> tuple[object, Optional[str]]:
+    """Parse a per-call child timeout override.
+
+    Returns ``_CHILD_TIMEOUT_UNSET`` when the caller omitted the override so the
+    global ``delegation.child_timeout_seconds`` value should still apply.
+    """
+    if value is _CHILD_TIMEOUT_UNSET:
+        return _CHILD_TIMEOUT_UNSET, None
+    if value is None or value == "":
+        return _CHILD_TIMEOUT_UNSET, None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return _CHILD_TIMEOUT_UNSET, f"{field_name} must be a number of seconds."
+    return (None if parsed <= 0 else max(30.0, parsed)), None
+
+
 def _get_max_spawn_depth() -> int:
     """Read delegation.max_spawn_depth from config, floored at 1 (no ceiling).
 
@@ -1737,6 +1759,7 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    timeout_seconds: object = _CHILD_TIMEOUT_UNSET,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -1903,7 +1926,11 @@ def _run_single_child(
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        child_timeout = (
+            _get_child_timeout()
+            if timeout_seconds is _CHILD_TIMEOUT_UNSET
+            else timeout_seconds
+        )
         _timeout_executor = ThreadPoolExecutor(
             max_workers=1,
             # Install a non-interactive approval callback in the worker thread
@@ -2353,6 +2380,7 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2425,6 +2453,12 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
+    top_timeout_override, timeout_error = _parse_child_timeout_override(
+        timeout_seconds, "timeout_seconds"
+    )
+    if timeout_error:
+        return tool_error(timeout_error)
+
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
@@ -2472,6 +2506,18 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    task_timeout_overrides = []
+    for i, task in enumerate(task_list):
+        if "timeout_seconds" in task:
+            task_timeout_override, timeout_error = _parse_child_timeout_override(
+                task.get("timeout_seconds"), f"tasks[{i}].timeout_seconds"
+            )
+            if timeout_error:
+                return tool_error(timeout_error)
+        else:
+            task_timeout_override = top_timeout_override
+        task_timeout_overrides.append(task_timeout_override)
+
     overall_start = time.monotonic()
     results = []
 
@@ -2493,6 +2539,7 @@ def delegate_task(
     try:
         for i, t in enumerate(task_list):
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
+            task_timeout_override = task_timeout_overrides[i]
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
@@ -2521,7 +2568,7 @@ def delegate_task(
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
-            children.append((i, t, child))
+            children.append((i, t, child, task_timeout_override))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
@@ -2538,8 +2585,14 @@ def delegate_task(
         """
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
-            _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            _i, _t, child, child_timeout = children[0]
+            result = _run_single_child(
+                _i,
+                _t["goal"],
+                child,
+                parent_agent,
+                timeout_seconds=child_timeout,
+            )
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -2548,13 +2601,14 @@ def delegate_task(
 
             with ThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
-                for i, t, child in children:
+                for i, t, child, child_timeout in children:
                     future = executor.submit(
                         _run_single_child,
                         task_index=i,
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
+                        timeout_seconds=child_timeout,
                     )
                     futures[future] = i
 
@@ -2565,7 +2619,7 @@ def delegate_task(
                 # when the parent is interrupted.
                 # Map task_index -> child agent, so fabricated entries for
                 # still-pending futures can carry the correct _delegate_role.
-                _child_by_index = {i: child for (i, _, child) in children}
+                _child_by_index = {i: child for (i, _, child, _) in children}
 
                 pending = set(futures.keys())
                 while pending:
@@ -2807,7 +2861,7 @@ def delegate_task(
             return json.dumps(_sync_result, ensure_ascii=False)
 
         _session_key = get_current_session_key(default="")
-        _child_agents = [c for (_, _, c) in children]
+        _child_agents = [c for (_, _, c, _) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the
         # batch's lifecycle is owned by the async registry now, not the parent
@@ -3382,6 +3436,16 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "timeout_seconds": {
+                "type": "number",
+                "description": (
+                    "Optional per-call wall-clock cap for each child agent. "
+                    "Overrides delegation.child_timeout_seconds for this "
+                    "delegate_task call. Omit to use config; set 0 to disable "
+                    "the hard cap for this call. Positive values below 30 are "
+                    "floored to 30 seconds."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3414,6 +3478,17 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "timeout_seconds": {
+                            "type": "number",
+                            "description": (
+                                "Per-task wall-clock cap override for this "
+                                "child. Overrides the top-level "
+                                "timeout_seconds and "
+                                "delegation.child_timeout_seconds. Omit to "
+                                "inherit; set 0 to disable the hard cap for "
+                                "this child."
+                            ),
                         },
                     },
                     "required": ["goal"],
@@ -3501,6 +3576,7 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        timeout_seconds=args.get("timeout_seconds"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
