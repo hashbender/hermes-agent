@@ -1738,6 +1738,91 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, exc_info=True,
                 )
 
+    def _schedule_polling_recovery(self, error: Exception, *, reason: str) -> None:
+        """Schedule polling recovery without failing gateway startup.
+
+        A Telegram bootstrap failure (deleteWebhook / initial start_polling)
+        caused by a transient network error should degrade only the Telegram
+        adapter: the gateway process stays alive and the existing reconnect
+        ladder (``_handle_polling_network_error``) recovers in the background.
+        """
+        if self.has_fatal_error:
+            return
+        if self._polling_error_task and not self._polling_error_task.done():
+            logger.debug(
+                "[%s] Telegram polling recovery already scheduled; ignoring %s: %s",
+                self.name, reason, error,
+            )
+            return
+        self._send_path_degraded = True
+        logger.warning(
+            "[%s] Telegram polling degraded (%s); gateway stays alive and will retry. Error: %s",
+            self.name, reason, error,
+        )
+        loop = asyncio.get_running_loop()
+        self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
+        self._background_tasks.add(self._polling_error_task)
+        self._polling_error_task.add_done_callback(self._background_tasks.discard)
+
+    async def _delete_webhook_best_effort(self) -> bool:
+        """Clear any stale webhook, but never fail polling on a network error.
+
+        Returns True when the webhook was cleared (or there was nothing to do)
+        and False when a transient network error was swallowed so bootstrap can
+        continue to polling; the reconnect ladder recovers from there.
+        """
+        if not self._bot:
+            return False
+        delete_webhook = getattr(self._bot, "delete_webhook", None)
+        if not callable(delete_webhook):
+            return True
+        try:
+            await delete_webhook(drop_pending_updates=False)
+            return True
+        except Exception as err:
+            if self._looks_like_network_error(err):
+                logger.warning(
+                    "[%s] deleteWebhook failed with a recoverable network error; "
+                    "continuing to polling so getUpdates/retry can recover: %s",
+                    self.name, err,
+                )
+                self._send_path_degraded = True
+                return False
+            raise
+
+    async def _start_polling_resilient(self, *, drop_pending_updates: bool, error_callback) -> bool:
+        """Start PTB polling; on a transient bootstrap failure, recover in background.
+
+        Returns True when polling started, False when a transient conflict or
+        network error was scheduled for background recovery instead of raising
+        (keeping the gateway process alive).
+        """
+        if not (self._app and self._app.updater):
+            raise RuntimeError("Telegram application/updater not initialized")
+        try:
+            await self._app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=drop_pending_updates,
+                error_callback=error_callback,
+            )
+            return True
+        except Exception as err:
+            if self._looks_like_polling_conflict(err):
+                logger.warning(
+                    "[%s] Telegram polling bootstrap conflict; gateway stays alive "
+                    "while conflict retry runs: %s",
+                    self.name, err,
+                )
+                loop = asyncio.get_running_loop()
+                self._polling_error_task = loop.create_task(self._handle_polling_conflict(err))
+                self._background_tasks.add(self._polling_error_task)
+                self._polling_error_task.add_done_callback(self._background_tasks.discard)
+                return False
+            if self._looks_like_network_error(err):
+                self._schedule_polling_recovery(err, reason="polling bootstrap")
+                return False
+            raise
+
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
 
@@ -2900,10 +2985,11 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 # ── Polling mode (default) ───────────────────────────
                 # Clear any stale webhook first so polling doesn't inherit a
-                # previous webhook registration and silently stop receiving updates.
-                delete_webhook = getattr(self._bot, "delete_webhook", None)
-                if callable(delete_webhook):
-                    await delete_webhook(drop_pending_updates=False)
+                # previous webhook registration and silently stop receiving
+                # updates. Best-effort: a transient Bot API network error here
+                # must not fail gateway startup — degrade to background polling
+                # recovery instead.
+                await self._delete_webhook_best_effort()
 
                 loop = asyncio.get_running_loop()
 
@@ -2920,23 +3006,32 @@ class TelegramAdapter(BasePlatformAdapter):
                         # exit on its next tick so recovery owns polling alone.
                         self._disarm_ptb_retry_loop()
                         self._polling_error_task = loop.create_task(self._handle_polling_conflict(error))
+                        self._background_tasks.add(self._polling_error_task)
+                        self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     elif self._looks_like_network_error(error):
                         logger.warning("[%s] Telegram network error, scheduling reconnect: %s", self.name, error)
                         self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
+                        self._background_tasks.add(self._polling_error_task)
+                        self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     else:
                         logger.error("[%s] Telegram polling error: %s", self.name, error, exc_info=True)
 
                 # Store reference for retry use in _handle_polling_conflict
                 self._polling_error_callback_ref = _polling_error_callback
 
-                await self._app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
+                polling_started = await self._start_polling_resilient(
                     # On a cold first boot drop the stale Bot API queue; on a
                     # watcher reconnect after an outage preserve it so messages
                     # sent while the bot was offline are delivered (#46621).
                     drop_pending_updates=not is_reconnect,
                     error_callback=_polling_error_callback,
                 )
+                if not polling_started:
+                    logger.warning(
+                        "[%s] Connected in degraded Telegram mode: gateway is alive, "
+                        "polling will be retried in the background",
+                        self.name,
+                    )
             
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
@@ -4165,15 +4260,36 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            try:
+                from gateway.devrun import (
+                    is_devflow_confirm_message,
+                    render_devflow_button_labels,
+                )
+            except Exception:
+                is_devflow_confirm_message = lambda _message: False
+                render_devflow_button_labels = lambda: {
+                    "once": "✅ Approve Once",
+                    "always": "🔒 Always Approve",
+                    "cancel": "❌ Cancel",
+                }
+            labels = (
+                render_devflow_button_labels()
+                if is_devflow_confirm_message(message)
+                else {
+                    "once": "✅ Approve Once",
+                    "always": "🔒 Always Approve",
+                    "cancel": "❌ Cancel",
+                }
+            )
             preview = self.format_message(message if len(message) <= 3800 else message[:3800] + "...")
 
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✅ Approve Once", callback_data=f"sc:once:{confirm_id}"),
-                    InlineKeyboardButton("🔒 Always Approve", callback_data=f"sc:always:{confirm_id}"),
+                    InlineKeyboardButton(labels["once"], callback_data=f"sc:once:{confirm_id}"),
+                    InlineKeyboardButton(labels["always"], callback_data=f"sc:always:{confirm_id}"),
                 ],
                 [
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"sc:cancel:{confirm_id}"),
+                    InlineKeyboardButton(labels["cancel"], callback_data=f"sc:cancel:{confirm_id}"),
                 ],
             ])
 
@@ -4904,9 +5020,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 label_map = {
-                    "once": "✅ Approved once",
-                    "always": "🔒 Always approve",
-                    "cancel": "❌ Cancelled",
+                    "once": "已启动本次",
+                    "always": "已设为始终允许",
+                    "cancel": "已暂不启动",
                 }
                 user_display = getattr(query.from_user, "first_name", "User")
                 label = label_map.get(choice, "Resolved")
@@ -4914,8 +5030,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text=label)
 
                 try:
+                    original_text = getattr(query.message, "text", "") if query.message else ""
+                    try:
+                        from gateway.devrun import (
+                            is_devflow_confirm_message,
+                            render_devflow_resolved_banner,
+                        )
+                    except Exception:
+                        is_devflow_confirm_message = lambda _message: False
+                        render_devflow_resolved_banner = None
+                    resolved_text = (
+                        render_devflow_resolved_banner(choice)
+                        if render_devflow_resolved_banner and is_devflow_confirm_message(original_text)
+                        else f"{label} by {user_display}"
+                    )
                     await query.edit_message_text(
-                        text=self.format_message(f"{label} by {user_display}"),
+                        text=self.format_message(resolved_text),
                         parse_mode=ParseMode.MARKDOWN_V2,
                         reply_markup=None,
                     )
