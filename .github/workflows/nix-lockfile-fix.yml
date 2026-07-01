@@ -43,7 +43,7 @@ jobs:
   #      triggers downstream nix.yml verification.
   auto-fix-main:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 25
     concurrency:
       group: auto-fix-main
@@ -131,7 +131,7 @@ jobs:
        && github.event.issue.pull_request != null
        && contains(github.event.comment.body, '[x] **Apply lockfile fix**')
        && !contains(github.event.changes.body.from, '[x] **Apply lockfile fix**'))
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 25
     steps:
       - name: Authorize & resolve PR

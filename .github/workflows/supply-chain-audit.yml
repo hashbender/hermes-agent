@@ -23,7 +23,7 @@ permissions:
 jobs:
   # ── Path filter (shared by both scan and dep-bounds) ───────────────
   changes:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     outputs:
       # True when any file the scanner cares about changed in this PR
       scan: ${{ steps.filter.outputs.scan }}
@@ -59,7 +59,7 @@ jobs:
     name: Scan PR for critical supply chain risks
     needs: changes
     if: needs.changes.outputs.scan == 'true'
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -186,7 +186,7 @@ jobs:
     # skipped — without it, a failed dependency would leave the required
     # check unreported (i.e. "pending"), the exact failure mode this fixes.
     if: always() && needs.changes.outputs.scan != 'true'
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - run: echo "No supply-chain-relevant files changed, skipping scan."
 
@@ -194,7 +194,7 @@ jobs:
     name: Check PyPI dependency upper bounds
     needs: changes
     if: needs.changes.outputs.deps == 'true'
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -265,6 +265,6 @@ jobs:
     # skipped — without it, a failed dependency would leave the required
     # check unreported (i.e. "pending"), the exact failure mode this fixes.
     if: always() && needs.changes.outputs.deps != 'true'
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - run: echo "No pyproject.toml changes, skipping dependency bounds check."
