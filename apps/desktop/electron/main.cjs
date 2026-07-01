@@ -10,6 +10,7 @@ const {
   nativeTheme,
   net: electronNet,
   powerMonitor,
+  powerSaveBlocker,
   protocol,
   safeStorage,
   screen,
@@ -37,6 +38,7 @@ const {
 const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const { createLinkTitleWindow } = require('./link-title-window.cjs')
 const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
+const { createPowerSaveBlockerController } = require('./power-save.cjs')
 const { adoptServedDashboardToken } = require('./dashboard-token.cjs')
 const { waitForDashboardPortAnnouncement } = require('./backend-ready.cjs')
 const { dashboardFallbackArgs, sourceDeclaresServe } = require('./backend-command.cjs')
@@ -806,6 +808,7 @@ let desktopLogBuffer = ''
 let desktopLogFlushTimer = null
 let desktopLogFlushPromise = Promise.resolve()
 let nativeThemeListenerInstalled = false
+let desktopPowerSaveBlocker = null
 let bootProgressState = {
   error: null,
   fakeMode: BOOT_FAKE_MODE,
@@ -3913,6 +3916,47 @@ function registerPowerResumeListeners() {
   }
 }
 
+function startDesktopSleepPrevention() {
+  if (desktopPowerSaveBlocker) return
+  try {
+    desktopPowerSaveBlocker = createPowerSaveBlockerController(powerSaveBlocker, {
+      configPath: path.join(HERMES_HOME, 'config.yaml'),
+      surface: 'desktop'
+    })
+    const started = desktopPowerSaveBlocker.start()
+    if (started) {
+      const mode = desktopPowerSaveBlocker.config?.mode || 'system'
+      rememberLog(`[power] sleep prevention enabled for desktop (mode=${mode}; display sleep ${mode === 'display' ? 'blocked' : 'allowed'})`)
+    }
+  } catch (error) {
+    desktopPowerSaveBlocker = null
+    rememberLog(`[power] sleep prevention setup failed: ${error.message}`)
+  }
+}
+
+function stopDesktopSleepPrevention() {
+  if (!desktopPowerSaveBlocker) return
+  try {
+    if (desktopPowerSaveBlocker.stop()) {
+      rememberLog('[power] sleep prevention cleared for desktop')
+    }
+  } catch (error) {
+    rememberLog(`[power] sleep prevention cleanup failed: ${error.message}`)
+  } finally {
+    desktopPowerSaveBlocker = null
+  }
+}
+
+function refreshDesktopSleepPrevention() {
+  stopDesktopSleepPrevention()
+  startDesktopSleepPrevention()
+  return {
+    ok: true,
+    active: Boolean(desktopPowerSaveBlocker?.isStarted?.()),
+    mode: desktopPowerSaveBlocker?.config?.mode || 'system'
+  }
+}
+
 function getAppIconPath() {
   return APP_ICON_PATHS.find(fileExists)
 }
@@ -6249,6 +6293,7 @@ ipcMain.handle('hermes:bootstrap:cancel', async () => {
   return { ok: false, cancelled: false }
 })
 ipcMain.handle('hermes:boot-progress:get', async () => bootProgressState)
+ipcMain.handle('hermes:power:refresh', async () => refreshDesktopSleepPrevention())
 ipcMain.handle('hermes:bootstrap:get', async () => getBootstrapState())
 ipcMain.handle('hermes:connection-config:get', async (_event, profile) =>
   sanitizeDesktopConnectionConfig(readDesktopConnectionConfig(), profile)
@@ -7531,6 +7576,7 @@ app.whenReady().then(() => {
   ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()
+  startDesktopSleepPrevention()
   createWindow()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
@@ -7573,6 +7619,8 @@ function configureSpellChecker() {
 }
 
 app.on('before-quit', () => {
+  stopDesktopSleepPrevention()
+
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()

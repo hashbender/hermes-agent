@@ -1930,6 +1930,19 @@ DEFAULT_CONFIG = {
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
     },
+
+    # Host power management.  Off by default because a long-running gateway or
+    # desktop app can otherwise keep a laptop awake indefinitely.  When enabled,
+    # Hermes holds a process-scoped idle-sleep assertion for the selected
+    # surfaces.  mode="system" prevents system sleep while still allowing the
+    # display to turn off; mode="display" also keeps the display awake.
+    "power": {
+        "prevent_sleep": {
+            "enabled": False,
+            "surfaces": ["desktop", "gateway"],
+            "mode": "system",
+        },
+    },
     
     # Text-to-speech configuration
     # Each provider supports an optional `max_text_length:` override for the
