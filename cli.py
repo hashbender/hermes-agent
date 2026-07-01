@@ -2510,6 +2510,26 @@ def _prepend_note_to_message(message, note: str):
     return message
 
 
+def _cli_visible_print(text: str = "") -> None:
+    """Print normally unless prompt_toolkit owns the live terminal.
+
+    Bare ``print()`` output is swallowed by ``patch_stdout`` while an
+    interactive ``Application`` is running, so ``/sessions`` and ``/history``
+    would render nothing. Route through ``_cprint`` (prompt_toolkit-native)
+    in that case, and fall back to ``print`` otherwise.
+    """
+    try:
+        from prompt_toolkit.application import get_app_or_none
+        app = get_app_or_none()
+    except Exception:
+        app = None
+
+    if app is not None and getattr(app, "_is_running", False):
+        _cprint(text)
+    else:
+        print(text)
+
+
 # ---------------------------------------------------------------------------
 # File-drop / local attachment detection — extracted as pure helpers for tests.
 # ---------------------------------------------------------------------------
@@ -5423,10 +5443,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._stream_last_was_newline = True  # start of stream = boundary
 
         if not getattr(self, "_in_reasoning_block", False):
+            # Case-insensitive matching against a lowercased view so
+            # mixed-case tag variants (<Think>, <THINKING>, …) are caught.
+            prefilt_lower = self._stream_prefilt.lower()
             for tag in _OPEN_TAGS:
+                tag_lower = tag.lower()
                 search_start = 0
                 while True:
-                    idx = self._stream_prefilt.find(tag, search_start)
+                    idx = prefilt_lower.find(tag_lower, search_start)
                     if idx == -1:
                         break
                     # Check if this is a block boundary position
@@ -5466,11 +5490,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             # Could also be a partial open tag at the end — hold it back
             if not getattr(self, "_in_reasoning_block", False):
-                # Check for partial tag match at the end
+                # Check for partial tag match at the end (case-insensitive)
                 safe = self._stream_prefilt
                 for tag in _OPEN_TAGS:
+                    tag_lower = tag.lower()
                     for i in range(1, len(tag)):
-                        if self._stream_prefilt.endswith(tag[:i]):
+                        if prefilt_lower.endswith(tag_lower[:i]):
                             safe = self._stream_prefilt[:-i]
                             break
                 if safe:
@@ -5483,8 +5508,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Keep accumulating _stream_prefilt because close tags can arrive
         # split across multiple tokens (e.g. "</REASONING_SCRATCH" + "PAD>...").
         if getattr(self, "_in_reasoning_block", False):
+            prefilt_lower = self._stream_prefilt.lower()
             for tag in _CLOSE_TAGS:
-                idx = self._stream_prefilt.find(tag)
+                idx = prefilt_lower.find(tag.lower())
                 if idx != -1:
                     self._in_reasoning_block = False
                     # When show_reasoning is on, route inner content to
@@ -6549,30 +6575,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         from hermes_cli.main import _relative_time
 
-        print()
+        _cli_visible_print()
         if reason == "history":
-            print("(._.) No messages in the current chat yet — here are recent sessions you can resume:")
+            _cli_visible_print("(._.) No messages in the current chat yet — here are recent sessions you can resume:")
         else:
-            print("  Recent sessions:")
-        print()
-        print(f"  {'#':<3} {'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
-        print(f"  {'─' * 3} {'─' * 32} {'─' * 40} {'─' * 13} {'─' * 24}")
+            _cli_visible_print("  Recent sessions:")
+        _cli_visible_print()
+        _cli_visible_print(f"  {'#':<3} {'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
+        _cli_visible_print(f"  {'─' * 3} {'─' * 32} {'─' * 40} {'─' * 13} {'─' * 24}")
         for idx, session in enumerate(sessions, start=1):
             title = session.get("title") or "—"
             preview = (session.get("preview") or "")[:38]
             last_active = _relative_time(session.get("last_active"))
-            print(f"  {idx:<3} {title:<32} {preview:<40} {last_active:<13} {session['id']}")
-        print()
-        print("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
-        print("  Example: /resume 2")
-        print()
+            _cli_visible_print(f"  {idx:<3} {title:<32} {preview:<40} {last_active:<13} {session['id']}")
+        _cli_visible_print()
+        _cli_visible_print("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
+        _cli_visible_print("  Example: /resume 2")
+        _cli_visible_print()
         return True
 
     def show_history(self):
         """Display conversation history."""
         if not self.conversation_history:
             if not self._show_recent_sessions(reason="history"):
-                print("(._.) No conversation history yet.")
+                _cli_visible_print("(._.) No conversation history yet.")
             return
 
         preview_limit = 400
@@ -6601,14 +6627,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 return
 
             noun = "message" if hidden_tool_messages == 1 else "messages"
-            print("\n  [Tools]")
-            print(f"    ({hidden_tool_messages} tool {noun} hidden)")
+            _cli_visible_print("\n  [Tools]")
+            _cli_visible_print(f"    ({hidden_tool_messages} tool {noun} hidden)")
             hidden_tool_messages = 0
 
-        print()
-        print("+" + "-" * 50 + "+")
-        print("|" + " " * 12 + "(^_^) Conversation History" + " " * 11 + "|")
-        print("+" + "-" * 50 + "+")
+        _cli_visible_print()
+        _cli_visible_print("+" + "-" * 50 + "+")
+        _cli_visible_print("|" + " " * 12 + "(^_^) Conversation History" + " " * 11 + "|")
+        _cli_visible_print("+" + "-" * 50 + "+")
 
         for msg in self.conversation_history:
             role = msg.get("role", "unknown")
@@ -6627,13 +6653,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             content_text = "" if content is None else str(content)
 
             if role == "user":
-                print(f"\n  [You #{visible_index}]{_ts_suffix(msg)}")
-                print(
+                _cli_visible_print(f"\n  [You #{visible_index}]{_ts_suffix(msg)}")
+                _cli_visible_print(
                     f"    {content_text[:preview_limit]}{'...' if len(content_text) > preview_limit else ''}"
                 )
                 continue
 
-            print(f"\n  [Hermes #{visible_index}]{_ts_suffix(msg)}")
+            _cli_visible_print(f"\n  [Hermes #{visible_index}]{_ts_suffix(msg)}")
             tool_calls = msg.get("tool_calls") or []
             if content_text:
                 preview = content_text[:preview_limit]
@@ -6646,10 +6672,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             else:
                 preview = "(no text response)"
                 suffix = ""
-            print(f"    {preview}{suffix}")
+            _cli_visible_print(f"    {preview}{suffix}")
 
         flush_tool_summary()
-        print()
+        _cli_visible_print()
     
     def _notify_session_boundary(self, event_type: str) -> None:
         """Fire a session-boundary plugin hook (on_session_finalize or on_session_reset).
@@ -8600,12 +8626,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         try:
                             # shell=True is intentional: quick_commands are user-defined
                             # shell snippets from config.yaml — not agent/LLM controlled.
+                            # Sanitize env to prevent credential leakage —
+                            # quick commands run in the CLI process which
+                            # has all API keys in os.environ.
+                            from tools.environments.local import _sanitize_subprocess_env
+                            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
                             result = subprocess.run(
                                 exec_cmd, shell=True, capture_output=True,
-                                text=True, timeout=30
+                                text=True, timeout=30, env=sanitized_env
                             )
                             output = result.stdout.strip() or result.stderr.strip()
                             if output:
+                                from agent.redact import redact_sensitive_text
+                                output = redact_sensitive_text(output)
                                 self._console_print(_rich_text_from_ansi(output))
                             else:
                                 self._console_print("[dim]Command returned no output[/]")
@@ -9254,7 +9287,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         total = agent.session_total_tokens
 
         compressor = agent.context_compressor
-        last_prompt = compressor.last_prompt_tokens
+        last_prompt = compressor.last_prompt_tokens if compressor.last_prompt_tokens > 0 else 0
         ctx_len = compressor.context_length
         pct = min(100, (last_prompt / ctx_len * 100)) if ctx_len else 0
         compressions = compressor.compression_count
