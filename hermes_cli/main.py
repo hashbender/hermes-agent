@@ -254,6 +254,54 @@ def _try_termux_ultrafast_version() -> bool:
 if _try_termux_ultrafast_version():
     raise SystemExit(0)
 
+
+def _try_acp_fastpath() -> bool:
+    """Short-circuit ``hermes acp [...]`` before the heavy CLI imports.
+
+    hermes_cli.main imports rich, prompt_toolkit, and dozens of subcommand
+    modules that add ~7s of import time on cold start.  For ``hermes acp``
+    none of that is needed — jump straight to acp_adapter.entry so the ACP
+    process is ready to accept connections seconds sooner.
+    """
+    argv = sys.argv[1:]
+    # Strip profile flag: hermes -p <name> acp ...
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("-p", "--profile") and i + 1 < len(argv):
+            i += 2
+        elif argv[i].startswith(("--profile=", "-p=")):
+            i += 1
+        else:
+            break
+    if not argv[i:] or argv[i] != "acp":
+        return False
+    # Apply profile override before any path resolution.
+    # _apply_profile_override is defined later in this module, but since we're
+    # at module scope here we call it via a forward-compatible inline version.
+    _profile = None
+    for flag in ("-p", "--profile"):
+        try:
+            idx = sys.argv.index(flag)
+            _profile = sys.argv[idx + 1]
+        except (ValueError, IndexError):
+            pass
+    for arg in sys.argv[1:]:
+        for prefix in ("--profile=", "-p="):
+            if arg.startswith(prefix):
+                _profile = arg[len(prefix):]
+    if _profile:
+        import os as _os
+        from pathlib import Path as _Path
+        _profiles_root = _Path.home() / ".hermes" / "profiles"
+        _os.environ["HERMES_HOME"] = str(_profiles_root / _profile)
+    from acp_adapter.entry import main as _acp_main  # noqa: PLC0415
+    _acp_main(argv[i + 1:])
+    return True
+
+
+if _try_acp_fastpath():
+    raise SystemExit(0)
+
 import argparse
 import hashlib
 import json
@@ -616,6 +664,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_stepfun,
     _model_flow_bedrock_api_key,
     _model_flow_bedrock,
+    _model_flow_vertex,
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
@@ -3109,6 +3158,8 @@ def select_provider_and_model(args=None):
         _model_flow_stepfun(config, current_model)
     elif selected_provider == "bedrock":
         _model_flow_bedrock(config, current_model)
+    elif selected_provider == "vertex":
+        _model_flow_vertex(config, current_model)
     elif selected_provider == "azure-foundry":
         _model_flow_azure_foundry(config, current_model)
     elif selected_provider in {
@@ -11902,7 +11953,7 @@ def _build_provider_choices() -> list[str]:
         # Fallback: static list guarantees the CLI always works
         return [
             "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
-            "anthropic", "gemini", "xai", "bedrock", "azure-foundry",
+            "anthropic", "gemini", "vertex", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
             "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
