@@ -896,6 +896,7 @@ class ContextCompressor(ContextEngine):
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
+        hygiene_hard_message_limit: int = 0,
     ):
         self.model = model
         self.base_url = base_url
@@ -919,6 +920,11 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        # Hard message-count safety valve: force compression when the number
+        # of messages exceeds this limit, regardless of token estimates.
+        # Mirrors the gateway hygiene hard limit (gateway/run.py, #2153/#4750).
+        # 0 = disabled (only token-based compression triggers apply).
+        self.hygiene_hard_message_limit = max(0, int(hygiene_hard_message_limit or 0))
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -1063,12 +1069,17 @@ class ContextCompressor(ContextEngine):
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int = None, force: bool = False) -> bool:
         """Check if context exceeds the compression threshold.
 
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
+
+        When *force* is True (e.g. the hard message-count safety valve
+        triggered), the anti-thrashing check is bypassed — the session
+        is too large to leave uncompressed regardless of recent
+        effectiveness.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
@@ -1091,7 +1102,7 @@ class ContextCompressor(ContextEngine):
                 )
             return False
         # Anti-thrashing: back off if recent compressions were ineffective
-        if self._ineffective_compression_count >= 2:
+        if not force and self._ineffective_compression_count >= 2:
             if not self.quiet_mode:
                 logger.warning(
                     "Compression skipped — last %d compressions saved <10%% each. "
