@@ -701,6 +701,102 @@ def _seed_cron_thread_session(
         )
 
 
+def _seed_cron_channel_session(
+    job: dict,
+    adapter,
+    platform_name: str,
+    chat_id: str,
+    mirror_text: str,
+    *,
+    is_dm: bool,
+    user_id: Optional[str],
+    chat_name: Optional[str] = None,
+) -> bool:
+    """Seed the FLAT (thread_id=None) session for an ``in_channel`` cron delivery.
+
+    The ``in_channel`` surface (D1/D2) delivers the brief flat into the channel
+    with no thread, so the continuation surface is the whole-channel /
+    whole-DM session keyed ``thread_id=None`` — the same bucket
+    ``reply_in_thread: false`` routes an inbound plain reply to.
+
+    Unlike the thread path, the shipped delivery-mirror alone is NOT sufficient
+    here: ``mirror_to_session`` only APPENDS to a session that already EXISTS
+    (``_find_session_id`` → no-op when none matches), and a flat channel
+    ``(…, None)`` row is only created when a human posts a top-level message the
+    bot processes — a ``chat_postMessage`` cron delivery never goes through the
+    inbound handler, so the row is usually absent and the mirror silently drops
+    the brief (verified live: the brief never landed, the reply had no context).
+    So we CREATE the flat session row first, exactly like
+    ``_seed_cron_thread_session`` does for threads, then mirror into it.
+
+    The session KEY must match what the user's later inbound reply resolves to
+    (``build_session_key``):
+    - **Channel** (``chat_type="group"``): key is
+      ``…:group:<chat_id>:<user_id>`` — user-isolated — so the seed MUST carry
+      the **origin's real ``user_id``** (the member who scheduled the job), NOT
+      a synthetic ``system:cron`` id, or the reply keys to a different session.
+    - **1:1 DM** (``chat_type="dm"``): the key is ``…:dm:<chat_id>`` and does
+      NOT embed ``user_id``, so any ``user_id`` resolves to the same session.
+    ``chat_type`` mirrors the inbound handler's own choice
+    (``"dm" if is_dm else "group"``, ``adapter.py``), so the seeded key is
+    byte-identical to the reply's key.
+
+    Returns True if a seed row was created and the brief mirrored, else False
+    (caller falls back to the plain mirror). Best-effort — a delivery that
+    already succeeded is never failed by a seeding problem.
+    """
+    text = (mirror_text or "").strip()
+    if not text:
+        return False
+    try:
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        chat_type = "dm" if is_dm else "group"
+        session_store = getattr(adapter, "_session_store", None)
+        if session_store is not None:
+            try:
+                platform_enum = Platform(platform_name.lower())
+            except (ValueError, KeyError):
+                platform_enum = None
+            if platform_enum is not None:
+                dest_source = SessionSource(
+                    platform=platform_enum,
+                    chat_id=str(chat_id),
+                    chat_name=chat_name,
+                    chat_type=chat_type,
+                    user_id=str(user_id) if user_id else None,
+                    thread_id=None,  # flat — the whole-channel/DM session
+                )
+                # Create the flat session row so the mirror has a target and the
+                # user's later plain reply joins the SAME session.
+                session_store.get_or_create_session(dest_source)
+
+        from gateway.mirror import mirror_to_session
+
+        ok = mirror_to_session(
+            platform_name,
+            str(chat_id),
+            f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n{text}",
+            source_label="cron",
+            thread_id=None,
+            user_id=str(user_id) if user_id else None,
+            role="user",
+        )
+        if ok:
+            logger.info(
+                "Job '%s': seeded flat in_channel session on %s:%s (chat_type=%s)",
+                job.get("id", "?"), platform_name, chat_id, chat_type,
+            )
+        return bool(ok)
+    except Exception as e:
+        logger.debug(
+            "Job '%s': seeding in_channel session failed for %s:%s: %s",
+            job.get("id", "?"), platform_name, chat_id, e,
+        )
+        return False
+
+
 def _cron_job_origin_log_suffix(job: dict) -> str:
     """Return safe provenance details for security warnings about a cron job.
 
@@ -1261,6 +1357,50 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         delivered = False
         target_errors = []
 
+        # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
+        # this platform generically from its config ``extra``. Default "thread"
+        # (today's behaviour, byte-identical). "in_channel" delivers the brief
+        # FLAT into the channel (no dedicated thread) so a plain channel reply
+        # continues the job in-context via the shared-channel session
+        # ``(platform, chat_id, None)`` — the same bucket ``reply_in_thread:
+        # false`` routes inbound channel messages to. The key is read
+        # generically here (any platform); the ``in_channel`` branch is gated on
+        # the adapter capability flag ``supports_inchannel_continuable`` so an
+        # unsupported platform fails SAFE to "thread" (Slack is the first
+        # consumer; "first consumer ≠ definition").
+        surface_mode = "thread"
+        try:
+            surface_raw = (pconfig.extra or {}).get("cron_continuable_surface")
+            if surface_raw is not None and str(surface_raw).strip().lower() == "in_channel":
+                surface_mode = "in_channel"
+        except Exception:
+            surface_mode = "thread"
+        in_channel_surface = surface_mode == "in_channel"
+        if in_channel_surface and runtime_adapter is not None and not getattr(
+            runtime_adapter, "supports_inchannel_continuable", False
+        ):
+            # Fail safe (D6): platform has no in_channel continuation primitive.
+            logger.debug(
+                "Job '%s': cron_continuable_surface=in_channel not supported on "
+                "%s, using thread",
+                job.get("id", "?"), platform_name,
+            )
+            in_channel_surface = False
+
+        # For an in_channel delivery the flat continuation session is created
+        # explicitly below (the shipped mirror only APPENDS to an existing
+        # session, and the flat channel row is otherwise absent for a
+        # chat_postMessage delivery). ``is_dm`` selects the session chat_type so
+        # the seeded key matches the inbound reply's key: a 1:1 DM keys as
+        # ``dm`` (Slack DM channel ids start with "D"; or the origin says so),
+        # everything else as ``group`` (shared channel). ``inchannel_seeded``
+        # suppresses the generic mirror below so the brief is not double-written.
+        origin_chat_type = str(origin.get("chat_type") or "").lower()
+        is_dm_target = origin_chat_type == "dm" or (
+            not origin_chat_type and str(chat_id).startswith("D")
+        )
+        inchannel_seeded = False
+
         # Continuable cron (thread-preferred): when mirroring is enabled for the
         # origin target and the gateway is live, try to open a DEDICATED thread
         # for this job and deliver the brief into it. On thread-capable
@@ -1269,10 +1409,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # continues with full context. On DM-only platforms (WhatsApp/Signal)
         # create_handoff_thread returns None and we fall back to mirroring into
         # the origin DM session (handled after delivery). Cf. _process_handoff.
+        #
+        # in_channel surface (D2): SKIP thread creation entirely — leave
+        # thread_id=None so the delivery posts flat, then
+        # ``_seed_cron_channel_session`` (below) CREATES the shared-channel
+        # session and mirrors the brief into it. The shipped mirror alone is
+        # NOT enough here: ``mirror_to_session`` only APPENDS to an existing
+        # session and a flat ``(platform, chat_id, None)`` row is otherwise
+        # absent for a ``chat_postMessage`` delivery, so the seed must create
+        # the row first (F5).
         thread_seeded = False
         opened_thread_id: Optional[str] = None
         if (
             mirror_this_target
+            and not in_channel_surface
             and runtime_adapter is not None
             and loop is not None
             and not thread_id  # never override an explicit origin thread/topic
@@ -1510,10 +1660,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             chat_name=origin.get("chat_name"),
                         )
                         thread_seeded = True
+                    # in_channel surface: CREATE + seed the flat channel/DM
+                    # session (the shipped mirror only appends to an existing
+                    # session — the flat row is otherwise absent for a
+                    # chat_postMessage delivery, so the brief would be lost).
+                    if in_channel_surface and mirror_this_target and not thread_seeded:
+                        inchannel_seeded = _seed_cron_channel_session(
+                            job, runtime_adapter, platform_name, chat_id,
+                            mirror_text, is_dm=is_dm_target,
+                            user_id=origin_user_id,
+                            chat_name=origin.get("chat_name"),
+                        )
                     _maybe_mirror_cron_delivery(
                         job, platform_name, chat_id, mirror_text,
                         thread_id=thread_id, user_id=origin_user_id,
-                        enabled=mirror_this_target and not thread_seeded,
+                        enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
@@ -1535,12 +1696,30 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
                 # fresh thread that has no running loop.
                 coro.close()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
-                    result = future.result(timeout=30)
+                # The thread-pool fallback can itself raise (SMTP ConnectionError,
+                # future.result timeout, etc.). An exception raised inside this
+                # `except RuntimeError` block is NOT caught by the sibling
+                # `except Exception` below — it would escape _deliver_result()
+                # and crash the whole delivery loop, silently skipping every
+                # remaining target (#47163). Wrap the fallback in its own
+                # try/except so a per-target failure is logged and the loop
+                # continues to the next target.
+                try:
+                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    try:
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        result = future.result(timeout=30)
+                    finally:
+                        pool.shutdown(wait=False)
+                except Exception as e:
+                    msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
+                    logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
+                    target_errors.extend([msg])
+                    delivery_errors.extend(target_errors)
+                    continue
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
-                logger.error("Job '%s': %s", job["id"], msg)
+                logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
                 continue
@@ -1850,20 +2029,16 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
 
-    # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[IMPORTANT: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
-    prompt = cron_hint + prompt
+    # Cron execution guidance (auto-delivery framing via PLATFORM_HINTS["cron"],
+    # [SILENT] suppression + no-send_message via CRON_DELIVERY_INVARIANTS — both
+    # in agent/prompt_builder.py / wired in agent/system_prompt.py) lands in the
+    # system-prompt slot for the cron agent instance (this module sets
+    # platform="cron" on the AIAgent it constructs). That slot is prefix-cached
+    # across a session's turns, so this is the single source of truth for
+    # cron-mode behavior. Previously a duplicate ~150-token "[IMPORTANT: ...]"
+    # block was prepended to the user-message body here on every invocation —
+    # paid per-call (user-message slot isn't cached) and mixed
+    # framework-to-model instructions into the user-message slot.
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -1976,8 +2151,8 @@ def _scan_assembled_cron_prompt(
     Two pattern tiers, selected by what the assembled prompt CONTAINS,
     not just whether skills are attached:
 
-    - When the assembled prompt is essentially the user prompt + the cron
-      hint (no skills, no injected data), the STRICT ``_scan_cron_prompt``
+    - When the assembled prompt is essentially the user prompt alone (no
+      skills, no injected data), the STRICT ``_scan_cron_prompt``
       patterns apply: a bare ``rm -rf /`` in a small directive prompt is a
       smoking gun, not prose.
     - When the assembled prompt includes runtime-loaded content — skill
@@ -2864,9 +3039,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _VAR_MAP[_var_name].set("")
         if _session_db:
             # Title the cron session from the job (name → short prompt → id) so
-            # sidebars/history show a meaningful label instead of the injected
-            # "[IMPORTANT: …]" hint that is the session's first message. Set here
-            # (not at create time) so the agent's own INSERT keeps model /
+            # sidebars/history show a meaningful, stable label rather than
+            # whatever the session's first message happens to be (its content
+            # varies with the job: task prompt, script output header, etc.,
+            # and multi-turn tool use can push the actual task prompt out of
+            # a naive "first message" preview anyway). Set here (not at create
+            # time) so the agent's own INSERT keeps model /
             # system_prompt; this only UPDATEs the title column. The run-time
             # suffix keeps it unique against the sessions.title index across runs.
             try:

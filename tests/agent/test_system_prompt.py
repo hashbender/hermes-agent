@@ -99,3 +99,54 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestCronDeliveryInvariants:
+    """CRON_DELIVERY_INVARIANTS ([SILENT] suppression + no send_message) must
+    reach the system prompt for every cron run, and must survive a
+    platform_hints.cron override — unlike PLATFORM_HINTS["cron"] (the
+    descriptive hint), it is NOT subject to the replace/append override
+    resolved by _resolve_platform_hint. See agent/prompt_builder.py's
+    CRON_DELIVERY_INVARIANTS docstring for the full rationale."""
+
+    def test_present_for_cron_platform(self):
+        stable = _stable_prompt(_make_agent(platform="cron"))
+        # Base descriptive hint (PLATFORM_HINTS["cron"], via _effective_hint)
+        # must still land alongside the invariants — this guards against a
+        # regression where _effective_hint silently stops resolving while
+        # CRON_DELIVERY_INVARIANTS alone keeps this test green.
+        assert "There is no user present" in stable
+        assert "send_message" in stable
+        assert "[SILENT]" in stable
+
+    def test_absent_for_non_cron_platform(self):
+        stable = _stable_prompt(_make_agent(platform="cli"))
+        assert "[SILENT]" not in stable
+
+    def test_survives_platform_hints_replace_override(self):
+        """Regression guard: an admin using the documented
+        platform_hints.cron.replace override to customize the descriptive
+        cron hint's wording must never accidentally disable [SILENT]
+        suppression or the send_message prohibition — those are scheduler
+        mechanics (cron/scheduler.py::run_job), not just tone."""
+        agent = _make_agent(
+            platform="cron",
+            _platform_hint_overrides={
+                "cron": {"replace": "Custom cron hint with no mention of delivery mechanics."}
+            },
+        )
+        stable = _stable_prompt(agent)
+        assert "Custom cron hint with no mention of delivery mechanics." in stable
+        assert "send_message" in stable
+        assert "[SILENT]" in stable
+
+    def test_survives_platform_hints_append_override(self):
+        agent = _make_agent(
+            platform="cron",
+            _platform_hint_overrides={"cron": {"append": "Extra operator note."}},
+        )
+        stable = _stable_prompt(agent)
+        assert "Extra operator note." in stable
+        assert "send_message" in stable
+        assert "[SILENT]" in stable
+
