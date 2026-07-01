@@ -165,6 +165,16 @@ except (ValueError, TypeError):
 _WS_ORPHAN_REAP_GRACE_S = max(0.0, _ws_orphan_reap_grace)
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
+_PUSH_EVENT_TYPES = frozenset(
+    {
+        "approval.request",
+        "clarify.request",
+        "message.complete",
+        "subagent.complete",
+        "background.complete",
+        "preview.restart.complete",
+    }
+)
 
 # ── Async RPC dispatch (#12546) ──────────────────────────────────────
 # A handful of handlers block the dispatcher loop in entry.py for seconds
@@ -284,6 +294,14 @@ class _SlashWorker:
         self._closed = False
         from hermes_cli._subprocess_compat import windows_hide_flags
 
+        # start_new_session=True detaches the slash worker into its own
+        # process group / session. Without this, the worker inherits the
+        # gateway's pgid (= TUI parent PID). When mcp_tool's
+        # _kill_orphaned_mcp_children races with slash_worker spawn and sweeps
+        # the gateway's child set, it captures the worker PID, records the
+        # inherited pgid, and killpg() then kills the TUI parent itself.
+        # See agent/lsp/client.py for the symmetric LSP server fix and
+        # tools/mcp_tool.py _filter_mcp_children for defense-in-depth.
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -296,6 +314,7 @@ class _SlashWorker:
             # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
             env=hermes_subprocess_env(inherit_credentials=True),
             creationflags=windows_hide_flags(),
+            start_new_session=True,
         )
         threading.Thread(target=self._drain_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -990,6 +1009,28 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     if payload is not None:
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
+    _queue_push_notification(event, sid, payload or {})
+
+
+def _queue_push_notification(event: str, sid: str, payload: dict) -> None:
+    if event not in _PUSH_EVENT_TYPES:
+        return
+    session = _sessions.get(sid) or {}
+    session_key = str(session.get("session_key") or "").strip()
+    if not session_key:
+        return
+    try:
+        from gateway.push_notifications import notify_event
+
+        notify_event(
+            event,
+            session_key=session_key,
+            live_session_id=sid,
+            payload=payload,
+            raw_config=_load_cfg(),
+        )
+    except Exception as exc:
+        logger.warning("Failed to queue push notification intent for %s: %s", event, exc)
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
@@ -2964,12 +3005,31 @@ def _get_usage(agent) -> dict:
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:
-        ctx_used = getattr(comp, "last_prompt_tokens", 0) or usage["total"] or 0
+        # context_used is the *current-window* occupancy. Do NOT fall back to
+        # usage["total"] (cumulative lifetime session_total_tokens): for an
+        # external context engine that doesn't report last_prompt_tokens that
+        # substitution showed lifetime totals as the live context fill, yielding
+        # impossible readings such as 1.9m/120k clamped to 100% (#50421).
+        #
+        # Per the issue, populate context_used/percent only from a *real*
+        # current-occupancy value and "leave it unknown otherwise" — so a falsy
+        # last_prompt_tokens (0 or missing, i.e. an engine that doesn't track
+        # per-window occupancy) intentionally emits no gauge rather than a
+        # fabricated 0% or the old cumulative reading. The built-in compressor
+        # always reports a real last_prompt_tokens once a turn runs, so it is
+        # unaffected.
+        # Clamp the -1 "compression just ran, awaiting real usage" sentinel
+        # (conversation_compression.py) to 0 so the transitional turn reads as
+        # unknown (no gauge) instead of leaking context_used=-1. Matches the
+        # CLI status-bar path (cli.py _get_status_bar_snapshot).
+        last_prompt = getattr(comp, "last_prompt_tokens", 0) or 0
+        if last_prompt < 0:
+            last_prompt = 0
         ctx_max = getattr(comp, "context_length", 0) or 0
-        if ctx_max:
-            usage["context_used"] = ctx_used
+        if ctx_max and last_prompt:
+            usage["context_used"] = last_prompt
             usage["context_max"] = ctx_max
-            usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
+            usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
@@ -8121,7 +8181,12 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
             user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
-            if ordinal >= len(user_indices):
+            # Reject out-of-range ordinals on BOTH ends. A negative value would
+            # otherwise sail past the upper-bound check and hit Python's negative
+            # indexing below (user_indices[-1] -> the LAST user turn), silently
+            # truncating history to everything before it and persisting that loss
+            # via replace_messages — an unrecoverable overwrite of the session DB.
+            if ordinal < 0 or ordinal >= len(user_indices):
                 return _err(rid, 4018, "target user message is no longer in session history")
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
@@ -9674,6 +9739,87 @@ def _(rid, params: dict) -> dict:
 
     threading.Thread(target=run, daemon=True).start()
     return _ok(rid, {"task_id": task_id})
+
+
+# ── Methods: push notifications ──────────────────────────────────────
+
+
+@method("push.register")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    try:
+        from gateway.push_notifications import PushRegistrationError, register_device
+
+        return _ok(
+            rid,
+            register_device(
+                params,
+                session_key=session.get("session_key") or "",
+                live_session_id=params.get("session_id") or "",
+                raw_config=_load_cfg(),
+            ),
+        )
+    except PushRegistrationError as exc:
+        return _err(rid, 4002, str(exc))
+    except Exception as exc:
+        return _err(rid, 5004, str(exc))
+
+
+@method("push.unregister")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    try:
+        from gateway.push_notifications import PushRegistrationError, unregister_device
+
+        return _ok(
+            rid,
+            unregister_device(
+                params.get("device_id") or "",
+                session_key=session.get("session_key") or "",
+                raw_config=_load_cfg(),
+            ),
+        )
+    except PushRegistrationError as exc:
+        return _err(rid, 4002, str(exc))
+    except Exception as exc:
+        return _err(rid, 5004, str(exc))
+
+
+@method("push.list")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    try:
+        from gateway.push_notifications import (
+            list_registrations,
+            load_push_config,
+            relay_configured,
+        )
+
+        cfg = load_push_config(_load_cfg())
+        return _ok(
+            rid,
+            {
+                "registrations": list_registrations(
+                    session_key=session.get("session_key") or "",
+                    raw_config=_load_cfg(),
+                ),
+                "relay": {
+                    "enabled": cfg.enabled,
+                    "configured": relay_configured(cfg),
+                    "url_configured": bool(cfg.relay_url),
+                    "token_env": cfg.relay_token_env,
+                    "token_configured": bool(cfg.relay_token),
+                },
+            },
+        )
+    except Exception as exc:
+        return _err(rid, 5004, str(exc))
 
 
 # ── Methods: respond ─────────────────────────────────────────────────
@@ -11310,6 +11456,11 @@ def _(rid, params: dict) -> dict:
     if name in qcmds:
         qc = qcmds[name]
         if qc.get("type") == "exec":
+            # Sanitize env to prevent credential leakage —
+            # quick commands run in the TUI server process which
+            # has all API keys in os.environ.
+            from tools.environments.local import _sanitize_subprocess_env
+            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
             r = subprocess.run(
                 qc.get("command", ""),
                 shell=True,
@@ -11317,12 +11468,16 @@ def _(rid, params: dict) -> dict:
                 text=True,
                 timeout=30,
                 stdin=subprocess.DEVNULL,
+                env=sanitized_env,
             )
             output = (
                 (r.stdout or "")
                 + ("\n" if r.stdout and r.stderr else "")
                 + (r.stderr or "")
             ).strip()[:4000]
+            if output:
+                from agent.redact import redact_sensitive_text
+                output = redact_sensitive_text(output)
             if r.returncode != 0:
                 return _err(
                     rid,
