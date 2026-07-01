@@ -147,6 +147,7 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bxapp-\d+-[A-Za-z0-9\-]{20,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{20,}\b"),
     re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b"),
@@ -3654,6 +3655,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         If the error is retryable (e.g. network blip, DNS failure), queue the
         platform for background reconnection instead of giving up permanently.
         """
+        # Snapshot the current owner of this platform slot before doing
+        # anything else. If it's neither this adapter nor empty, a different
+        # adapter has already taken over (e.g. this is a delayed notification
+        # from a background retry chain that raced with, and lost to, a
+        # reconnect that already succeeded). Acting on a stale notification
+        # would overwrite an already-healthy platform's runtime status and
+        # incorrectly re-queue it for reconnection, so bail out before any of
+        # that happens.
+        existing = self.adapters.get(adapter.platform)
+        if existing is not None and existing is not adapter:
+            logger.debug(
+                "Ignoring stale fatal error from a superseded %s adapter instance: %s",
+                adapter.platform.value,
+                adapter.fatal_error_code or "unknown",
+            )
+            return
+
         logger.error(
             "Fatal %s adapter error (%s): %s",
             adapter.platform.value,
@@ -3677,13 +3695,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             error_message=adapter.fatal_error_message,
         )
 
-        existing = self.adapters.get(adapter.platform)
         if existing is adapter:
-            try:
-                await adapter.disconnect()
-            finally:
-                self.adapters.pop(adapter.platform, None)
-                self.delivery_router.adapters = self.adapters
+            # Claim this adapter for teardown before awaiting disconnect() —
+            # a second fatal-error notification for the same adapter (e.g.
+            # from a concurrent recovery path) would otherwise still see
+            # itself as "existing" during the await below and disconnect()
+            # the same object twice.
+            self.adapters.pop(adapter.platform, None)
+            self.delivery_router.adapters = self.adapters
+            await adapter.disconnect()
 
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
