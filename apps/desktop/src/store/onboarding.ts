@@ -27,8 +27,9 @@ export type OnboardingFlow =
   | { provider: OAuthProvider; status: 'starting' }
   | { code: string; provider: OAuthProvider; start: PkceStart; status: 'awaiting_user' }
   | { copied: boolean; provider: OAuthProvider; start: DeviceStart; status: 'polling' }
-  // Loopback PKCE (xAI Grok): browser opens, the local backend's 127.0.0.1
-  // listener catches the redirect, and we poll until the worker finishes.
+  // Loopback PKCE (xAI Grok): browser opens and the configured gateway owns
+  // the redirect listener/session state; the desktop only polls until the
+  // worker finishes.
   // No code to paste and no user_code to show — just a waiting state.
   | { provider: OAuthProvider; start: LoopbackStart; status: 'awaiting_browser' }
   | { provider: OAuthProvider; start: OAuthStartResponse; status: 'submitting' }
@@ -531,7 +532,7 @@ export async function refreshOnboarding(ctx: OnboardingContext) {
       kind: 'error',
       title: 'Runtime not ready',
       message:
-        'Hermes Desktop could not verify the running backend on startup. Some features may be unavailable until the gateway is reachable.'
+        'Reuben could not verify the remote gateway on startup. Some features may be unavailable until the gateway is reachable.'
     })
 
     return false

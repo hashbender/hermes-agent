@@ -85,12 +85,11 @@ export const ja = defineLocale({
       remoteDescription:
         'リモートゲートウェイのセッションが期限切れです。再接続するにはもう一度サインインしてください。チャットや設定は削除されません。',
       retry: '再試行',
-      repairInstall: 'インストールを修復',
-      useLocalGateway: 'ローカルゲートウェイを使用',
+      configureGateway: 'ゲートウェイを設定',
       openLogs: 'ログを開く',
-      repairHint: '修復はインストーラーを再実行します。新しいマシンでは数分かかる場合があります。',
+      repairHint: 'リモート Hermes ゲートウェイ URL を設定してから、接続を再試行してください。',
       remoteSignInHint:
-        'ゲートウェイのログインウィンドウを開きます。代わりにバンドルされたバックエンドに切り替えるには「ローカルゲートウェイを使用」を選択してください。',
+        'ゲートウェイのログインウィンドウを開きます。設定でゲートウェイ URL やトークンを更新することもできます。',
       hideRecentLogs: '最近のログを非表示',
       showRecentLogs: '最近のログを表示',
       signedInTitle: 'サインインしました',
@@ -181,8 +180,7 @@ export const ja = defineLocale({
     showRightSidebar: '右サイドバーを表示',
     muteHaptics: '触覚フィードバックをオフ',
     unmuteHaptics: '触覚フィードバックをオン',
-    openSettings: '設定を開く',
-    openStarmap: 'メモリグラフを開く'
+    openSettings: '設定を開く'
   },
 
   language: {
@@ -630,18 +628,17 @@ export const ja = defineLocale({
       title: 'ゲートウェイ接続',
       envOverride: 'env オーバーライド',
       intro:
-        'Hermes Desktop はデフォルトで独自のローカルゲートウェイを起動します。別のマシンや信頼できるプロキシの背後で既に動作している Hermes バックエンドをこのアプリで制御する場合は、リモートゲートウェイを使用してください。以下でプロファイルを選択して、それぞれのリモートホストを設定します。',
+        'Hermes Desktop は、URL で指定された実行中の Hermes バックエンドに接続します。バックエンドは同じマシンでも別ホストでもかまいませんが、別コンポーネントとしてインストール・管理されます。',
       appliesTo: '適用対象',
       allProfiles: 'すべてのプロファイル',
       defaultConnection: '独自のオーバーライドがないすべてのプロファイルのデフォルト接続。',
       profileConnection: profile =>
-        `"${profile}" がアクティブプロファイルのときのみ使用される接続。ローカルに設定するとデフォルトを継承します。`,
+        `"${profile}" がアクティブプロファイルのときのみ使用される接続。未設定にするとデフォルトを継承します。`,
       envOverrideTitle: '環境変数がこのデスクトップセッションを制御しています。',
       envOverrideDesc:
         '保存された設定を使用するには HERMES_DESKTOP_REMOTE_URL と HERMES_DESKTOP_REMOTE_TOKEN の設定を解除してください。',
       localTitle: 'ローカルゲートウェイ',
-      localDesc:
-        'ローカルホストでプライベートな Hermes バックエンドを起動します。これがデフォルトで、オフラインでも動作します。',
+      localDesc: '同じマシンのバックエンドも、他のバックエンドと同じように URL で設定します。',
       remoteTitle: 'リモートゲートウェイ',
       remoteDesc:
         'このデスクトップシェルをリモートの Hermes バックエンドに接続します。ホスト型ゲートウェイは OAuth またはユーザー名とパスワードを使用します。自己ホスト型はセッショントークンを使用する場合があります。',
@@ -865,21 +862,6 @@ export const ja = defineLocale({
     failedToUpdate: name => `${name} の更新に失敗しました`
   },
 
-  starmap: {
-    title: 'メモリグラフ',
-    subtitle: (nodes, clusters) => `${clusters} カテゴリの ${nodes} スキル`,
-    close: 'メモリグラフを閉じる',
-    refresh: '更新',
-    memory: 'メモリ',
-    filterAll: 'すべて',
-    filterUsed: '使用済み',
-    filterLearned: '学習済み',
-    viewGraph: 'グラフ',
-    loadFailed: 'メモリグラフを読み込めませんでした',
-    loading: '読み込み中…',
-    emptyTitle: 'まだ学習はありません',
-    emptyDesc: 'Hermes がスキルやメモリを蓄積すると、ここに表示されます。'
-  },
   agents: {
     close: 'エージェントを閉じる',
     title: 'スポーンツリー',
@@ -1466,8 +1448,6 @@ export const ja = defineLocale({
       copyPath: 'パスをコピー',
       removeFromSidebar: 'サイドバーから削除',
       createFailed: 'プロジェクトを作成できませんでした',
-      staleBackend:
-        'プロジェクトを作成するには Hermes バックエンドを更新してください。バックエンドがこのデスクトップアプリより古いです（設定 → 更新 → バックエンド）。',
       deleteConfirm:
         'Hermes から保存済みプロジェクトを削除します。ファイル・git リポジトリ・ワークツリーはそのまま残ります。',
       startWork: '新しいワークツリー',
@@ -1983,8 +1963,6 @@ export const ja = defineLocale({
       running: count => `${count} 実行中`,
       cron: 'Cron',
       openCron: 'Cron ジョブを開く',
-      starmap: 'メモリグラフ',
-      openStarmap: 'メモリグラフを開く',
       turnRunning: '実行中',
       currentTurnElapsed: '現在のターン経過時間',
       contextUsage: 'コンテキスト使用状況',

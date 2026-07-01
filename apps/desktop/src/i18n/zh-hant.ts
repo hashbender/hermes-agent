@@ -83,11 +83,10 @@ export const zhHant = defineLocale({
       remoteTitle: '需要重新登入遠端閘道',
       remoteDescription: '您的遠端閘道工作階段已過期。請重新登入以重新連線。這裡的操作不會刪除您的聊天或設定。',
       retry: '重試',
-      repairInstall: '修復安裝',
-      useLocalGateway: '使用本機閘道',
+      configureGateway: '設定閘道',
       openLogs: '開啟記錄',
-      repairHint: '修復會重新執行安裝程式，在新機器上可能需要幾分鐘。',
-      remoteSignInHint: '開啟閘道登入視窗。使用本機閘道可切換至內建後端。',
+      repairHint: '設定遠端 Hermes 閘道 URL，然後重試連線。',
+      remoteSignInHint: '開啟閘道登入視窗。您也可以在設定中更新閘道 URL 或權杖。',
       hideRecentLogs: '隱藏最近記錄',
       showRecentLogs: '顯示最近記錄',
       signedInTitle: '已登入',
@@ -175,8 +174,7 @@ export const zhHant = defineLocale({
     showRightSidebar: '顯示右側邊欄',
     muteHaptics: '靜音觸感回饋',
     unmuteHaptics: '開啟觸感回饋',
-    openSettings: '開啟設定',
-    openStarmap: '開啟記憶圖譜'
+    openSettings: '開啟設定'
   },
 
   language: {
@@ -618,15 +616,15 @@ export const zhHant = defineLocale({
       title: '閘道連線',
       envOverride: '環境變數覆寫',
       intro:
-        'Hermes Desktop 預設會啟動自己的本機閘道。如果您希望此應用程式控制另一台機器或可信代理後面已執行的 Hermes 後端，請使用遠端閘道。在下方按設定檔指定各自的遠端主機。',
+        'Hermes Desktop 透過 URL 連線至已執行的 Hermes 後端。後端可以位於本機或其他主機，但需分開安裝與管理。',
       appliesTo: '套用至',
       allProfiles: '全部設定檔',
       defaultConnection: '預設連線適用於所有沒有自訂覆寫的設定檔。',
-      profileConnection: profile => `僅當「${profile}」為作用中設定檔時使用此連線。設為本機可繼承預設連線。`,
+      profileConnection: profile => `僅當「${profile}」為作用中設定檔時使用此連線。留空即可繼承預設連線。`,
       envOverrideTitle: '環境變數正在控制此桌面工作階段。',
       envOverrideDesc: '取消設定 HERMES_DESKTOP_REMOTE_URL 和 HERMES_DESKTOP_REMOTE_TOKEN 後才會使用下方儲存的設定。',
       localTitle: '本機閘道',
-      localDesc: '在 localhost 啟動私有 Hermes 後端。這是預設方式，可離線使用。',
+      localDesc: '本機後端也透過 URL 設定，與其他後端相同。',
       remoteTitle: '遠端閘道',
       remoteDesc:
         '將此桌面殼層連線至遠端 Hermes 後端。託管閘道使用 OAuth 或帳號密碼；自託管閘道也可使用工作階段 Token。',
@@ -837,21 +835,6 @@ export const zhHant = defineLocale({
     failedToUpdate: name => `更新 ${name} 失敗`
   },
 
-  starmap: {
-    title: '記憶圖譜',
-    subtitle: (nodes, clusters) => `${clusters} 個類別中的 ${nodes} 個技能`,
-    close: '關閉記憶圖譜',
-    refresh: '重新整理',
-    memory: '記憶',
-    filterAll: '全部',
-    filterUsed: '已使用',
-    filterLearned: '已學習',
-    viewGraph: '圖譜',
-    loadFailed: '無法載入記憶圖譜',
-    loading: '載入中…',
-    emptyTitle: '尚無學習內容',
-    emptyDesc: '當 Hermes 為你的工作建立技能與記憶時，會顯示在這裡。'
-  },
   agents: {
     close: '關閉代理',
     title: '派生樹',
@@ -1419,8 +1402,6 @@ export const zhHant = defineLocale({
       copyPath: '複製路徑',
       removeFromSidebar: '從側邊欄移除',
       createFailed: '無法建立專案',
-      staleBackend:
-        '請更新 Hermes 後端以建立專案——目前後端比桌面應用舊（設定 → 更新 → 後端）。',
       deleteConfirm: '這會從 Hermes 中移除已儲存的專案。檔案、git 儲存庫和工作樹維持不變。',
       startWork: '新增工作樹',
       newWorktreeTitle: '新增工作樹',
@@ -1922,8 +1903,6 @@ export const zhHant = defineLocale({
       running: count => `${count} 個執行中`,
       cron: '排程',
       openCron: '開啟排程工作',
-      starmap: '記憶圖譜',
-      openStarmap: '開啟記憶圖譜',
       turnRunning: '執行中',
       currentTurnElapsed: '目前回合已用時間',
       contextUsage: '上下文使用量',
