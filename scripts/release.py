@@ -1129,6 +1129,7 @@ AUTHOR_MAP = {
     "oncuevtv@gmail.com": "sprmn24",
     "programming@olafthiele.com": "olafthiele",
     "r2668940489@gmail.com": "r266-tech",
+    "r266-tech@users.noreply.github.com": "r266-tech",  # PR #55780 salvage (dead-target not_found blast radius)
     "s5460703@gmail.com": "BlackishGreen33",
     "saul.jj.wu@gmail.com": "SaulJWu",
     "shenhaocheng19990111@gmail.com": "hcshen0111",
@@ -1203,7 +1204,6 @@ AUTHOR_MAP = {
     "xiayh17@gmail.com": "xiayh0107",
     "zhujianxyz@gmail.com": "opriz",
     "tuancanhnguyen706@gmail.com": "xxxigm",
-    "timchris.roth@pm.me": "x9x9x9x9x9x91",
     "larcombe.n@gmail.com": "NickLarcombe",
     "54813621+xxxigm@users.noreply.github.com": "xxxigm",
     "asurla@nvidia.com": "anniesurla",
