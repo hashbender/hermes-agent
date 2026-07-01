@@ -3518,6 +3518,18 @@ function runRenderTitleJob(rawUrl) {
   return new Promise(resolve => {
     if (!app.isReady()) return resolve('')
 
+    // Only http(s) URLs can be loaded in a hidden BrowserWindow for title
+    // extraction. Non-http protocols (e.g. bitbrowser://) would otherwise
+    // trigger the OS external protocol handler dialog as a side effect.
+    try {
+      const parsed = new URL(rawUrl)
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return resolve('')
+      }
+    } catch {
+      return resolve('')
+    }
+
     const partitionSession = getLinkTitleSession()
     if (!partitionSession) return resolve('')
 
@@ -5108,24 +5120,13 @@ function resetBootProgressForReconnect() {
   )
 }
 
-function stopBackendChild(child) {
-  if (!child || child.killed) return
-  try {
-    if (IS_WINDOWS && Number.isInteger(child.pid)) {
-      forceKillProcessTree(child.pid)
-    } else {
-      child.kill('SIGTERM')
-    }
-  } catch {
-    // Already gone.
-  }
-}
-
 function resetHermesConnection() {
   connectionPromise = null
   backendStartFailure = null
 
-  stopBackendChild(hermesProcess)
+  if (hermesProcess && !hermesProcess.killed) {
+    hermesProcess.kill('SIGTERM')
+  }
 
   hermesProcess = null
   resetBootProgressForReconnect()
@@ -5373,7 +5374,13 @@ function stopPoolBackend(profile) {
   const entry = backendPool.get(profile)
   if (!entry) return
   backendPool.delete(profile)
-  stopBackendChild(entry.process)
+  if (entry.process && !entry.process.killed) {
+    try {
+      entry.process.kill('SIGTERM')
+    } catch {
+      // Already gone.
+    }
+  }
 }
 
 async function teardownPoolBackendAndWait(profile) {
@@ -5381,7 +5388,13 @@ async function teardownPoolBackendAndWait(profile) {
   if (!entry) return
   backendPool.delete(profile)
 
-  stopBackendChild(entry.process)
+  if (entry.process && !entry.process.killed) {
+    try {
+      entry.process.kill('SIGTERM')
+    } catch {
+      // Already gone.
+    }
+  }
 
   await waitForBackendExit(entry.process)
 }
@@ -7599,7 +7612,9 @@ app.on('before-quit', () => {
     disposeTerminalSession(id)
   }
 
-  stopBackendChild(hermesProcess)
+  if (hermesProcess && !hermesProcess.killed) {
+    hermesProcess.kill('SIGTERM')
+  }
   stopAllPoolBackends()
 })
 
