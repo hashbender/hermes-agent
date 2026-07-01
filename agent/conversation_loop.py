@@ -794,6 +794,10 @@ def run_conversation(
                 api_msg.pop("finish_reason")
             # Strip internal thinking-prefill marker
             api_msg.pop("_thinking_prefill", None)
+            # Strip internal wall-clock timestamp (SessionDB persistence metadata).
+            # Strict providers (Fireworks-backed OpenCode Go, Mistral, Kimi K2.5)
+            # reject unknown message keys with HTTP 400.
+            api_msg.pop("timestamp", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields
