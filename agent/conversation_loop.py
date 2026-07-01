@@ -2034,27 +2034,11 @@ def run_conversation(
                         api_duration, _cache_pct,
                     )
 
-                    # On the MoA path, agent.model/provider are the virtual
-                    # preset name ("closed") and "moa", which have no pricing
-                    # entry — estimating against them returns None and silently
-                    # drops the aggregator's own spend, leaving the session cost
-                    # as advisor-fan-out only (a ~50% undercount when the
-                    # aggregator does the full acting loop). Price the aggregator
-                    # turn at its REAL model/provider, read from the MoA client's
-                    # resolved aggregator slot.
-                    _agg_cost_model = agent.model
-                    _agg_cost_provider = agent.provider
-                    _agg_cost_base_url = agent.base_url
-                    _agg_slot = getattr(_moa_client, "last_aggregator_slot", None) if _moa_client is not None else None
-                    if _agg_slot and _agg_slot.get("model"):
-                        _agg_cost_model = _agg_slot["model"]
-                        _agg_cost_provider = _agg_slot.get("provider") or agent.provider
-                        _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
                     cost_result = estimate_usage_cost(
-                        _agg_cost_model,
+                        agent.model,
                         aggregator_usage,
-                        provider=_agg_cost_provider,
-                        base_url=_agg_cost_base_url,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
                     if cost_result.amount_usd is not None:
@@ -4530,6 +4514,12 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                # ── Lazy tool expansion ──────────────────────────────────
+                # If describe_tool("X") was called successfully, expand the
+                # available tools to include X on the next API call.
+                if getattr(agent, "_lazy_tool_mode", False) and hasattr(agent, "_all_tool_schemas"):
+                    _expand_lazy_tools_after_turn(agent, assistant_message)
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
@@ -5153,3 +5143,62 @@ def run_conversation(
 
 
 __all__ = ["run_conversation"]
+
+
+def _expand_lazy_tools_after_turn(agent, assistant_message):
+    """Check if describe_tool was called and expand available tools.
+
+    Called after tool execution in lazy-tool mode.  Scans the assistant
+    message's tool_calls for ``describe_tool`` invocations and adds the
+    requested tool schemas to ``agent.tools`` so the next API call
+    includes them.
+
+    This is what makes the lazy-loading mechanism work: the model can
+    ``describe_tool("read_file")`` to inspect a tool's schema, and on
+    the very next turn it can call ``read_file()`` directly because
+    its schema has been added to the API tools parameter.
+    """
+    if not agent._lazy_tool_mode:
+        return
+
+    tool_calls = getattr(assistant_message, "tool_calls", None)
+    if not tool_calls:
+        return
+
+    requested = set()
+    for tc in tool_calls:
+        fn = getattr(tc, "function", None)
+        if fn is None:
+            continue
+        if getattr(fn, "name", "") != "describe_tool":
+            continue
+        try:
+            args = json.loads(getattr(fn, "arguments", "{}"))
+            tool_name = args.get("tool_name", "")
+            if tool_name and tool_name in agent._all_tool_schemas:
+                requested.add(tool_name)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    if not requested:
+        return
+
+    # Only add tools that aren't already loaded
+    new_tools = [agent._all_tool_schemas[name] for name in requested
+                 if name not in agent._lazy_tool_names]
+    if not new_tools:
+        return
+
+    agent._lazy_tool_names.update(requested)
+    agent.tools.extend(new_tools)
+    agent.valid_tool_names.update(requested)
+    # Sort by name for deterministic order
+    agent.tools.sort(key=lambda t: t["function"]["name"])
+
+    _names = sorted(requested)
+    logger.info(
+        "%sLazy-loaded tools: %s (total: %d schemas in API parameter)",
+        getattr(agent, "log_prefix", ""),
+        ", ".join(_names),
+        len(agent.tools),
+    )
