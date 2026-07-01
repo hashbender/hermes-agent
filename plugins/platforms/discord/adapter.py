@@ -1075,11 +1075,18 @@ class DiscordAdapter(BasePlatformAdapter):
                     # _is_allowed_user docstring).
                     _msg_guild = getattr(message, "guild", None)
                     _is_dm = isinstance(message.channel, discord.DMChannel) or _msg_guild is None
+                    _msg_channel_ids = None
+                    if not _is_dm:
+                        _msg_channel_ids = {str(message.channel.id)}
+                        _parent_id = adapter_self._get_parent_channel_id(message.channel)
+                        if _parent_id:
+                            _msg_channel_ids.add(_parent_id)
                     if not self._is_allowed_user(
                         str(message.author.id),
                         message.author,
                         guild=_msg_guild,
                         is_dm=_is_dm,
+                        channel_ids=_msg_channel_ids,
                     ):
                         return
                     _role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
@@ -3085,6 +3092,18 @@ class DiscordAdapter(BasePlatformAdapter):
             except OSError:
                 pass
 
+    def _discord_channel_ids_allowed(self, channel_ids: set[str]) -> bool:
+        """True when *channel_ids* intersect ``DISCORD_ALLOWED_CHANNELS``."""
+        if not channel_ids:
+            return False
+        allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "").strip()
+        if not allowed_raw:
+            return False
+        allowed = {c.strip() for c in allowed_raw.split(",") if c.strip()}
+        if "*" in allowed:
+            return True
+        return bool(channel_ids & allowed)
+
     def _is_allowed_user(
         self,
         user_id: str,
@@ -3092,11 +3111,15 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         guild=None,
         is_dm: bool = False,
+        channel_ids: Optional[set[str]] = None,
     ) -> bool:
         """Check if user is allowed via DISCORD_ALLOWED_USERS or DISCORD_ALLOWED_ROLES.
 
         Uses OR semantics: if the user matches EITHER allowlist, they're allowed.
-        If both allowlists are empty, everyone is allowed (backwards compatible).
+        With no user/role allowlists configured, guild traffic may still pass when
+        ``channel_ids`` matches ``DISCORD_ALLOWED_CHANNELS`` — but only when the
+        caller supplies the validated channel context (on_message, slash). Calls
+        without channel context (e.g. voice utterances) do not get this bypass.
 
         Role checks are **scoped to the guild the message originated from**.
         For DMs (no guild context), role-based auth is disabled by default and
@@ -3111,6 +3134,8 @@ class DiscordAdapter(BasePlatformAdapter):
             author: Optional Member/User object for in-guild role lookup.
             guild: The guild the message arrived in (None for DMs).
             is_dm: True if the message came from a DM channel.
+            channel_ids: Resolved text-channel ids for guild traffic when an
+                upstream gate has already scoped the message to a channel.
         """
         # ``getattr`` fallbacks here guard against test fixtures that build
         # an adapter via ``object.__new__(DiscordAdapter)`` and skip __init__
@@ -3120,7 +3145,20 @@ class DiscordAdapter(BasePlatformAdapter):
         has_users = bool(allowed_users)
         has_roles = bool(allowed_roles)
         if not has_users and not has_roles:
-            return True
+            if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+                return True
+            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+                return True
+            # Channel-scoped guild access requires validated channel context.
+            # Do not treat DISCORD_ALLOWED_CHANNELS alone as a user-wide bypass
+            # (voice loops and other guild-scoped callers may lack channel ids).
+            if (
+                not is_dm
+                and channel_ids is not None
+                and self._discord_channel_ids_allowed(channel_ids)
+            ):
+                return True
+            return False
         # Check user ID allowlist (works for both DMs and guild messages).
         # ``"*"`` is honored as an open-mode wildcard, mirroring
         # ``SIGNAL_ALLOWED_USERS`` and the existing ``DISCORD_ALLOWED_CHANNELS`` /
@@ -3184,11 +3222,11 @@ class DiscordAdapter(BasePlatformAdapter):
     # operator. ``_check_slash_authorization`` mirrors the on_message gates
     # one-for-one so the slash surface honors the same trust boundary.
     #
-    # By design, this is a no-op for deployments with no allowlist env vars
-    # set — ``_is_allowed_user`` returns True and the channel checks early-out
-    # — preserving the existing "single-tenant, all guild members trusted"
-    # default. Deployments that DO set any DISCORD_ALLOWED_* var get slash
-    # parity with on_message.
+    # Deployments with no allowlist env vars fail closed unless an explicit
+    # allow-all opt-in is set. When only ``DISCORD_ALLOWED_CHANNELS`` is
+    # configured, guild traffic is authorized per validated channel context
+    # (not as a user-wide bypass). Slash and on_message both pass the
+    # resolved channel ids into ``_is_allowed_user`` after the channel gate.
 
     def _evaluate_slash_authorization(
         self, interaction: "discord.Interaction",
@@ -3215,6 +3253,8 @@ class DiscordAdapter(BasePlatformAdapter):
         chan_obj = getattr(interaction, "channel", None)
         in_dm = isinstance(chan_obj, discord.DMChannel) if chan_obj is not None else False
 
+        channel_ids: set = set()
+        channel_keys: set = set()
         # ── Channel scope (mirrors on_message lines 3374-3388) ──
         # DMs aren't channel-gated — DMs follow on_message's DM lockdown
         # path which has its own user-allowlist enforcement.
@@ -3222,7 +3262,6 @@ class DiscordAdapter(BasePlatformAdapter):
             chan_id_raw = getattr(interaction, "channel_id", None) or getattr(
                 chan_obj, "id", None,
             )
-            channel_ids: set = set()
             if chan_id_raw is not None:
                 channel_ids.add(str(chan_id_raw))
                 # Mirror on_message: also test the parent channel for threads
@@ -3270,13 +3309,12 @@ class DiscordAdapter(BasePlatformAdapter):
         allowed_users = getattr(self, "_allowed_user_ids", set()) or set()
         allowed_roles = getattr(self, "_allowed_role_ids", set()) or set()
         if user is None or getattr(user, "id", None) is None:
-            # No identifiable user. With any user/role allowlist
-            # configured, fail closed rather than raise AttributeError
-            # on ``interaction.user.id`` below. With no allowlist this
-            # is the existing "no allowlist = everyone" backwards-compat.
+            # No identifiable user — fail closed even with allow-all opt-in.
+            # Downstream slash handlers (_build_slash_event, etc.) require
+            # interaction.user.id and do not synthesize a safe identity.
             if allowed_users or allowed_roles:
                 return (False, "missing interaction.user with allowlist configured")
-            return (True, None)
+            return (False, "missing interaction.user")
 
         user_id = str(user.id)
         # Pass guild + is_dm so role check is scoped to the originating
@@ -3288,6 +3326,7 @@ class DiscordAdapter(BasePlatformAdapter):
             author=user,
             guild=interaction_guild,
             is_dm=in_dm,
+            channel_ids=channel_keys if not in_dm else None,
         ):
             return (
                 False,
@@ -6255,6 +6294,10 @@ def _component_check_auth(
       - user is approved in the pairing store -> allow
       - otherwise -> reject
     """
+    user = getattr(interaction, "user", None)
+    if user is None or getattr(user, "id", None) is None:
+        return False
+
     if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
         return True
     if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
@@ -6270,9 +6313,6 @@ def _component_check_auth(
     role_set = set(allowed_role_ids or set())
     has_users = bool(user_set)
     has_roles = bool(role_set)
-    user = getattr(interaction, "user", None)
-    if user is None:
-        return False
 
     # Resolve user ID once for both allowlist and pairing checks.
     try:
@@ -6677,6 +6717,7 @@ def _define_discord_view_classes() -> None:
             self.resolved = False
             self._selected_provider: str = ""
             self._pending_expensive_model: str = ""
+            self._model_page: int = 0
 
             self._build_provider_select()
 
@@ -6727,8 +6768,11 @@ def _define_discord_view_classes() -> None:
                 return
 
             models = provider.get("models", [])
+            page = self._model_page
+            start = page * 25
+            end = start + 25
             options = []
-            for model_id in models[:25]:
+            for model_id in models[start:end]:
                 short = model_id.split("/")[-1] if "/" in model_id else model_id
                 options.append(
                     discord.SelectOption(
@@ -6758,6 +6802,24 @@ def _define_discord_view_classes() -> None:
             )
             cancel_btn.callback = self._on_cancel
             self.add_item(cancel_btn)
+
+            # Pagination: show Prev/Next when models exceed 25
+            total_pages = (len(models) + 24) // 25
+            if total_pages > 1:
+                if page > 0:
+                    prev_btn = discord.ui.Button(
+                        label="◀ Prev", style=discord.ButtonStyle.grey,
+                        custom_id="model_prev_page",
+                    )
+                    prev_btn.callback = self._on_prev_models
+                    self.add_item(prev_btn)
+                if end < len(models):
+                    next_btn = discord.ui.Button(
+                        label="Next ▶", style=discord.ButtonStyle.grey,
+                        custom_id="model_next_page",
+                    )
+                    next_btn.callback = self._on_next_models
+                    self.add_item(next_btn)
 
         def _build_expensive_confirm(self, model_id: str):
             """Build confirmation buttons for unusually expensive models."""
@@ -6803,6 +6865,7 @@ def _define_discord_view_classes() -> None:
 
             provider_slug = interaction.data["values"][0]
             self._selected_provider = provider_slug
+            self._model_page = 0
             provider = next(
                 (p for p in self.providers if p["slug"] == provider_slug), None
             )
@@ -6811,13 +6874,14 @@ def _define_discord_view_classes() -> None:
             self._build_model_select(provider_slug)
 
             total = provider.get("total_models", 0) if provider else 0
-            shown = min(len(provider.get("models", [])), 25) if provider else 0
-            extra = f"\n*{total - shown} more available — type `/model <name>` directly*" if total > shown else ""
+            models = provider.get("models", []) if provider else []
+            total_pages = (len(models) + 24) // 25
+            page_info = f" (page 1/{total_pages})" if total_pages > 1 else ""
 
             await interaction.response.edit_message(
                 embed=discord.Embed(
                     title="⚙ Model Configuration",
-                    description=f"Provider: **{pname}**\nSelect a model:{extra}",
+                    description=f"Provider: **{pname}**\nSelect a model{page_info}:",
                     color=discord.Color.blue(),
                 ),
                 view=self,
@@ -6912,6 +6976,56 @@ def _define_discord_view_classes() -> None:
                 self._pending_expensive_model,
             )
 
+        async def _on_next_models(self, interaction: discord.Interaction):
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+            self._model_page += 1
+            self._build_model_select(self._selected_provider)
+            provider = next(
+                (p for p in self.providers if p["slug"] == self._selected_provider), None
+            )
+            models = provider.get("models", []) if provider else []
+            total_pages = (len(models) + 24) // 25
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description=(
+                        f"Provider: **{provider.get('name', self._selected_provider) if provider else self._selected_provider}**\n"
+                        f"Select a model (page {self._model_page + 1}/{total_pages}):"
+                    ),
+                    color=discord.Color.blue(),
+                ),
+                view=self,
+            )
+
+        async def _on_prev_models(self, interaction: discord.Interaction):
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
+            self._model_page = max(0, self._model_page - 1)
+            self._build_model_select(self._selected_provider)
+            provider = next(
+                (p for p in self.providers if p["slug"] == self._selected_provider), None
+            )
+            models = provider.get("models", []) if provider else []
+            total_pages = (len(models) + 24) // 25
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="⚙ Model Configuration",
+                    description=(
+                        f"Provider: **{provider.get('name', self._selected_provider) if provider else self._selected_provider}**\n"
+                        f"Select a model (page {self._model_page + 1}/{total_pages}):"
+                    ),
+                    color=discord.Color.blue(),
+                ),
+                view=self,
+            )
+
         async def _on_back(self, interaction: discord.Interaction):
             if not self._check_auth(interaction):
                 await interaction.response.send_message(
@@ -6919,6 +7033,7 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
+            self._model_page = 0
             self._build_provider_select()
 
             try:
