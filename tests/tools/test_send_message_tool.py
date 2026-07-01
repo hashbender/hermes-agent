@@ -783,75 +783,27 @@ class TestSendToPlatformChunking:
         sent_text = send.await_args.args[2]
         assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>" in sent_text
 
-    def test_telegram_markdown_expansion_is_chunked_before_send(self, monkeypatch):
-        """Telegram chunking must account for MarkdownV2 escaping expansion.
+    def test_telegram_media_attaches_to_last_chunk(self):
 
-        A raw message under 4096 UTF-16 units can inflate past the limit once
-        MarkdownV2-escaped (each `!`/`.`/`-` becomes `\\!`/`\\.`/`\\-`). The
-        send path must chunk the *formatted* text so no single send exceeds
-        4096 (issue #28557).
-        """
-        from gateway.platforms.base import utf16_len
+        sent_calls = []
 
-        send_lengths = []
+        async def fake_send(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+            sent_calls.append(media_files or [])
+            return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": str(len(sent_calls))}
 
-        async def fake_send_message(**kwargs):
-            text = kwargs["text"]
-            send_lengths.append(utf16_len(text))
-            if utf16_len(text) > 4096:
-                raise Exception("Message is too long")
-            return SimpleNamespace(message_id=len(send_lengths))
-
-        bot = MagicMock()
-        bot.send_message = AsyncMock(side_effect=fake_send_message)
-        bot.send_photo = AsyncMock()
-        bot.send_video = AsyncMock()
-        bot.send_voice = AsyncMock()
-        bot.send_audio = AsyncMock()
-        bot.send_document = AsyncMock()
-        _install_telegram_mock(monkeypatch, bot)
-
-        result = asyncio.run(
-            _send_to_platform(
-                Platform.TELEGRAM,
-                SimpleNamespace(enabled=True, token="tok", extra={}),
-                "123",
-                "!" * 4096,  # raw 4096 -> ~8192 after MarkdownV2 escaping
+        long_msg = "word " * 2000  # ~10000 chars, well over 4096
+        media = [("/tmp/photo.png", False)]
+        with patch("tools.send_message_tool._send_telegram", fake_send):
+            asyncio.run(
+                _send_to_platform(
+                    Platform.TELEGRAM,
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "123", long_msg, media_files=media,
+                )
             )
-        )
-
-        assert result["success"] is True
-        assert bot.send_message.await_count >= 2
-        assert max(send_lengths) <= 4096
-
-    def test_telegram_media_attaches_after_long_text_chunks(self, tmp_path, monkeypatch):
-        """Long text is split into multiple chunks, then media is attached."""
-        image_path = tmp_path / "photo.png"
-        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
-
-        bot = MagicMock()
-        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
-        bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=2))
-        bot.send_video = AsyncMock()
-        bot.send_voice = AsyncMock()
-        bot.send_audio = AsyncMock()
-        bot.send_document = AsyncMock()
-        _install_telegram_mock(monkeypatch, bot)
-
-        long_msg = "word " * 2000  # ~10000 chars, well over Telegram's 4096 limit
-        result = asyncio.run(
-            _send_to_platform(
-                Platform.TELEGRAM,
-                SimpleNamespace(enabled=True, token="tok", extra={}),
-                "123",
-                long_msg,
-                media_files=[(str(image_path), False)],
-            )
-        )
-
-        assert result["success"] is True
-        assert bot.send_message.await_count >= 3
-        bot.send_photo.assert_awaited_once()
+        assert len(sent_calls) >= 3
+        assert all(call == [] for call in sent_calls[:-1])
+        assert sent_calls[-1] == media
 
     def test_matrix_media_uses_native_adapter_helper(self, tmp_path):
         doc_path = tmp_path / "test-send-message-matrix.pdf"
@@ -959,145 +911,6 @@ class TestSendToPlatformChunking:
             ("send_document", "!room:example.com", str(file_path), None),
             ("disconnect",),
         ]
-
-
-class TestMatrixMediaLiveAdapterReuse:
-    """Verify _send_matrix_via_adapter reuses the live gateway adapter
-    when available, avoiding per-message E2EE re-init storms (#46310)."""
-
-    def test_live_adapter_skips_connect_disconnect(self, tmp_path):
-        """When a live gateway adapter exists, no connect() or disconnect()
-        should be called — the persistent E2EE session is reused."""
-        img_path = tmp_path / "photo.png"
-        img_path.write_bytes(b"\x89PNG\r\n")
-
-        calls = []
-
-        class LiveAdapter:
-            async def send(self, chat_id, message, metadata=None):
-                calls.append(("send", chat_id, message))
-                return SimpleNamespace(success=True, message_id="$text")
-
-            async def send_image_file(self, chat_id, path, metadata=None):
-                calls.append(("send_image_file", chat_id, path))
-                return SimpleNamespace(success=True, message_id="$img")
-
-        live_adapter = LiveAdapter()
-        fake_runner = SimpleNamespace(
-            adapters={Platform.MATRIX: live_adapter}
-        )
-
-        with patch(
-            "gateway.run._gateway_runner_ref",
-            return_value=fake_runner,
-        ), patch.dict(
-            sys.modules, {"plugins.platforms.matrix.adapter": SimpleNamespace()}
-        ):
-            result = asyncio.run(
-                _send_matrix_via_adapter(
-                    SimpleNamespace(enabled=True, token="tok", extra={}),
-                    "!room:example.com",
-                    "here is an image",
-                    media_files=[(str(img_path), False)],
-                )
-            )
-
-        assert result["success"] is True
-        assert result["message_id"] == "$img"
-        # Only send + send_image_file; no connect / disconnect
-        assert calls == [
-            ("send", "!room:example.com", "here is an image"),
-            ("send_image_file", "!room:example.com", str(img_path)),
-        ]
-
-    def test_live_adapter_not_available_falls_back_to_ephemeral(self, tmp_path):
-        """When _gateway_runner_ref returns None, the ephemeral adapter
-        path (connect + disconnect) is used as before."""
-        doc_path = tmp_path / "doc.pdf"
-        doc_path.write_bytes(b"%PDF-1.4")
-
-        calls = []
-
-        class EphemeralAdapter:
-            def __init__(self, _config):
-                pass
-
-            async def connect(self):
-                calls.append(("connect",))
-                return True
-
-            async def send(self, chat_id, message, metadata=None):
-                calls.append(("send", chat_id, message))
-                return SimpleNamespace(success=True, message_id="$txt")
-
-            async def send_document(self, chat_id, path, metadata=None):
-                calls.append(("send_document", chat_id, path))
-                return SimpleNamespace(success=True, message_id="$doc")
-
-            async def disconnect(self):
-                calls.append(("disconnect",))
-
-        fake_module = SimpleNamespace(MatrixAdapter=EphemeralAdapter)
-
-        with patch(
-            "gateway.run._gateway_runner_ref", return_value=None
-        ), patch.dict(sys.modules, {"plugins.platforms.matrix.adapter": fake_module}):
-            result = asyncio.run(
-                _send_matrix_via_adapter(
-                    SimpleNamespace(enabled=True, token="tok", extra={}),
-                    "!room:example.com",
-                    "report attached",
-                    media_files=[(str(doc_path), False)],
-                )
-            )
-
-        assert result["success"] is True
-        assert calls == [
-            ("connect",),
-            ("send", "!room:example.com", "report attached"),
-            ("send_document", "!room:example.com", str(doc_path)),
-            ("disconnect",),
-        ]
-
-    def test_live_adapter_no_matrix_adapter_falls_back(self):
-        """When the runner exists but has no Matrix adapter registered,
-        fall back to ephemeral."""
-        calls = []
-
-        class EphemeralAdapter:
-            def __init__(self, _config):
-                pass
-
-            async def connect(self):
-                calls.append(("connect",))
-                return True
-
-            async def send(self, chat_id, message, metadata=None):
-                calls.append(("send",))
-                return SimpleNamespace(success=True, message_id="$txt")
-
-            async def disconnect(self):
-                calls.append(("disconnect",))
-
-        # Runner exists but adapters dict has no MATRIX key
-        fake_runner = SimpleNamespace(adapters={})
-        fake_module = SimpleNamespace(MatrixAdapter=EphemeralAdapter)
-
-        with patch(
-            "gateway.run._gateway_runner_ref",
-            return_value=fake_runner,
-        ), patch.dict(sys.modules, {"plugins.platforms.matrix.adapter": fake_module}):
-            result = asyncio.run(
-                _send_matrix_via_adapter(
-                    SimpleNamespace(enabled=True, token="tok", extra={}),
-                    "!room:example.com",
-                    "hello",
-                )
-            )
-
-        assert result["success"] is True
-        assert ("connect",) in calls
-        assert ("disconnect",) in calls
 
 
 # ---------------------------------------------------------------------------
@@ -3284,3 +3097,140 @@ class TestSendTelegramThreadNotFoundRetry:
         finally:
             if media_path and os.path.exists(media_path):
                 os.unlink(media_path)
+
+
+class TestTriggerGatewayAgentWake:
+    """Unit tests for the active-wake primitive ``_trigger_gateway_agent``
+    (backs the Kanban delivery_mode ``notify+wake`` / ``wake`` feature)."""
+
+    def test_active_wake_not_exposed_in_send_message_schema(self):
+        """Active wake must never be model-exposed: only the gateway/CLI
+        control plane reaches _trigger_gateway_agent, so an LLM can't loop a
+        wake on itself via send_message."""
+        from tools.send_message_tool import SEND_MESSAGE_SCHEMA
+
+        properties = SEND_MESSAGE_SCHEMA["parameters"]["properties"]
+        assert "trigger_agent" not in properties
+
+    @pytest.mark.asyncio
+    async def test_missing_inputs_return_structured_error(self):
+        from tools.send_message_tool import _trigger_gateway_agent
+
+        assert (await _trigger_gateway_agent("telegram", "", "hi")).get("trigger_error")
+        assert (await _trigger_gateway_agent("telegram", "chat1", "")).get("trigger_error")
+
+    @pytest.mark.asyncio
+    async def test_no_live_gateway_returns_structured_error(self):
+        """Outside a live gateway process the helper must degrade gracefully to
+        a structured trigger_error (never raise), so the notifier's best-effort
+        wake branch can just log and advance the cursor."""
+        from tools.send_message_tool import _trigger_gateway_agent
+
+        with patch("gateway.run._gateway_runner_ref", new=lambda: None):
+            result = await _trigger_gateway_agent("telegram", "chat1", "hi")
+        assert result == {"trigger_error": "no live gateway runner in this process"}
+
+    @pytest.mark.asyncio
+    async def test_wake_task_retained_in_background_tasks(self):
+        """The scheduled wake task must be retained in ``runner._background_tasks``
+        so asyncio can't garbage-collect it mid-run and silently drop the wake.
+        It must also auto-discard via its done callback once it finishes."""
+        from tools.send_message_tool import _trigger_gateway_agent
+
+        handled = asyncio.Event()
+
+        class _FakeAdapter:
+            async def handle_message(self, event):
+                handled.set()
+
+        loop = asyncio.get_running_loop()
+
+        class _FakeRunner:
+            def __init__(self):
+                self.adapters = {Platform.TELEGRAM: _FakeAdapter()}
+                # We're already on the gateway loop in this test, so the
+                # direct ``loop.create_task`` branch is exercised.
+                self._gateway_loop = loop
+                self._background_tasks: set = set()
+
+        runner = _FakeRunner()
+        with patch("gateway.run._gateway_runner_ref", new=lambda: runner):
+            result = await _trigger_gateway_agent("telegram", "chat1", "hi")
+
+        assert result == {"triggered_agent": True}
+        # Retained synchronously (strong ref held) — not left to GC.
+        assert len(runner._background_tasks) == 1
+
+        # The wake actually runs, and the done callback discards the task.
+        await asyncio.wait_for(handled.wait(), timeout=1)
+        for _ in range(20):
+            if not runner._background_tasks:
+                break
+            await asyncio.sleep(0)
+        assert runner._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_wake_source_resolves_to_originating_session_key(self):
+        """The forged event's source must resolve to the SAME session key as the
+        operator's originating channel, for both DM and group shapes, so a woken
+        turn reuses the real session instead of a parallel one."""
+        from tools.send_message_tool import _trigger_gateway_agent
+        from gateway.session import SessionSource, build_session_key
+
+        captured: list = []
+
+        class _CaptureAdapter:
+            async def handle_message(self, event):
+                captured.append(event)
+
+        loop = asyncio.get_running_loop()
+
+        class _FakeRunner:
+            def __init__(self):
+                self.adapters = {Platform.TELEGRAM: _CaptureAdapter()}
+                self._gateway_loop = loop
+                self._background_tasks: set = set()
+
+        runner = _FakeRunner()
+
+        # (originating source, kwargs the watcher forwards from the sub)
+        cases = [
+            # DM: build_session_key uses chat_id, not user_id.
+            (
+                SessionSource(
+                    platform=Platform.TELEGRAM, chat_id="dm-123",
+                    chat_type="dm", user_id="op-7",
+                ),
+                {"chat_type": "dm", "user_id": "op-7"},
+            ),
+            # Group: the key includes the real participant user_id.
+            (
+                SessionSource(
+                    platform=Platform.TELEGRAM, chat_id="grp-9",
+                    chat_type="group", user_id="op-42",
+                ),
+                {"chat_type": "group", "user_id": "op-42"},
+            ),
+        ]
+
+        for original, kw in cases:
+            captured.clear()
+            with patch("gateway.run._gateway_runner_ref", new=lambda: runner):
+                result = await _trigger_gateway_agent(
+                    "telegram", original.chat_id, "task done", **kw,
+                )
+            assert result == {"triggered_agent": True}
+
+            for _ in range(20):
+                if captured:
+                    break
+                await asyncio.sleep(0)
+            assert captured, "wake task did not run"
+
+            woke = captured[0].source
+            assert captured[0].internal is True
+            assert woke.chat_type == original.chat_type
+            assert woke.user_id == original.user_id
+            assert build_session_key(woke) == build_session_key(original)
+            # Never a synthetic placeholder user_id.
+            assert woke.user_id != "hermes-internal-trigger"

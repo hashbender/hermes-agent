@@ -75,7 +75,6 @@ import hashlib
 import json
 import os
 import re
-import random
 import secrets
 import shutil
 import sqlite3
@@ -285,43 +284,6 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
-
-
-def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
-    """Render the age of an epoch-seconds timestamp as a coarse, human-
-    readable string like ``just now``, ``18h ago``, ``3d ago``.
-
-    Workers read parent handoffs, comments, and prior-attempt summaries as
-    if they describe *current* state. A bare absolute timestamp
-    (``2026-06-25 14:30``) doesn't make an LLM reason about staleness — it
-    reads the content as fact regardless of how old it is. A relative age
-    ("18h ago") is the signal that prompts the worker to re-verify against
-    the live source before acting on stale sibling work. Returns an empty
-    string for missing/invalid timestamps so callers can append
-    unconditionally.
-    """
-    if ts is None:
-        return ""
-    try:
-        ts = int(ts)
-    except (TypeError, ValueError):
-        return ""
-    if now is None:
-        now = int(time.time())
-    delta = now - ts
-    if delta < 0:
-        # Clock skew across machines/profiles — don't claim "in the future".
-        return "just now"
-    if delta < 60:
-        return "just now"
-    if delta < 3600:
-        m = delta // 60
-        return f"{m}m ago"
-    if delta < 86400:
-        h = delta // 3600
-        return f"{h}h ago"
-    d = delta // 86400
-    return f"{d}d ago"
 
 
 # ---------------------------------------------------------------------------
@@ -1257,7 +1219,9 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     chat_id       TEXT NOT NULL,
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
+    chat_type     TEXT NOT NULL DEFAULT 'dm',
     notifier_profile TEXT,
+    delivery_mode TEXT NOT NULL DEFAULT 'notify',
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -2026,6 +1990,24 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+        if "delivery_mode" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "delivery_mode",
+                "delivery_mode TEXT NOT NULL DEFAULT 'notify'",
+            )
+        if "chat_type" not in notify_cols:
+            # Records the originating source's chat_type so the active-wake
+            # delivery modes resolve the operator's real channel. Legacy rows
+            # default to 'dm'; they are passive 'notify' subs that never wake,
+            # so the default is inert and corrected on any re-subscribe.
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "chat_type",
+                "chat_type TEXT NOT NULL DEFAULT 'dm'",
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2149,7 +2131,9 @@ _REBUILD_SPECS = {
         "CREATE TABLE kanban_notify_subs ("
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
-        " notifier_profile TEXT, created_at INTEGER NOT NULL,"
+        " chat_type TEXT NOT NULL DEFAULT 'dm',"
+        " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
+        " created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
@@ -2271,38 +2255,6 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
         pass  # I/O errors during check are non-fatal; let normal ops continue
 
 
-# SQLite's own busy_timeout uses a near-deterministic backoff, so concurrent
-# writers re-collide in lockstep under a stampede. A jittered retry on the
-# transaction boundary breaks that convoy. Mirrors state.db's _execute_write:
-# a fixed 20-150ms jitter band (a 20ms floor prevents a near-zero retry from
-# busy-spinning back into the collision). Only BEGIN IMMEDIATE and COMMIT are
-# retried -- both are idempotent re-issues that touch no transaction body, so a
-# CAS inside write_txn is never replayed. kanban keeps fewer retries than
-# state.db (5 vs 15) because its 120s busy_timeout already absorbs most waits;
-# the retry is the backstop for the tail SQLite returns BUSY on immediately.
-_BUSY_MAX_RETRIES = 5
-_BUSY_RETRY_MIN_S = 0.020  # 20ms
-_BUSY_RETRY_MAX_S = 0.150  # 150ms
-
-
-def _is_busy_error(exc: BaseException) -> bool:
-    return isinstance(exc, sqlite3.OperationalError) and (
-        "database is locked" in str(exc).lower()
-        or "database is busy" in str(exc).lower()
-    )
-
-
-def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
-    for attempt in range(_BUSY_MAX_RETRIES + 1):
-        try:
-            conn.execute(sql)
-            return
-        except sqlite3.OperationalError as exc:
-            if not _is_busy_error(exc) or attempt == _BUSY_MAX_RETRIES:
-                raise
-            time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
-
-
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection):
     """Context manager for an IMMEDIATE write transaction.
@@ -2315,7 +2267,7 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
     except Exception:
@@ -2328,16 +2280,7 @@ def write_txn(conn: sqlite3.Connection):
             pass
         raise
     else:
-        try:
-            _execute_boundary_with_retry(conn, "COMMIT")
-        except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
-            raise
+        conn.execute("COMMIT")
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
@@ -2666,6 +2609,44 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                if parents:
+                    # ACK-edge inheritance: a child inherits the parent/root
+                    # task's terminal-notification return path (chat_type and
+                    # delivery_mode included), so the originating channel still
+                    # hears about a child that BLOCKs, not just the final fan-in.
+                    # The child task_id is brand-new, so INSERT OR IGNORE copies
+                    # each sub.
+                    placeholders = ",".join("?" * len(parents))
+                    parent_subs = conn.execute(
+                        "SELECT * FROM kanban_notify_subs "
+                        f"WHERE task_id IN ({placeholders}) "
+                        "ORDER BY created_at ASC",
+                        parents,
+                    ).fetchall()
+                    for psub in parent_subs:
+                        # Inherit chat_type and delivery_mode so a woken child
+                        # notification keys to the parent's channel.
+                        psub_mode = psub["delivery_mode"] or "notify"
+                        psub_chat_type = psub["chat_type"] or "dm"
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO kanban_notify_subs
+                                (task_id, platform, chat_id, thread_id, user_id,
+                                 chat_type, notifier_profile, delivery_mode, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                task_id,
+                                psub["platform"],
+                                psub["chat_id"],
+                                psub["thread_id"] or "",
+                                psub["user_id"],
+                                psub_chat_type,
+                                psub["notifier_profile"],
+                                psub_mode,
+                                now,
+                            ),
+                        )
                 _append_event(
                     conn,
                     task_id,
@@ -7922,11 +7903,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if not task:
         raise ValueError(f"unknown task {task_id}")
 
-    # Single clock reading shared by every relative-age stamp below, so all
-    # ages in one rendering are consistent ("3h ago" / "3h ago", not drifting
-    # by the seconds it takes to build the block).
-    _now = int(time.time())
-
     def _cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
         """Truncate a string to `limit` chars with a visible ellipsis."""
         if not s:
@@ -8006,11 +7982,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         for offset, run in enumerate(shown):
             idx = first_shown_idx + offset
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
-            age = _relative_age(run.started_at, _now)
-            ts_disp = f"{ts}, {age}" if age else ts
             profile = run.profile or "(unknown)"
             outcome = run.outcome or run.status
-            lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})")
+            lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts})")
             if run.summary and run.summary.strip():
                 lines.append(_cap(run.summary))
             if run.error and run.error.strip():
@@ -8044,24 +8018,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
             if not wrote_header:
                 lines.append("## Parent task results")
-                lines.append(
-                    "_Handoffs from upstream tasks, captured when each parent "
-                    "completed (see age below). These are point-in-time "
-                    "snapshots, not live state — if a result drives your "
-                    "current work and it's not recent, re-verify against the "
-                    "source before acting on it as current._"
-                )
                 wrote_header = True
-
-            # When did this parent's result get produced? Prefer the
-            # completed run's end time; fall back to the task's completed_at.
-            done_ts = None
-            if run is not None and getattr(run, "ended_at", None):
-                done_ts = run.ended_at
-            elif pt.completed_at:
-                done_ts = pt.completed_at
-            age = _relative_age(done_ts, _now)
-            lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
+            lines.append(f"### {pid}")
 
             body_lines: list[str] = []
             if run is not None and run.summary and run.summary.strip():
@@ -8101,11 +8059,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 ts = time.strftime(
                     "%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"]))
                 )
-                age = _relative_age(row["ended_at"], _now)
-                ts_disp = f"{ts}, {age}" if age else ts
                 s = (row["summary"] or "").strip().splitlines()
                 first = s[0][:200] if s else "(no summary)"
-                lines.append(f"- {row['id']} — {row['title']} ({ts_disp}): {first}")
+                lines.append(f"- {row['id']} — {row['title']} ({ts}): {first}")
             lines.append("")
 
     # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
@@ -8127,8 +8083,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             )
         for c in shown_c:
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.created_at))
-            age = _relative_age(c.created_at, _now)
-            ts_disp = f"{ts}, {age}" if age else ts
             # Render author with explicit "comment from worker" framing so
             # operator-controlled HERMES_PROFILE values like "hermes-system"
             # or "operator" can't be misread by the next worker as a system
@@ -8136,7 +8090,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             # Defense-in-depth — the LLM-controlled author-forgery surface
             # was already closed in #22435. See #22452.
             safe_author = (c.author or "").replace("`", "")
-            lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
+            lines.append(f"comment from worker `{safe_author}` at {ts}:")
             lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
             lines.append("")
 
@@ -8233,6 +8187,14 @@ def task_age(task: Task) -> dict:
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
 
+# How the gateway kanban-notifier reacts to a terminal event for a
+# subscription:
+#   "notify"       -> passive ``adapter.send`` only (default)
+#   "notify+wake"  -> passive send AND wake the destination gateway agent
+#   "wake"         -> wake the agent only; no passive message is sent
+_NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -8241,20 +8203,50 @@ def add_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    chat_type: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    delivery_mode: Optional[str] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    for ``task_id``. Idempotent on (task, platform, chat, thread).
+
+    ``chat_type`` records the originating source's chat_type ("dm", "group",
+    "channel", "thread"); the active-wake delivery modes replay it so the woken
+    turn resolves the operator's real channel. ``None`` keeps an existing row's
+    value (and defaults a fresh row to ``"dm"``); a truthy value is
+    last-write-wins so a re-subscribe can correct a legacy default.
+
+    ``delivery_mode`` (see ``_NOTIFY_DELIVERY_MODES``) selects how the
+    kanban-notifier reacts to a terminal event for this subscription. ``None``
+    leaves an existing row's mode untouched (and inserts the ``"notify"``
+    default for a fresh row); an explicit value is last-write-wins, so an
+    operator can intentionally re-subscribe to change the mode (e.g.
+    ``notify`` -> ``wake``). An unknown value falls back to ``"notify"``.
+    """
+    insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else "notify"
+    insert_chat_type = chat_type or "dm"
     now = int(time.time())
     with write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, chat_type, notifier_profile, delivery_mode, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (task_id, platform, chat_id, thread_id or "", user_id, insert_chat_type, notifier_profile, insert_mode, now),
         )
+        if chat_type:
+            # Refresh chat_type on re-subscribe so a legacy 'dm' default is
+            # corrected once the real source is known; a ``None`` caller never
+            # clobbers the existing value.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET chat_type = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                """,
+                (chat_type, task_id, platform, chat_id, thread_id or ""),
+            )
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by
             # backfilling only when the existing value is unset.
@@ -8266,6 +8258,17 @@ def add_notify_sub(
                    AND (notifier_profile IS NULL OR notifier_profile = '')
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+            )
+        if delivery_mode in _NOTIFY_DELIVERY_MODES:
+            # Explicit delivery_mode is last-write-wins on re-subscribe; a
+            # ``None`` caller does NOT clobber the existing mode.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET delivery_mode = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                """,
+                (delivery_mode, task_id, platform, chat_id, thread_id or ""),
             )
 
 
