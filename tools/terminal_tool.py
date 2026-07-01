@@ -893,7 +893,7 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     should prepend sudo_stdin to their stdin_data and pass the merged bytes to
     Popen's stdin pipe.
 
-    Callers that cannot pipe subprocess stdin (modal, daytona, tenki) must embed
+    Callers that cannot pipe subprocess stdin (modal, daytona) must embed
     the password in the command string themselves; see their execute()
     methods for how they handle the non-None sudo_stdin case.
 
@@ -1386,6 +1386,35 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
         has_direct=has_direct_modal_credentials(),
         managed_ready=is_managed_tool_gateway_ready("modal"),
     )
+
+
+def _container_config_from_env_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the shared container-backend config passed to _create_environment."""
+    return {
+        "container_cpu": config.get("container_cpu", 1),
+        "container_memory": config.get("container_memory", 5120),
+        "container_disk": config.get("container_disk", 51200),
+        "container_persistent": config.get("container_persistent", True),
+        "modal_mode": config.get("modal_mode", "auto"),
+        "docker_volumes": config.get("docker_volumes", []),
+        "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+        "docker_forward_env": config.get("docker_forward_env", []),
+        "docker_env": config.get("docker_env", {}),
+        "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+        "docker_extra_args": config.get("docker_extra_args", []),
+        "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+        "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+        "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
+        "tenki_workspace_id": config.get("tenki_workspace_id", ""),
+        "tenki_project_id": config.get("tenki_project_id", ""),
+        "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
+        "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
+        "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
+        "tenki_max_duration": config.get("tenki_max_duration", 3600),
+        "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
+        "tenki_pause_retention": config.get("tenki_pause_retention", 0),
+        "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
+    }
 
 
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
@@ -2224,31 +2253,7 @@ def terminal_tool(
 
                         container_config = None
                         if env_type in _CONTAINER_BACKENDS:
-                            container_config = {
-                                "container_cpu": config.get("container_cpu", 1),
-                                "container_memory": config.get("container_memory", 5120),
-                                "container_disk": config.get("container_disk", 51200),
-                                "container_persistent": config.get("container_persistent", True),
-                                "modal_mode": config.get("modal_mode", "auto"),
-                                "docker_volumes": config.get("docker_volumes", []),
-                                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                                "docker_forward_env": config.get("docker_forward_env", []),
-                                "docker_env": config.get("docker_env", {}),
-                                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                                "docker_extra_args": config.get("docker_extra_args", []),
-                                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-                                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                                "tenki_project_id": config.get("tenki_project_id", ""),
-                                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                                "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
-                                "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
-                            }
+                            container_config = _container_config_from_env_config(config)
 
                         local_config = None
                         if env_type == "local":

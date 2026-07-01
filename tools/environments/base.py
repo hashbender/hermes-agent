@@ -295,7 +295,7 @@ class BaseEnvironment(ABC):
     interrupt handling, and timeout enforcement.
     """
 
-    # Subclasses that embed stdin as a heredoc (Modal, Daytona, Tenki) set this.
+    # Subclasses that embed stdin as a heredoc (Modal, Daytona) set this.
     _stdin_mode: str = "pipe"  # "pipe" or "heredoc"
 
     # Snapshot creation timeout (override for slow cold-starts).

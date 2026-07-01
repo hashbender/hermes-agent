@@ -1522,15 +1522,20 @@ def run_doctor(args):
     # Tenki (if using tenki backend)
     if terminal_env == "tenki":
         try:
+            from hermes_cli.config import load_config_readonly
             from tools.tenki_config import (
                 has_tenki_auth,
                 resolve_tenki_project_id,
                 resolve_tenki_workspace_id,
             )
         except Exception:
+            load_config_readonly = lambda: {}  # noqa: E731
             has_tenki_auth = lambda: False  # noqa: E731
             resolve_tenki_project_id = lambda _explicit="": ""  # noqa: E731
             resolve_tenki_workspace_id = lambda _explicit="": ""  # noqa: E731
+        terminal_cfg = load_config_readonly().get("terminal", {})
+        if not isinstance(terminal_cfg, dict):
+            terminal_cfg = {}
 
         if has_tenki_auth():
             check_ok("Tenki auth", "(configured)")
@@ -1542,16 +1547,18 @@ def run_doctor(args):
                 issues,
             )
 
-        workspace_id = resolve_tenki_workspace_id(os.getenv("TERMINAL_TENKI_WORKSPACE_ID", ""))
-        project_id = resolve_tenki_project_id(os.getenv("TERMINAL_TENKI_PROJECT_ID", ""))
+        workspace_id = resolve_tenki_workspace_id(
+            os.getenv("TERMINAL_TENKI_WORKSPACE_ID") or terminal_cfg.get("tenki_workspace_id", "")
+        )
+        project_id = resolve_tenki_project_id(
+            os.getenv("TERMINAL_TENKI_PROJECT_ID") or terminal_cfg.get("tenki_project_id", "")
+        )
         if workspace_id and project_id:
             check_ok("Tenki workspace/project", "(configured)")
         else:
-            _fail_and_issue(
+            check_warn(
                 "Tenki workspace/project not configured",
-                "(required for TERMINAL_ENV=tenki)",
-                "Run tenki login or set terminal.tenki_workspace_id and terminal.tenki_project_id",
-                issues,
+                "(optional for sessions; required for volume-backed workflows)",
             )
 
         if importlib.util.find_spec("tenki_sandbox") is not None:

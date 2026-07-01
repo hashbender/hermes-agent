@@ -514,6 +514,7 @@ def load_cli_config() -> Dict[str, Any]:
     # overwrite env vars that were already set by .env -- only a user's config
     # file should be authoritative.
     _file_has_terminal_config = False
+    file_config: dict[str, Any] = {}
 
     # Load from file if exists
     if config_path.exists():
@@ -571,7 +572,7 @@ def load_cli_config() -> Dict[str, Any]:
             logger.warning("Failed to load cli-config.yaml: %s", e)
 
     # Expand ${ENV_VAR} references in config values before bridging to env vars.
-    from hermes_cli.config import _expand_env_vars
+    from hermes_cli.config import _deep_merge, _expand_env_vars, _normalize_terminal_backend_defaults
     defaults = _expand_env_vars(defaults)
 
     # Managed scope: overlay administrator-pinned values LAST so they win over
@@ -584,7 +585,11 @@ def load_cli_config() -> Dict[str, Any]:
     # normalization, leaf-merge) and is fail-open.
     from hermes_cli import managed_scope
 
+    managed_config = managed_scope.load_managed_config()
     defaults = managed_scope.apply_managed_overlay(defaults)
+    raw_terminal_defaults_source = file_config
+    if managed_config:
+        raw_terminal_defaults_source = _deep_merge(raw_terminal_defaults_source, managed_config)
 
     # Apply terminal config to environment variables (so terminal_tool picks them up)
     terminal_config = defaults.get("terminal", {})
@@ -594,6 +599,9 @@ def load_cli_config() -> Dict[str, Any]:
     # Accept both, with "backend" taking precedence (it's the documented key).
     if "backend" in terminal_config:
         terminal_config["env_type"] = terminal_config["backend"]
+
+    defaults = _normalize_terminal_backend_defaults(defaults, raw_terminal_defaults_source)
+    terminal_config = defaults.get("terminal", {})
     
     # CWD resolution for CLI/TUI. The gateway has its own config bridge in
     # gateway/run.py but may lazily import cli.py (triggering this code).

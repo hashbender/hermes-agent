@@ -19,6 +19,9 @@ def _simulate_config_bridge(cfg: dict, initial_env: dict | None = None):
     Returns the resulting env dict (only TERMINAL_* and MESSAGING_CWD keys).
     """
     env = dict(initial_env or {})
+    from hermes_cli.config import _normalize_terminal_backend_defaults
+
+    cfg = _normalize_terminal_backend_defaults(cfg, cfg)
 
     # --- Replicate lines 54-56: generic top-level bridge (for context) ---
     for key, val in cfg.items():
@@ -88,6 +91,12 @@ class TestTopLevelCwdAlias:
         cfg = {"backend": "docker"}
         result = _simulate_config_bridge(cfg)
         assert result["TERMINAL_ENV"] == "docker"
+
+    def test_tenki_backend_defaults_to_terminate_only_over_stale_env(self):
+        cfg = {"terminal": {"backend": "tenki"}}
+        result = _simulate_config_bridge(cfg, {"TERMINAL_CONTAINER_PERSISTENT": "true"})
+        assert result["TERMINAL_ENV"] == "tenki"
+        assert result["TERMINAL_CONTAINER_PERSISTENT"] == "False"
 
     def test_top_level_cwd_and_backend(self):
         cfg = {"backend": "local", "cwd": "/home/hermes/projects"}

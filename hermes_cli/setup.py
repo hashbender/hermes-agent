@@ -1451,14 +1451,18 @@ def setup_terminal_backend(config: dict):
             terminal["tenki_project_id"] = project_id
         terminal.setdefault("tenki_image", "")
         terminal.setdefault("tenki_name_prefix", "hermes")
-        terminal["tenki_allow_inbound"] = False
-        terminal["tenki_allow_outbound"] = True
+        terminal.setdefault("tenki_allow_inbound", False)
+        terminal.setdefault("tenki_allow_outbound", True)
         terminal.setdefault("tenki_max_duration", 3600)
         terminal.setdefault("tenki_idle_timeout", 0)
         terminal.setdefault("tenki_pause_retention", 0)
         terminal.setdefault("tenki_sync_hermes_home", False)
-        terminal["container_persistent"] = False
-        terminal["cwd"] = "/home/tenki"
+        if current_backend == "tenki":
+            terminal.setdefault("container_persistent", False)
+            terminal.setdefault("cwd", "/home/tenki")
+        else:
+            terminal["container_persistent"] = False
+            terminal["cwd"] = "/home/tenki"
 
         print_info(f"  Endpoint:  {endpoint}")
         print_info(f"  Workspace: {workspace_id or '(not found; run tenki login)'}")

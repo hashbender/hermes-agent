@@ -384,6 +384,7 @@ terminal:
   tenki_api_endpoint: "https://api.tenki.cloud"
   tenki_workspace_id: ""           # Falls back to Tenki CLI config
   tenki_project_id: ""             # Falls back to Tenki CLI config
+  tenki_name_prefix: "hermes"
   tenki_allow_inbound: false
   tenki_allow_outbound: true
   tenki_max_duration: 3600

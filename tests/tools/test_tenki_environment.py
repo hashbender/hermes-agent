@@ -1,8 +1,34 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import types
 from types import SimpleNamespace
+
+
+class _FakeFS:
+    def __init__(self):
+        self.mkdir_calls: list[tuple[tuple, dict]] = []
+        self.upload_calls: list[tuple[str, str]] = []
+        self.download_calls: list[tuple[str, str]] = []
+
+    @staticmethod
+    def _assert_remote_path(path: str) -> None:
+        if path.startswith("/") and path != "/home/tenki" and not path.startswith("/home/tenki/"):
+            raise AssertionError(f"Tenki fs path must be under /home/tenki, got {path!r}")
+
+    def mkdir(self, path, **kwargs):
+        self._assert_remote_path(str(path))
+        self.mkdir_calls.append(((path,), kwargs))
+
+    def upload(self, local_path, remote_path, **_kwargs):
+        self._assert_remote_path(str(remote_path))
+        self.upload_calls.append((str(local_path), str(remote_path)))
+
+    def download(self, remote_path, local_path, **_kwargs):
+        self._assert_remote_path(str(remote_path))
+        self.download_calls.append((str(remote_path), str(local_path)))
 
 
 class _FakeResult:
@@ -10,6 +36,35 @@ class _FakeResult:
         self.stdout_text = stdout
         self.stderr_text = stderr
         self.exit_code = exit_code
+
+
+class _FakeProcess:
+    def __init__(
+        self,
+        result: _FakeResult,
+        *,
+        stdin_data: str | None = None,
+        block_until_killed: bool = False,
+    ):
+        self._result = result
+        self.stdin_data = stdin_data
+        self.closed_stdin = False
+        self.killed = False
+        self._block_until_killed = block_until_killed
+        self._done = threading.Event()
+
+    def close_stdin(self):
+        self.closed_stdin = True
+
+    def kill(self):
+        self.killed = True
+        self._done.set()
+
+    def wait(self, *_args, **_kwargs):
+        if self._block_until_killed:
+            self._done.wait(timeout=5)
+            return _FakeResult(stdout="", exit_code=143)
+        return self._result
 
 
 class _FakeSandbox:
@@ -21,26 +76,44 @@ class _FakeSandbox:
         metadata: dict | None = None,
     ):
         self.exec_calls: list[tuple[tuple, dict]] = []
+        self.start_calls: list[tuple[tuple, dict]] = []
+        self.last_process: _FakeProcess | None = None
+        self.snapshots: list[tuple[str | None, bool]] = []
         self.terminated = False
         self.paused = False
         self.resumed = False
         self.waited = False
+        self.refreshed = False
         self.id = "sb-test"
         self.name = name
         self.state = state
         self.info = SimpleNamespace(name=name, metadata=metadata or {})
-        self.fs = SimpleNamespace(
-            mkdir=lambda *_args, **_kwargs: None,
-            upload=lambda *_args, **_kwargs: None,
-            download=lambda *_args, **_kwargs: None,
-        )
+        self.fs = _FakeFS()
 
-    def exec(self, *args, **kwargs):
-        self.exec_calls.append((args, kwargs))
+    @staticmethod
+    def _result_for_command(args):
         command = args[-1] if args else ""
         if "echo \"$HOME\"" in command:
             return _FakeResult(stdout="/home/tenki\n")
         return _FakeResult(stdout="ran\n", exit_code=0)
+
+    def exec(self, *args, **kwargs):
+        self.exec_calls.append((args, kwargs))
+        return self._result_for_command(args)
+
+    def start(self, *args, **kwargs):
+        self.start_calls.append((args, kwargs))
+        command = args[-1] if args else ""
+        self.last_process = _FakeProcess(
+            self._result_for_command(args),
+            stdin_data=kwargs.get("stdin"),
+            block_until_killed="sleep infinity" in command,
+        )
+        return self.last_process
+
+    def refresh(self):
+        self.refreshed = True
+        return self.info
 
     def terminate(self):
         self.terminated = True
@@ -57,13 +130,26 @@ class _FakeSandbox:
     def wait_ready(self, *_args, **_kwargs):
         self.waited = True
 
+    def snapshot(self, *, name=None, wait=True):
+        self.snapshots.append((name, wait))
+        return SimpleNamespace(id=f"snap-{self.name}")
+
+
+def _last_started_command(sandbox: _FakeSandbox) -> str:
+    return sandbox.start_calls[-1][0][-1]
+
 
 class _FakeSandboxFactory:
     created_kwargs: list[dict] = []
+    failed_kwargs: list[dict] = []
     sandboxes: list[_FakeSandbox] = []
+    fail_snapshot_ids: set[str] = set()
 
     @classmethod
     def create(cls, **kwargs):
+        if kwargs.get("snapshot_id") in cls.fail_snapshot_ids:
+            cls.failed_kwargs.append(kwargs)
+            raise RuntimeError("stale snapshot")
         sandbox = _FakeSandbox(
             name=kwargs.get("name", "sb-test"),
             metadata=kwargs.get("metadata", {}),
@@ -79,6 +165,7 @@ class _FakeClient:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.snapshots = SimpleNamespace(wait_durable=lambda *_args, **_kwargs: None)
 
     def create(self, **kwargs):
         return _FakeSandboxFactory.create(**kwargs)
@@ -99,7 +186,9 @@ class _FakeClient:
 def _install_fake_tenki(monkeypatch):
     module = types.ModuleType("tenki_sandbox")
     _FakeSandboxFactory.created_kwargs = []
+    _FakeSandboxFactory.failed_kwargs = []
     _FakeSandboxFactory.sandboxes = []
+    _FakeSandboxFactory.fail_snapshot_ids = set()
     _FakeClient.listed_sandboxes = []
     _FakeClient.closed_count = 0
     module.Client = _FakeClient
@@ -196,22 +285,53 @@ def test_tenki_environment_uses_cli_config_and_terminates_by_default(monkeypatch
     assert sandbox.paused is False
 
 
-def test_tenki_environment_pauses_when_persistent(monkeypatch, tmp_path):
+def test_tenki_environment_snapshots_when_persistent(monkeypatch, tmp_path):
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
     (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
 
+    from tools.environments import tenki as tenki_module
     from tools.environments.tenki import TenkiEnvironment
 
+    monkeypatch.setattr(tenki_module, "_SNAPSHOT_STORE", tmp_path / "tenki_snapshots.json")
     monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
     env = TenkiEnvironment(task_id="persist", persistent_filesystem=True)
 
     sandbox = _FakeSandboxFactory.sandboxes[0]
     env.cleanup()
-    assert sandbox.paused is True
-    assert sandbox.terminated is False
+    assert sandbox.snapshots == [("hermes-persist", True)]
+    assert sandbox.paused is False
+    assert sandbox.terminated is True
+
+    env = TenkiEnvironment(task_id="persist", image="base-image", persistent_filesystem=True)
+    assert _FakeSandboxFactory.created_kwargs[-1]["snapshot_id"] == "snap-hermes-persist"
+    assert "image" not in _FakeSandboxFactory.created_kwargs[-1]
+    env.cleanup()
+
+
+def test_tenki_environment_falls_back_when_persistent_snapshot_is_stale(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments import tenki as tenki_module
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(tenki_module, "_SNAPSHOT_STORE", tmp_path / "tenki_snapshots.json")
+    tenki_module._store_snapshot("persist", "snap-stale")
+    _FakeSandboxFactory.fail_snapshot_ids = {"snap-stale"}
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+
+    env = TenkiEnvironment(task_id="persist", image="base-image", persistent_filesystem=True)
+
+    assert _FakeSandboxFactory.failed_kwargs[0]["snapshot_id"] == "snap-stale"
+    assert _FakeSandboxFactory.created_kwargs[0]["image"] == "base-image"
+    assert tenki_module._get_snapshot_restore_candidate("persist") == (None, False)
+    env.cleanup()
 
 
 def test_tenki_environment_resumes_existing_persistent_sandbox(monkeypatch, tmp_path):
@@ -236,6 +356,51 @@ def test_tenki_environment_resumes_existing_persistent_sandbox(monkeypatch, tmp_
     assert existing.resumed is True
     assert existing.waited is True
     assert _FakeSandboxFactory.created_kwargs == []
+    env.cleanup()
+
+
+def test_tenki_environment_resumes_paused_cached_sandbox_before_execute(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="paused-cache")
+    sandbox = env._sandbox
+    sandbox.state = "PAUSED"
+
+    env.execute("echo ok", timeout=5)
+
+    assert sandbox.refreshed is True
+    assert sandbox.resumed is True
+    assert sandbox.waited is True
+    assert env._sandbox is sandbox
+    env.cleanup()
+
+
+def test_tenki_environment_recreates_terminated_cached_sandbox(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="terminated-cache")
+    first = env._sandbox
+    first.state = "TERMINATED"
+
+    env.execute("echo ok", timeout=5)
+
+    assert len(_FakeSandboxFactory.sandboxes) == 2
+    assert env._sandbox is _FakeSandboxFactory.sandboxes[1]
+    assert env._sandbox is not first
     env.cleanup()
 
 
@@ -356,6 +521,155 @@ def test_tenki_sync_hermes_home_is_opt_in(monkeypatch, tmp_path):
     assert ("sync_back", None) in calls
 
 
+def test_tenki_bulk_sync_stages_tar_under_home_not_tmp(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="bulk-sync")
+    host_file = tmp_path / "skill.md"
+    host_file.write_text("content", encoding="utf-8")
+
+    env._tenki_bulk_upload([(str(host_file), "/home/tenki/.hermes/skills/skill.md")])
+
+    remote_tar = env._sandbox.fs.upload_calls[-1][1]
+    assert remote_tar.startswith("/home/tenki/.hermes_tenki_sync.")
+    assert not remote_tar.startswith("/tmp/")
+    env.cleanup()
+
+
+def test_tenki_bulk_sync_uses_documented_fs_root_when_home_differs(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="root-home")
+    env._remote_home = "/root"
+
+    assert env._remote_transfer_path(".hermes_tenki_sync").startswith("/home/tenki/")
+    env.cleanup()
+
+
+def test_tenki_cleanup_sync_back_uses_original_sandbox(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="cleanup-sync")
+    original = env._sandbox
+    created_before = len(_FakeSandboxFactory.created_kwargs)
+
+    class FakeSyncManager:
+        def sync_back(self):
+            env._tenki_bulk_download(tmp_path / "sync-back.tar")
+
+    env._sync_manager = FakeSyncManager()
+    env.cleanup()
+
+    assert len(_FakeSandboxFactory.created_kwargs) == created_before
+    assert original.fs.download_calls
+    remote_tar = original.fs.download_calls[-1][0]
+    assert remote_tar.startswith("/home/tenki/.hermes_tenki_sync_back.")
+    assert original.terminated is True
+
+
+def test_tenki_cleanup_blocks_public_execution_while_syncing(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="cleanup-guard")
+    created_before = len(_FakeSandboxFactory.created_kwargs)
+
+    with env._lock:
+        env._cleanup_in_progress = True
+        env._cleanup_sandbox = env._sandbox
+    try:
+        try:
+            env.execute("echo should-not-run", timeout=5)
+        except RuntimeError as exc:
+            assert "cleanup" in str(exc)
+        else:
+            raise AssertionError("execute should fail while cleanup is in progress")
+        assert len(_FakeSandboxFactory.created_kwargs) == created_before
+    finally:
+        with env._lock:
+            env._cleanup_in_progress = False
+            env._cleanup_sandbox = None
+    env.cleanup()
+
+
+def test_tenki_execute_passes_stdin_natively_not_as_heredoc(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="stdin")
+    large_stdin = "x" * 200_000
+
+    env.execute("cat > /home/tenki/out.txt", stdin_data=large_stdin, timeout=5)
+
+    sandbox = env._sandbox
+    command = _last_started_command(sandbox)
+    assert large_stdin not in command
+    assert "HERMES_STDIN_" not in command
+    assert sandbox.start_calls[-1][1]["stdin"] == large_stdin
+    env.cleanup()
+
+
+def test_tenki_cancel_kills_process_without_tearing_down_sandbox(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="cancel-process")
+    sandbox = env._sandbox
+    handle = env._run_bash("sleep infinity", timeout=30)
+    for _ in range(100):
+        if sandbox.last_process is not None:
+            break
+        time.sleep(0.01)
+
+    handle.kill()
+    handle.wait(timeout=1)
+
+    assert sandbox.last_process is not None
+    assert sandbox.last_process.killed is True
+    assert sandbox.terminated is False
+    assert sandbox.paused is False
+    env.cleanup()
+
+
 def test_tenki_non_sudo_command_does_not_probe_sudo(monkeypatch, tmp_path):
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)
@@ -399,7 +713,7 @@ def test_tenki_passwordless_sudo_does_not_prompt_or_rewrite(monkeypatch, tmp_pat
     env = TenkiEnvironment(task_id="sudo-nopasswd")
     env.execute("sudo whoami", timeout=5)
 
-    command = _FakeSandboxFactory.sandboxes[0].exec_calls[-1][0][-1]
+    command = _last_started_command(_FakeSandboxFactory.sandboxes[0])
     assert "sudo whoami" in command
     assert "sudo -S" not in command
     assert "sudo -n whoami" not in command
@@ -428,7 +742,7 @@ def test_tenki_sudo_without_nopasswd_fails_fast_without_host_password(monkeypatc
     env = TenkiEnvironment(task_id="sudo-no-nopasswd")
     env.execute("sudo whoami", timeout=5)
 
-    command = _FakeSandboxFactory.sandboxes[0].exec_calls[-1][0][-1]
+    command = _last_started_command(_FakeSandboxFactory.sandboxes[0])
     assert "sudo -n whoami" in command
     assert "sudo -S" not in command
     assert "host-secret" not in command

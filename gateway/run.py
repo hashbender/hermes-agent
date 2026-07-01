@@ -1415,7 +1415,7 @@ if _config_path.exists():
         with open(_config_path, encoding="utf-8") as _f:
             _cfg = _yaml.safe_load(_f) or {}
         # Expand ${ENV_VAR} references before bridging to env vars.
-        from hermes_cli.config import _expand_env_vars
+        from hermes_cli.config import _expand_env_vars, _normalize_terminal_backend_defaults
         _cfg = _expand_env_vars(_cfg)
         # Managed scope: overlay administrator-pinned values BEFORE bridging to
         # env vars, so a managed timezone / redact_secrets / max_turns / terminal
@@ -1428,6 +1428,7 @@ if _config_path.exists():
             _cfg = managed_scope.apply_managed_overlay(_cfg)
         except Exception:
             pass
+        _cfg = _normalize_terminal_backend_defaults(_cfg, _cfg)
         # Top-level simple values (fallback only — don't override .env)
         for _key, _val in _cfg.items():
             if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:

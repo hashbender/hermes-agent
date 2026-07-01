@@ -6074,6 +6074,31 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _normalize_terminal_backend_defaults(
+    config: Dict[str, Any],
+    raw_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Apply backend-specific terminal defaults without writing them to config.yaml."""
+    terminal = config.get("terminal")
+    if not isinstance(terminal, dict):
+        return config
+
+    backend = str(terminal.get("backend") or terminal.get("env_type") or "").lower()
+    if backend != "tenki":
+        return config
+
+    raw_terminal = raw_config.get("terminal") if isinstance(raw_config, dict) else {}
+    explicit_persistence = isinstance(raw_terminal, dict) and "container_persistent" in raw_terminal
+    if explicit_persistence:
+        return config
+
+    config = dict(config)
+    terminal = dict(terminal)
+    terminal["container_persistent"] = False
+    config["terminal"] = terminal
+    return config
+
+
 def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> Any:
     """Traverse nested dict keys safely, returning ``default`` on any miss.
 
@@ -6303,10 +6328,20 @@ def apply_terminal_config_to_env(
     target = os.environ if env is None else env
 
     raw_config = read_raw_config()
+    raw_terminal_defaults_source: Dict[str, Any] = raw_config
+    try:
+        from hermes_cli import managed_scope
+
+        managed_config = managed_scope.load_managed_config()
+        if managed_config:
+            raw_terminal_defaults_source = _deep_merge(raw_terminal_defaults_source, managed_config)
+    except Exception:
+        pass
     file_has_terminal_config = isinstance(raw_config.get("terminal"), dict)
     should_override = file_has_terminal_config if override is None else override
 
     cfg = config if config is not None else load_config_readonly()
+    cfg = _normalize_terminal_backend_defaults(cfg, raw_terminal_defaults_source)
     terminal_cfg = cfg.get("terminal", {}) if isinstance(cfg, dict) else {}
     if not isinstance(terminal_cfg, dict):
         return target
@@ -6370,6 +6405,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        user_config: Dict[str, Any] = {}
 
         if user_sig is not None:
             try:
@@ -6395,9 +6431,12 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
         managed_config = managed_scope.load_managed_config()
+        raw_terminal_defaults_source: Dict[str, Any] = user_config
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
+            raw_terminal_defaults_source = _deep_merge(raw_terminal_defaults_source, managed_config)
+        expanded = _normalize_terminal_backend_defaults(expanded, raw_terminal_defaults_source)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
