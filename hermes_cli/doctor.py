@@ -8,7 +8,6 @@ import os
 import sys
 import subprocess
 import shutil
-import importlib.util
 from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
@@ -671,7 +670,7 @@ def run_doctor(args):
         check_ok(f"{_DHH}/.env file exists")
         
         # Check for common issues. Pin encoding to UTF-8 because .env files are
-        # written as UTF-8 everywhere in the codebase, while Path.read_text()
+        # written as UTF-8 everywhere in the codebase, while Path.read_text(encoding="utf-8")
         # defaults to the system locale — which crashes on non-UTF-8 Windows
         # locales (e.g. GBK) as soon as the file contains any non-ASCII byte.
         content = env_path.read_text(encoding="utf-8")
@@ -1519,51 +1518,6 @@ def run_doctor(args):
                 issues,
             )
 
-    # Tenki (if using tenki backend)
-    if terminal_env == "tenki":
-        try:
-            from tools.tenki_config import (
-                has_tenki_auth,
-                resolve_tenki_project_id,
-                resolve_tenki_workspace_id,
-            )
-        except Exception:
-            has_tenki_auth = lambda: False  # noqa: E731
-            resolve_tenki_project_id = lambda _explicit="": ""  # noqa: E731
-            resolve_tenki_workspace_id = lambda _explicit="": ""  # noqa: E731
-
-        if has_tenki_auth():
-            check_ok("Tenki auth", "(configured)")
-        else:
-            _fail_and_issue(
-                "Tenki auth not found",
-                "(required for TERMINAL_ENV=tenki)",
-                "Run tenki login or set TENKI_AUTH_TOKEN/TENKI_API_KEY",
-                issues,
-            )
-
-        workspace_id = resolve_tenki_workspace_id(os.getenv("TERMINAL_TENKI_WORKSPACE_ID", ""))
-        project_id = resolve_tenki_project_id(os.getenv("TERMINAL_TENKI_PROJECT_ID", ""))
-        if workspace_id and project_id:
-            check_ok("Tenki workspace/project", "(configured)")
-        else:
-            _fail_and_issue(
-                "Tenki workspace/project not configured",
-                "(required for TERMINAL_ENV=tenki)",
-                "Run tenki login or set terminal.tenki_workspace_id and terminal.tenki_project_id",
-                issues,
-            )
-
-        if importlib.util.find_spec("tenki_sandbox") is not None:
-            check_ok("tenki-sandbox SDK", "(installed)")
-        else:
-            _fail_and_issue(
-                "tenki-sandbox SDK not installed",
-                "(pip install tenki-sandbox==0.1.1)",
-                "Install Tenki SDK: pip install tenki-sandbox==0.1.1",
-                issues,
-            )
-
     # Node.js + agent-browser (for browser automation tools)
     if _safe_which("node"):
         check_ok("Node.js")
@@ -2222,7 +2176,7 @@ def run_doctor(args):
         if lock_file.exists():
             try:
                 import json
-                lock_data = json.loads(lock_file.read_text())
+                lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
                 count = len(lock_data.get("installed", {}))
                 check_ok(f"Lock file OK ({count} hub-installed skill(s))")
             except Exception:
@@ -2388,7 +2342,7 @@ def run_doctor(args):
                     if not wrapper.is_file():
                         continue
                     try:
-                        content = wrapper.read_text()
+                        content = wrapper.read_text(encoding="utf-8")
                         if "hermes -p" in content:
                             _m = _re.search(r"hermes -p (\S+)", content)
                             if _m and not profile_exists(_m.group(1)):
