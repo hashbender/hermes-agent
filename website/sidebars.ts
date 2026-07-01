@@ -10,7 +10,6 @@ const sidebars: SidebarsConfig = {
       items: [
         'getting-started/quickstart',
         'getting-started/installation',
-        'getting-started/platform-support',
         'getting-started/termux',
         'getting-started/nix-setup',
         'getting-started/updating',
@@ -61,7 +60,6 @@ const sidebars: SidebarsConfig = {
           label: 'Core',
           items: [
             'user-guide/features/tools',
-            'user-guide/features/tool-search',
             'user-guide/features/skills',
             'user-guide/features/lsp',
             'user-guide/features/curator',
@@ -70,7 +68,6 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/honcho',
             'user-guide/features/context-files',
             'user-guide/features/context-references',
-            'user-guide/features/mixture-of-agents',
             'user-guide/features/personality',
             'user-guide/features/skins',
             'user-guide/features/plugins',
@@ -106,7 +103,6 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/vision',
             'user-guide/features/image-generation',
             'user-guide/features/spotify',
-            'user-guide/features/pets',
             'user-guide/features/tts',
             'user-guide/features/deliverable-mode',
           ],
@@ -193,6 +189,16 @@ const sidebars: SidebarsConfig = {
                 },
                 {
                   type: 'category',
+                  label: 'devops',
+                  key: 'skills-bundled-devops',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/devops/devops-kanban-orchestrator',
+                    'user-guide/skills/bundled/devops/devops-kanban-worker',
+                  ],
+                },
+                {
+                  type: 'category',
                   label: 'dogfood',
                   key: 'skills-bundled-dogfood',
                   collapsed: true,
@@ -271,8 +277,8 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/productivity/productivity-nano-pdf',
                     'user-guide/skills/bundled/productivity/productivity-notion',
                     'user-guide/skills/bundled/productivity/productivity-ocr-and-documents',
-                    'user-guide/skills/bundled/productivity/productivity-petdex',
                     'user-guide/skills/bundled/productivity/productivity-powerpoint',
+                    'user-guide/skills/bundled/productivity/productivity-slack-surfaces',
                     'user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline',
                   ],
                 },
@@ -284,6 +290,7 @@ const sidebars: SidebarsConfig = {
                   items: [
                     'user-guide/skills/bundled/research/research-arxiv',
                     'user-guide/skills/bundled/research/research-blogwatcher',
+                    'user-guide/skills/bundled/research/research-cyber-vc-analyst',
                     'user-guide/skills/bundled/research/research-llm-wiki',
                     'user-guide/skills/bundled/research/research-polymarket',
                     'user-guide/skills/bundled/research/research-research-paper-writing',
@@ -538,6 +545,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/optional/productivity/productivity-shopify',
                     'user-guide/skills/optional/productivity/productivity-siyuan',
                     'user-guide/skills/optional/productivity/productivity-telephony',
+                    'user-guide/skills/optional/productivity/productivity-vault-para-triage',
                   ],
                 },
                 {
@@ -653,7 +661,6 @@ const sidebars: SidebarsConfig = {
             'user-guide/messaging/line',
             'user-guide/messaging/simplex',
             'user-guide/messaging/ntfy',
-            'user-guide/messaging/irc',
             'user-guide/messaging/open-webui',
             'user-guide/messaging/webhooks',
           ],
