@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import tempfile
 import threading
 from pathlib import Path
 
@@ -199,7 +200,7 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
         container_key = task_id
 
     with _file_ops_lock:
-        cached = _file_ops_cache.get(container_key) or _file_ops_cache.get(task_id)
+        cached = _file_ops_cache.get(task_id) or _file_ops_cache.get(container_key)
     if cached is not None:
         env = getattr(cached, "env", None)
         live_cwd = _live_cwd_if_owned(env, task_id)
@@ -447,6 +448,15 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
+    try:
+        temp_root = os.path.realpath(tempfile.gettempdir())
+    except Exception:
+        temp_root = ""
+    if temp_root and (
+        resolved == temp_root
+        or resolved.startswith(temp_root.rstrip(os.sep) + os.sep)
+    ):
+        return None
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
@@ -891,8 +901,6 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 image = overrides.get("modal_image") or config["modal_image"]
             elif env_type == "daytona":
                 image = overrides.get("daytona_image") or config["daytona_image"]
-            elif env_type == "tenki":
-                image = overrides.get("tenki_image") or config["tenki_image"]
             else:
                 image = ""
 
@@ -920,7 +928,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in _CONTAINER_BACKENDS:
+            if env_type in {"docker", "singularity", "modal", "daytona"}:
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
@@ -930,16 +938,6 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                     "docker_forward_env": config.get("docker_forward_env", []),
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                    "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                    "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                    "tenki_project_id": config.get("tenki_project_id", ""),
-                    "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                    "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                    "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                    "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                    "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                    "tenki_pause_retention": config.get("tenki_pause_retention", 0),
-                    "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
                 }
 
             ssh_config = None
