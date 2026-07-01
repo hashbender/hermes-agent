@@ -3605,7 +3605,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         )
         self._provider_source: Optional[str] = None
         self.provider = self.requested_provider
-        self.api_mode = "chat_completions"
+        self.api_mode = CLI_CONFIG["model"].get("api_mode") or "chat_completions"
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
         self.base_url = (
@@ -8385,7 +8385,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif canonical == "copy":
             self._handle_copy_command(cmd_original)
         elif canonical == "debug":
-            self._handle_debug_command()
+            self._handle_debug_command(cmd_original)
         elif canonical == "update":
             if self._handle_update_command():
                 return False
