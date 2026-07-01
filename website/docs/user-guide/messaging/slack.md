@@ -343,6 +343,13 @@ platforms:
       # (Slack's "Also send to channel" feature).
       # Only the first chunk of the first reply is broadcast.
       reply_broadcast: false
+
+      # Continuable-cron delivery surface (default: "thread").
+      # "in_channel" delivers a continuable cron job FLAT into the channel
+      # (no dedicated thread); pair with reply_in_thread: false (and
+      # require_mention: false) so a plain reply continues the job.
+      # See the cron guide → "Flat, in-channel continuation".
+      cron_continuable_surface: thread
 ```
 
 | Key | Default | Description |
@@ -350,6 +357,7 @@ platforms:
 | `platforms.slack.reply_to_mode` | `"first"` | Threading mode for multi-part messages: `"off"`, `"first"`, or `"all"` |
 | `platforms.slack.extra.reply_in_thread` | `true` | When `false`, channel messages get direct replies instead of threads. Messages inside existing threads still reply in-thread. |
 | `platforms.slack.extra.reply_broadcast` | `false` | When `true`, thread replies are also posted to the main channel. Only the first chunk is broadcast. |
+| `platforms.slack.extra.cron_continuable_surface` | `"thread"` | Delivery surface for [continuable cron jobs](../features/cron.md#flat-in-channel-continuation-slack). `"thread"` opens a dedicated thread per delivery (default); `"in_channel"` delivers flat into the channel timeline. Pair `in_channel` with `reply_in_thread: false` (and `require_mention: false`) so a plain channel reply continues the job. |
 
 ### Session Isolation
 
