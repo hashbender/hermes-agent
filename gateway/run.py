@@ -1676,7 +1676,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from gateway.delivery import DeliveryRouter
+from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -3654,6 +3654,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         If the error is retryable (e.g. network blip, DNS failure), queue the
         platform for background reconnection instead of giving up permanently.
         """
+        # Snapshot the current owner of this platform slot before doing
+        # anything else. If it's neither this adapter nor empty, a different
+        # adapter has already taken over (e.g. this is a delayed notification
+        # from a background retry chain that raced with, and lost to, a
+        # reconnect that already succeeded). Acting on a stale notification
+        # would overwrite an already-healthy platform's runtime status and
+        # incorrectly re-queue it for reconnection, so bail out before any of
+        # that happens.
+        existing = self.adapters.get(adapter.platform)
+        if existing is not None and existing is not adapter:
+            logger.debug(
+                "Ignoring stale fatal error from a superseded %s adapter instance: %s",
+                adapter.platform.value,
+                adapter.fatal_error_code or "unknown",
+            )
+            return
+
         logger.error(
             "Fatal %s adapter error (%s): %s",
             adapter.platform.value,
@@ -3677,13 +3694,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             error_message=adapter.fatal_error_message,
         )
 
-        existing = self.adapters.get(adapter.platform)
         if existing is adapter:
-            try:
-                await adapter.disconnect()
-            finally:
-                self.adapters.pop(adapter.platform, None)
-                self.delivery_router.adapters = self.adapters
+            # Claim this adapter for teardown before awaiting disconnect() —
+            # a second fatal-error notification for the same adapter (e.g.
+            # from a concurrent recovery path) would otherwise still see
+            # itself as "existing" during the await below and disconnect()
+            # the same object twice.
+            self.adapters.pop(adapter.platform, None)
+            self.delivery_router.adapters = self.adapters
+            await adapter.disconnect()
 
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
@@ -6814,26 +6833,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             str(home.thread_id) if home.thread_id else None
         )
 
-        # Determine chat_type for the destination source. If we created a
-        # thread, key the session_key as a thread (build_session_key sets
-        # thread sessions to user-shared by default, which is what we
-        # want — the synthetic turn and any later real-user message both
-        # land on the same key without needing a user_id).
-        if new_thread_id:
+        # Determine chat_type/user_id for the destination source.
+        #
+        # Telegram private-chat DM topics are represented differently from
+        # group/forum threads by the inbound adapter. A handoff-created topic
+        # in a positive Telegram chat_id must therefore use the same DM-topic
+        # source shape as the user's next real message; otherwise the synthetic
+        # handoff turn binds a generic `thread` session key while real replies
+        # arrive on a `dm` session key.
+        home_chat_id = str(home.chat_id)
+        is_telegram_private_chat = (
+            platform == Platform.TELEGRAM
+            and looks_like_telegram_private_chat_id(home_chat_id)
+        )
+
+        if new_thread_id and not is_telegram_private_chat:
             dest_chat_type = "thread"
+            dest_user_id = "system:handoff"
         else:
-            # No thread — assume DM-style for the home channel. For
-            # group/channel home channels without thread support
-            # (Matrix/WhatsApp/Signal), the platform's own keying makes
-            # the synthetic turn shared anyway (single-DM platforms).
+            # No thread — assume DM-style for the home channel. For Telegram
+            # private-chat topics, use the real user id (same as chat_id) so
+            # topic-mode checks and binding persistence see the same identity as
+            # subsequent inbound user messages.
             dest_chat_type = "dm"
+            dest_user_id = home_chat_id if is_telegram_private_chat else "system:handoff"
 
         dest_source = SessionSource(
             platform=platform,
-            chat_id=str(home.chat_id),
+            chat_id=home_chat_id,
             chat_name=home.name,
             chat_type=dest_chat_type,
-            user_id="system:handoff",
+            user_id=dest_user_id,
             user_name="Handoff",
             thread_id=effective_thread_id,
         )
