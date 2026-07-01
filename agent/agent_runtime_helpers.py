@@ -56,6 +56,37 @@ def _ra():
     return run_agent
 
 
+def _credential_pool_matches_agent_provider(agent: Any, pool: Any) -> bool:
+    """Return whether a live credential pool belongs to the agent's provider.
+
+    Fallback activation can temporarily attach the fallback provider's pool to
+    the same long-lived agent. Recovery/restore paths must not apply that pool
+    after the runtime has moved back to a different provider, because
+    ``_swap_credential`` adopts both the entry key and entry base_url.
+    """
+    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    pool_provider = (getattr(pool, "provider", "") or "").strip().lower()
+    if not current_provider or not pool_provider or current_provider == pool_provider:
+        return True
+
+    # Custom endpoints use two naming conventions for the SAME provider: the
+    # agent carries ``custom`` while the pool is keyed ``custom:<name>``. Accept
+    # that pair only when the agent's current base_url resolves to this pool.
+    if current_provider == "custom" and pool_provider.startswith("custom:"):
+        try:
+            from agent.credential_pool import get_custom_provider_pool_key
+
+            agent_base = (getattr(agent, "base_url", "") or "").strip()
+            return bool(agent_base) and (
+                (get_custom_provider_pool_key(agent_base) or "").strip().lower()
+                == pool_provider
+            )
+        except Exception:
+            return False
+
+    return False
+
+
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
     {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task"}
 )
@@ -699,34 +730,14 @@ def recover_with_credential_pool(
     # that seeded the pool.
     current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     pool_provider = (getattr(pool, "provider", "") or "").strip().lower()
-    if current_provider and pool_provider and current_provider != pool_provider:
-        # Custom endpoints use two naming conventions for the SAME provider:
-        # the agent carries the generic ``custom`` label while the pool is
-        # keyed ``custom:<name>`` (see CUSTOM_POOL_PREFIX). A literal string
-        # compare treats them as a mismatch and skips recovery for every
-        # custom-provider user — 401s/429s then burn the full retry cycle
-        # with no rotation or refresh. Accept the pair as matching only when
-        # the agent's CURRENT base_url actually resolves to this pool key,
-        # so a fallback provider (or a different custom endpoint) still
-        # triggers the guard.
-        _custom_match = False
-        if current_provider == "custom" and pool_provider.startswith("custom:"):
-            try:
-                from agent.credential_pool import get_custom_provider_pool_key
-                _agent_base = (getattr(agent, "base_url", "") or "").strip()
-                _custom_match = bool(_agent_base) and (
-                    (get_custom_provider_pool_key(_agent_base) or "").strip().lower()
-                    == pool_provider
-                )
-            except Exception:
-                _custom_match = False
-        if not _custom_match:
-            _ra().logger.warning(
-                "Credential pool provider mismatch: pool=%s, agent=%s — "
-                "skipping pool mutation to avoid cross-provider contamination",
-                pool_provider, current_provider,
-            )
-            return False, has_retried_429
+    if not _credential_pool_matches_agent_provider(agent, pool):
+        _ra().logger.warning(
+            "Credential pool provider mismatch: pool=%s, agent=%s — "
+            "skipping pool mutation to avoid cross-provider contamination",
+            pool_provider,
+            current_provider,
+        )
+        return False, has_retried_429
 
     effective_reason = classified_reason
     if effective_reason is None:
@@ -1181,7 +1192,21 @@ def restore_primary_runtime(agent) -> bool:
         # When the pool is absent, empty, or the entry has no usable key, we
         # keep the snapshot key (the existing behavior).  Fixes #25205.
         pool = getattr(agent, "_credential_pool", None)
-        if pool is not None and pool.has_available():
+        if pool is not None and not _credential_pool_matches_agent_provider(agent, pool):
+            pool_provider = (getattr(pool, "provider", "") or "").strip().lower()
+            current_provider = (getattr(agent, "provider", "") or "").strip().lower()
+            logger.warning(
+                "Restore skipped credential pool provider mismatch: pool=%s, "
+                "agent=%s — detaching pool and keeping primary runtime snapshot credential",
+                pool_provider,
+                current_provider,
+            )
+            # A mismatched pool may belong to a fallback provider from the last
+            # turn. Detach instead of applying or reloading here: restore must be
+            # deterministic and the existing no-pool path safely keeps the
+            # primary snapshot credential.
+            agent._credential_pool = None
+        elif pool is not None and pool.has_available():
             entry = pool.select()
             if entry is not None:
                 entry_key = (
@@ -1442,21 +1467,6 @@ def anthropic_prompt_cache_policy(
     eff_base_url = base_url if base_url is not None else (agent.base_url or "")
     eff_api_mode = api_mode if api_mode is not None else (agent.api_mode or "")
     eff_model = (model if model is not None else agent.model) or ""
-
-    # Global kill switch: prompt_caching.enabled=false disables cache_control
-    # markers on every path (init, /model switch, fallback re-derivation).
-    # Escape hatch for strict Anthropic-compatible proxies that inject their
-    # own markers server-side — stacking ours on top exceeds Anthropic's
-    # 4-breakpoint limit and 400s. Gating here (not just at init) keeps the
-    # switch honored after a model switch or fallback re-evaluates the policy.
-    try:
-        from hermes_cli.config import load_config as _load_pc_cfg
-
-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        if isinstance(_pc_cfg, dict) and _pc_cfg.get("enabled") is False:
-            return False, False
-    except Exception:
-        pass
 
     model_lower = eff_model.lower()
     provider_lower = eff_provider.lower()
