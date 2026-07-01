@@ -611,11 +611,29 @@ def strip_think_blocks(agent, content: str) -> str:
     # 1b. Tool-call XML blocks (openclaw/openclaw#67318). Handle the
     #     generic tag names first — they have no attribute gating since
     #     a literal <tool_call> in prose is already vanishingly rare.
+    #     Logged (not silently dropped): a model emitting its tool call as
+    #     text instead of the structured tool_calls field means the call
+    #     never actually executed, but the model's surrounding narration
+    #     often still claims success -- e.g. #56461, where a local Ollama
+    #     model told the user it saved a memory and nothing was ever
+    #     written. Without this log line that failure is undiagnosable.
+    def _log_stripped_pseudo_tool_call(tag_name: str):
+        def _sub(match: "re.Match") -> str:
+            logger.warning(
+                "Stripped a <%s> block the model emitted as plain text "
+                "instead of a structured tool call -- the call never "
+                "executed, but any surrounding narration claiming success "
+                "is untouched: %r",
+                tag_name, match.group(0)[:300],
+            )
+            return ""
+        return _sub
+
     for _tc_name in ("tool_call", "tool_calls", "tool_result",
                       "function_call", "function_calls"):
         content = re.sub(
             rf'<{_tc_name}\b[^>]*>.*?</{_tc_name}>',
-            '',
+            _log_stripped_pseudo_tool_call(_tc_name),
             content,
             flags=re.DOTALL | re.IGNORECASE,
         )
@@ -628,7 +646,7 @@ def strip_think_blocks(agent, content: str) -> str:
         r'(?:(?<=^)|(?<=[\n\r.!?:]))[ \t]*'
         r'<function\b[^>]*\bname\s*=[^>]*>'
         r'(?:(?:(?!</function>).)*)</function>',
-        '',
+        _log_stripped_pseudo_tool_call("function"),
         content,
         flags=re.DOTALL | re.IGNORECASE,
     )
@@ -1442,21 +1460,6 @@ def anthropic_prompt_cache_policy(
     eff_base_url = base_url if base_url is not None else (agent.base_url or "")
     eff_api_mode = api_mode if api_mode is not None else (agent.api_mode or "")
     eff_model = (model if model is not None else agent.model) or ""
-
-    # Global kill switch: prompt_caching.enabled=false disables cache_control
-    # markers on every path (init, /model switch, fallback re-derivation).
-    # Escape hatch for strict Anthropic-compatible proxies that inject their
-    # own markers server-side — stacking ours on top exceeds Anthropic's
-    # 4-breakpoint limit and 400s. Gating here (not just at init) keeps the
-    # switch honored after a model switch or fallback re-evaluates the policy.
-    try:
-        from hermes_cli.config import load_config as _load_pc_cfg
-
-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        if isinstance(_pc_cfg, dict) and _pc_cfg.get("enabled") is False:
-            return False, False
-    except Exception:
-        pass
 
     model_lower = eff_model.lower()
     provider_lower = eff_provider.lower()
