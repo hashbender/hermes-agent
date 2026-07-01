@@ -2937,6 +2937,15 @@ def run_conversation(
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
                 }
+                # Transient provider outages (server restarts, network
+                # hiccups, provider overload/500/502/timeout) typically last
+                # 2-3 minutes. Use an extended backoff schedule for these so
+                # retries span the outage window instead of giving up at ~14s.
+                _is_transient_outage = classified.reason in {
+                    FailoverReason.overloaded,
+                    FailoverReason.server_error,
+                    FailoverReason.timeout,
+                }
                 _should_fallback = (
                     is_rate_limited
                     or (_is_transport_failure and retry_count >= 2)
@@ -3765,6 +3774,15 @@ def run_conversation(
                         _final_response = f"Billing or credits exhausted: {_final_summary}"
                         if _billing_guidance:
                             _final_response += f"\n\n{_billing_guidance}"
+                    elif classified.reason in {FailoverReason.overloaded, FailoverReason.server_error, FailoverReason.timeout}:
+                        # Transient outage — the conversation was saved, so the
+                        # user can resume once the provider recovers. Don't show
+                        # this for permanent failures (billing/auth/policy) where
+                        # /resume would just hit the same wall. See issue #33693.
+                        _final_response = (
+                            f"Provider temporarily unavailable after {max_retries} retries: {_final_summary}\n\n"
+                            f"Your conversation has been saved. Use /resume to continue when the provider is back online."
+                        )
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_thinking_timeout:
@@ -3822,7 +3840,17 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                if _retry_after:
+                    wait_time = _retry_after
+                elif _is_transient_outage:
+                    # Extended backoff for transient outages: ~5s + ~10s + ~20s
+                    # (+ ~40s + ~80s if the user configures more retries), which
+                    # covers the 2-3 minute window of a real provider outage
+                    # (server restart / network hiccup) instead of giving up at
+                    # ~14s. See issue #33693.
+                    wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                else:
+                    wait_time = jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
                 if is_rate_limited and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
@@ -3847,7 +3875,8 @@ def run_conversation(
                     else:
                         agent._buffer_status(_rate_limit_status)
                 else:
-                    agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
+                    _outage_note = " (provider outage — extended retry)" if _is_transient_outage else ""
+                    agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries}){_outage_note}...")
                 logger.warning(
                     "Retrying API call in %ss (attempt %s/%s) %s policy=%s error=%s",
                     wait_time,
