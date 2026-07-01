@@ -1138,18 +1138,7 @@ DEFAULT_CONFIG = {
         "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
         "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
         "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
-        "tenki_image": "",
-        "tenki_api_endpoint": "https://api.tenki.cloud",
-        "tenki_workspace_id": "",
-        "tenki_project_id": "",
-        "tenki_name_prefix": "hermes",
-        "tenki_allow_inbound": False,
-        "tenki_allow_outbound": True,
-        "tenki_max_duration": 3600,
-        "tenki_idle_timeout": 0,
-        "tenki_pause_retention": 0,
-        "tenki_sync_hermes_home": False,
-        # Container resource limits (docker, singularity, modal, daytona, tenki — ignored for local/ssh)
+        # Container resource limits (docker, singularity, modal, daytona — ignored for local/ssh)
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)
         "container_disk": 51200,        # MB (default 50GB)
@@ -4422,6 +4411,8 @@ def _normalize_custom_provider_entry(
         "defaultModel": "default_model",
         "contextLength": "context_length",
         "rateLimitDelay": "rate_limit_delay",
+        "preserveThinking": "preserve_thinking",
+        "reasoningReplayField": "reasoning_replay_field",
     }
     # api_key_env is a documented snake_case alias for key_env (see
     # website/docs/guides/azure-foundry.md).  Normalize it up front so the
@@ -4434,6 +4425,7 @@ def _normalize_custom_provider_entry(
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body",
+        "preserve_thinking", "reasoning_replay_field",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -4536,6 +4528,14 @@ def _normalize_custom_provider_entry(
     if isinstance(discover_models, bool):
         normalized["discover_models"] = discover_models
 
+    preserve_thinking = entry.get("preserve_thinking")
+    if isinstance(preserve_thinking, bool):
+        normalized["preserve_thinking"] = preserve_thinking
+
+    reasoning_replay_field = entry.get("reasoning_replay_field")
+    if isinstance(reasoning_replay_field, str) and reasoning_replay_field.strip():
+        normalized["reasoning_replay_field"] = reasoning_replay_field.strip()
+
     extra_body = entry.get("extra_body")
     if isinstance(extra_body, dict):
         normalized["extra_body"] = dict(extra_body)
@@ -4566,6 +4566,8 @@ def _custom_provider_entry_to_provider_config(
         "context_length",
         "rate_limit_delay",
         "discover_models",
+        "preserve_thinking",
+        "reasoning_replay_field",
         "extra_body",
     ):
         if field in normalized:
@@ -4768,6 +4770,7 @@ _KNOWN_ROOT_KEYS = {
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
     "context_length", "rate_limit_delay", "extra_body",
+    "preserve_thinking", "reasoning_replay_field",
     # key_env is read at runtime by runtime_provider.py and auxiliary_client.py
     # — include it here so the set accurately describes the supported schema.
     "key_env",
@@ -6249,17 +6252,6 @@ TERMINAL_CONFIG_ENV_MAP = {
     "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
     "modal_image": "TERMINAL_MODAL_IMAGE",
     "daytona_image": "TERMINAL_DAYTONA_IMAGE",
-    "tenki_image": "TERMINAL_TENKI_IMAGE",
-    "tenki_api_endpoint": "TERMINAL_TENKI_API_ENDPOINT",
-    "tenki_workspace_id": "TERMINAL_TENKI_WORKSPACE_ID",
-    "tenki_project_id": "TERMINAL_TENKI_PROJECT_ID",
-    "tenki_name_prefix": "TERMINAL_TENKI_NAME_PREFIX",
-    "tenki_allow_inbound": "TERMINAL_TENKI_ALLOW_INBOUND",
-    "tenki_allow_outbound": "TERMINAL_TENKI_ALLOW_OUTBOUND",
-    "tenki_max_duration": "TERMINAL_TENKI_MAX_DURATION",
-    "tenki_idle_timeout": "TERMINAL_TENKI_IDLE_TIMEOUT",
-    "tenki_pause_retention": "TERMINAL_TENKI_PAUSE_RETENTION",
-    "tenki_sync_hermes_home": "TERMINAL_TENKI_SYNC_HERMES_HOME",
     "ssh_host": "TERMINAL_SSH_HOST",
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
@@ -7313,12 +7305,6 @@ def show_config():
         print(f"  Daytona image: {terminal.get('daytona_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
         daytona_key = get_env_value('DAYTONA_API_KEY')
         print(f"  API key:      {'configured' if daytona_key else '(not set)'}")
-    elif terminal.get('backend') == 'tenki':
-        print(f"  Tenki image:  {terminal.get('tenki_image') or '(Tenki default)'}")
-        print(f"  Endpoint:     {terminal.get('tenki_api_endpoint', 'https://api.tenki.cloud')}")
-        print(f"  Workspace:    {terminal.get('tenki_workspace_id') or '(from Tenki CLI)'}")
-        print(f"  Project:      {terminal.get('tenki_project_id') or '(from Tenki CLI)'}")
-        print(f"  Sync .hermes: {'enabled' if terminal.get('tenki_sync_hermes_home') else 'disabled'}")
     elif terminal.get('backend') == 'ssh':
         ssh_host = get_env_value('TERMINAL_SSH_HOST')
         ssh_user = get_env_value('TERMINAL_SSH_USER')
