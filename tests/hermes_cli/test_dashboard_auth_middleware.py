@@ -593,3 +593,92 @@ def test_unverifiable_token_with_reachable_providers_redirects(_gated_state):
     r = client.get("/api/auth/me")
     assert r.status_code == 401
     assert "unreachable" not in r.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Issue #56130 — BasicAuthProvider (password-only) must not trigger the
+# auto-SSO redirect to /auth/login?provider=basic (which calls start_login()
+# and raises NotImplementedError). The gate must fall through to /login
+# directly so the password form renders.
+# ---------------------------------------------------------------------------
+
+
+def _make_basic_provider():
+    """Construct a BasicAuthProvider for test use."""
+    import plugins.dashboard_auth.basic as basic_module
+    h = basic_module.hash_password("hunter2")
+    return basic_module.BasicAuthProvider(
+        username="admin",
+        password_hash=h,
+        secret=b"test-secret-must-be-at-least-16b",
+    )
+
+
+def test_basic_auth_unauthenticated_html_redirects_to_login_not_auth_login(
+    _gated_state,
+):
+    """GET / with basic_auth configured must redirect to /login, NOT /auth/login.
+
+    Regression for issue #56130: with exactly one provider registered and that
+    provider being BasicAuthProvider (password-only), _auto_sso_response used
+    to build a redirect to /auth/login?provider=basic. That handler calls
+    start_login() which raises NotImplementedError — a 500 before the user
+    could see the password form.
+
+    Fix: _auto_sso_response detects supports_password=True and returns None
+    (falls through to _unauth_response → /login).
+    """
+    register_provider(_make_basic_provider())
+    client = _gated_state()
+    r = client.get("/", follow_redirects=False)
+    assert r.status_code == 302
+    location = r.headers["location"]
+    # Must NOT redirect to the OAuth initiation route.
+    assert not location.startswith("/auth/login"), (
+        f"BasicAuthProvider should never trigger /auth/login redirect "
+        f"(issue #56130). Got: {location!r}"
+    )
+    # Must redirect to the password-form login page.
+    assert location.startswith("/login"), (
+        f"Expected redirect to /login (password form), got: {location!r}"
+    )
+
+
+def test_basic_auth_direct_auth_login_url_redirects_to_login_page(
+    _gated_state,
+):
+    """GET /auth/login?provider=basic must 302 → /login, not 500.
+
+    Defence-in-depth guard: even if something navigates directly to
+    /auth/login?provider=basic (e.g. a stale link, a log entry copied into
+    the address bar), the routes.py handler detects supports_password=True
+    and redirects to /login instead of calling start_login().
+    """
+    register_provider(_make_basic_provider())
+    client = _gated_state()
+    r = client.get("/auth/login?provider=basic&next=%2F", follow_redirects=False)
+    assert r.status_code == 302, (
+        f"Expected 302, got {r.status_code}: {r.text}"
+    )
+    location = r.headers["location"]
+    assert location.startswith("/login"), (
+        f"Expected redirect to /login, got: {location!r}"
+    )
+    # next= param should be preserved.
+    assert "next=" in location, (
+        f"Expected next= to be forwarded in redirect, got: {location!r}"
+    )
+
+
+def test_basic_auth_does_not_suppress_oauth_auto_sso(_gated_state):
+    """When the single registered provider is OAuth-capable (not password-only),
+    the auto-SSO redirect to /auth/login must still fire (regression guard).
+    """
+    register_provider(StubAuthProvider())
+    client = _gated_state()
+    r = client.get("/", follow_redirects=False)
+    assert r.status_code == 302
+    location = r.headers["location"]
+    assert location.startswith("/auth/login?provider=stub"), (
+        f"OAuth provider should still trigger auto-SSO. Got: {location!r}"
+    )
