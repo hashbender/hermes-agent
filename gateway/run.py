@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Union
+from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -1447,17 +1447,6 @@ if _config_path.exists():
                 "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
                 "modal_image": "TERMINAL_MODAL_IMAGE",
                 "daytona_image": "TERMINAL_DAYTONA_IMAGE",
-                "tenki_image": "TERMINAL_TENKI_IMAGE",
-                "tenki_api_endpoint": "TERMINAL_TENKI_API_ENDPOINT",
-                "tenki_workspace_id": "TERMINAL_TENKI_WORKSPACE_ID",
-                "tenki_project_id": "TERMINAL_TENKI_PROJECT_ID",
-                "tenki_name_prefix": "TERMINAL_TENKI_NAME_PREFIX",
-                "tenki_allow_inbound": "TERMINAL_TENKI_ALLOW_INBOUND",
-                "tenki_allow_outbound": "TERMINAL_TENKI_ALLOW_OUTBOUND",
-                "tenki_max_duration": "TERMINAL_TENKI_MAX_DURATION",
-                "tenki_idle_timeout": "TERMINAL_TENKI_IDLE_TIMEOUT",
-                "tenki_pause_retention": "TERMINAL_TENKI_PAUSE_RETENTION",
-                "tenki_sync_hermes_home": "TERMINAL_TENKI_SYNC_HERMES_HOME",
                 "ssh_host": "TERMINAL_SSH_HOST",
                 "ssh_user": "TERMINAL_SSH_USER",
                 "ssh_port": "TERMINAL_SSH_PORT",
@@ -6365,7 +6354,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
@@ -7174,7 +7162,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-                    adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
@@ -7831,7 +7818,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter._busy_text_mode = self._busy_text_mode
 
             try:
@@ -7999,39 +7985,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return YuanbaoAdapter(config)
 
         return None
-
-    def _make_adapter_auth_check(
-        self,
-        platform: Platform,
-    ) -> Callable[[str, Optional[str], Optional[str]], bool]:
-        """Build a platform-bound auth callback for adapter use.
-
-        Adapters that fetch external context (e.g. Slack
-        ``conversations.replies``) call this through
-        ``BasePlatformAdapter._is_sender_authorized`` to mark non-allowlisted
-        senders as unverified in LLM context, mitigating indirect prompt
-        injection from third parties in shared threads/channels.
-
-        The returned callback delegates to :meth:`_is_user_authorized` so the
-        full auth chain — platform allowlists, group allowlists, pairing
-        store, allow-all flags — stays the single source of truth.
-        """
-        def check(
-            user_id: str,
-            chat_type: Optional[str] = None,
-            chat_id: Optional[str] = None,
-        ) -> bool:
-            if not user_id:
-                return False
-            source = SessionSource(
-                platform=platform,
-                chat_id=chat_id or "",
-                chat_type=chat_type or "group",
-                user_id=user_id,
-            )
-            return self._is_user_authorized(source)
-        return check
-
 
 
 
