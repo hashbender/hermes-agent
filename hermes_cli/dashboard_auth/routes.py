@@ -192,6 +192,19 @@ async def auth_login(request: Request, provider: str, next: str = ""):
             status_code=404,
             detail=f"Provider does not support interactive login: {provider!r}",
         )
+    # Password-only providers (e.g. BasicAuthProvider) have no OAuth redirect
+    # flow — start_login() raises NotImplementedError. Redirect directly to
+    # /login (the password form) so the user never sees a 500.
+    if getattr(p, "supports_password", False):
+        from urllib.parse import quote as _quote
+        prefix = _prefix(request)
+        safe_next = _validate_post_login_target(next)
+        login_url = (
+            f"{prefix}/login?next={_quote(safe_next, safe='')}"
+            if safe_next
+            else f"{prefix}/login"
+        )
+        return RedirectResponse(url=login_url, status_code=302)
 
     try:
         ls = p.start_login(redirect_uri=_redirect_uri(request))
