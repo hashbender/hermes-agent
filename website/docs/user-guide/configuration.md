@@ -915,19 +915,16 @@ For Claude on **native Anthropic**, **OpenRouter**, and **Nous Portal**, Hermes 
 
 The Qwen Cloud (Alibaba DashScope) upstream caps cache TTL at 5 minutes, so Hermes uses the 5-minute breakpoint TTL there instead. Other Claude-via-third-party paths (AWS Bedrock, Azure Foundry) fall back to the provider's own caching defaults. xAI Grok uses a separate session-pinned conversation-id mechanism — see [xAI prompt caching](/integrations/providers#xai-grok--responses-api--prompt-caching).
 
-Caching is on by default and saves money even on single-turn conversations because the system prompt alone is a meaningful fraction of the input token count. It can be turned off entirely with the `enabled` knob below when a strict provider rejects `cache_control` markers.
+No knob exists to disable this — caching is always-on and saves money even on single-turn conversations because the system prompt alone is a meaningful fraction of the input token count.
 
-The explicit knobs are whether caching runs at all and the cache TTL tier Hermes requests on Anthropic-style breakpoints:
+The one explicit knob is the cache TTL tier Hermes requests on Anthropic-style breakpoints:
 
 ```yaml
 prompt_caching:
-  enabled: true    # set false to stop sending cache_control markers entirely
   cache_ttl: "5m"   # "5m" or "1h" (Anthropic-supported tiers); other values are ignored
 ```
 
 `cache_ttl` selects the breakpoint TTL Hermes attaches for Claude via the native Anthropic API, OpenRouter, and Nous Portal. Only the two Anthropic-supported tiers (`"5m"`, `"1h"`) are honored — any other value is ignored. Providers with their own caps (e.g. Qwen Cloud, which maxes at 5 minutes) still clamp to what the upstream allows.
-
-`enabled` defaults to `true`. Set it to `false` as an escape hatch for strict Anthropic-compatible proxies that inject their own `cache_control` markers server-side — stacking those on top of Hermes' breakpoints can exceed Anthropic's 4-breakpoint limit and return HTTP 400 `"A maximum of 4 blocks with cache_control may be provided"`. Disabling caching on that setup passes requests through without client-side markers so the proxy manages its own.
 
 ## Auxiliary Models
 
@@ -1319,7 +1316,7 @@ agent:
 
 | Value | Behavior |
 |-------|----------|
-| `"auto"` (default) | Enabled for models matching: `gpt`, `codex`, `gemini`, `gemma`, `grok`. Disabled for all others (Claude, DeepSeek, Qwen, etc.). |
+| `"auto"` (default) | Enabled for models whose name matches `TOOL_USE_ENFORCEMENT_MODELS` (in `agent/prompt_builder.py`): `gpt`, `codex`, `gemini`, `gemma`, `grok`, `glm`, `qwen`, `deepseek`. Disabled for all others (e.g. Claude, which uses tools reliably without it). |
 | `true` | Always enabled, regardless of model. Useful if you notice your current model describing actions instead of performing them. |
 | `false` | Always disabled, regardless of model. |
 | `["gpt", "codex", "qwen", "llama"]` | Enabled only when the model name contains one of the listed substrings (case-insensitive). |
@@ -1330,7 +1327,7 @@ When enabled, three layers of guidance may be added to the system prompt:
 
 1. **General tool-use enforcement** (all matched models) — instructs the model to make tool calls immediately instead of describing intentions, keep working until the task is complete, and never end a turn with a promise of future action.
 
-2. **OpenAI execution discipline** (GPT and Codex models only) — additional guidance addressing GPT-specific failure modes: abandoning work on partial results, skipping prerequisite lookups, hallucinating instead of using tools, and declaring "done" without verification.
+2. **OpenAI execution discipline** (GPT, Codex, and Grok models) — additional guidance addressing failure modes common to these families: abandoning work on partial results, skipping prerequisite lookups, hallucinating instead of using tools, and declaring "done" without verification.
 
 3. **Google operational guidance** (Gemini and Gemma models only) — conciseness, absolute paths, parallel tool calls, and verify-before-edit patterns.
 
@@ -1344,6 +1341,17 @@ If you're using a model not in the default auto list and notice it frequently de
 agent:
   tool_use_enforcement: ["gpt", "codex", "gemini", "grok", "my-custom-model"]
 ```
+
+:::caution Small or quantized local models
+On a small or quantized local model (e.g. a heavily-quantized Qwen / GLM / DeepSeek served through vLLM or llama.cpp), this guidance can have the **opposite** effect. The extra system-prompt volume can push the model off its native tool-call format, so it emits the call as **text** instead of a structured `tool_calls` — the same symptom as [Tool calls appear as text](../integrations/providers.md#tool-calls-appear-as-text-instead-of-executing), but caused by the prompt rather than a missing parser flag. Because `qwen`, `gemma`, `glm`, and `deepseek` are matched by `"auto"`, this can happen at the default setting. If your `--tool-call-parser` flags are already correct and you still see text tool calls, disable the guidance:
+
+```yaml
+agent:
+  tool_use_enforcement: false
+  task_completion_guidance: false
+  parallel_tool_call_guidance: false
+```
+:::
 
 ## Tool-Loop Guardrails
 
