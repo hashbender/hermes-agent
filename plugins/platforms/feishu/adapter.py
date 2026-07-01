@@ -4200,6 +4200,17 @@ class FeishuAdapter(BasePlatformAdapter):
                 return "bot_not_mentioned"
 
         if not is_group:
+            if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+                return None
+            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+                return None
+            # Empty FEISHU_ALLOWED_USERS is the pairing-mode default from setup:
+            # forward DMs to gateway intake so the pairing handshake can run.
+            # Gateway auth fail-closes agent access until approval.
+            if not self._allowed_group_users:
+                return None
+            if not (sender_ids and (sender_ids & self._allowed_group_users)):
+                return "dm_policy_rejected"
             return None
 
         if not self._allow_group_message(
@@ -5560,10 +5571,19 @@ def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
 
 
 def _is_connected(config) -> bool:
-    """Feishu is connected when app_id is configured. Mirrors the legacy
-    _PLATFORM_CONNECTED_CHECKERS[Platform.FEISHU] = lambda cfg: bool(app_id)."""
+    """Feishu is connected when app_id is configured.
+
+    Mirrors the legacy _PLATFORM_CONNECTED_CHECKERS[Platform.FEISHU] = lambda
+    cfg: bool(app_id), with an env-var fallback so users who configure Feishu
+    via ``hermes setup gateway`` (which writes to ``~/.hermes/.env``) are
+    recognized as configured in the same wizard's picker. The picker passes a
+    synthetic ``PlatformConfig(enabled=True)`` whose ``extra`` is empty, so
+    without the env fallback the picker always reports "not configured" even
+    when ``FEISHU_APP_ID`` is set in ``.env``. Matches the DingTalk plugin's
+    pattern (see ``plugins/platforms/dingtalk/adapter.py::_is_connected``).
+    """
     extra = getattr(config, "extra", {}) or {}
-    return bool(extra.get("app_id"))
+    return bool(extra.get("app_id") or os.getenv("FEISHU_APP_ID"))
 
 
 def _build_adapter(config):
