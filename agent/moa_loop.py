@@ -64,6 +64,26 @@ _REFERENCE_SYSTEM_PROMPT = (
 )
 
 
+class MoAAggregatorContextOverflow(RuntimeError):
+    """Raised before calling the aggregator when the measured request is too large."""
+
+    def __init__(
+        self,
+        *,
+        estimated_tokens: int,
+        context_length: int,
+        aggregator_label: str,
+    ) -> None:
+        self.estimated_tokens = estimated_tokens
+        self.context_length = context_length
+        self.aggregator_label = aggregator_label
+        super().__init__(
+            "MoA aggregator input exceeds the context window of this model: "
+            f"estimated request {estimated_tokens:,} tokens > context window "
+            f"{context_length:,} tokens (aggregator={aggregator_label})."
+        )
+
+
 
 def _slot_label(slot: dict[str, str]) -> str:
     return f"{slot.get('provider', '').strip()}:{slot.get('model', '').strip()}"
@@ -369,6 +389,56 @@ def _extract_text(response: Any) -> str:
         return ""
 
 
+def _slot_context_length(slot: dict[str, str]) -> int | None:
+    try:
+        from agent.model_metadata import get_model_context_length
+
+        runtime = _slot_runtime(slot)
+        return get_model_context_length(
+            str(runtime.get("model") or slot.get("model") or ""),
+            base_url=str(runtime.get("base_url") or ""),
+            api_key=str(runtime.get("api_key") or ""),
+            provider=str(runtime.get("provider") or slot.get("provider") or ""),
+        )
+    except Exception:
+        logger.debug(
+            "MoA slot context budget resolution failed for %s",
+            _slot_label(slot),
+            exc_info=True,
+        )
+        return None
+
+
+def _latest_user_content(messages: list[dict[str, Any]]) -> str | None:
+    for msg in reversed(messages):
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            return msg["content"]
+    return None
+
+
+def _raise_if_aggregator_context_overflow(
+    *,
+    messages: list[dict[str, Any]],
+    aggregator: dict[str, str],
+    tools: list[dict[str, Any]] | None,
+) -> None:
+    context_length = _slot_context_length(aggregator)
+    if not context_length:
+        return
+
+    from agent.model_metadata import estimate_request_tokens_rough
+
+    estimated_tokens = estimate_request_tokens_rough(messages, tools=tools)
+    if estimated_tokens <= context_length:
+        return
+
+    raise MoAAggregatorContextOverflow(
+        estimated_tokens=estimated_tokens,
+        context_length=context_length,
+        aggregator_label=_slot_label(aggregator),
+    )
+
+
 def aggregate_moa_context(
     *,
     user_prompt: str,
@@ -466,6 +536,8 @@ class MoAChatCompletions:
         # for free, without re-firing on a pure no-op re-call.
         self._ref_cache_key: tuple | None = None
         self._ref_cache_outputs: list[tuple[str, str]] = []
+        self._reuse_reference_outputs_after_overflow = False
+        self._overflow_retry_user_content: str | None = None
 
     def _emit(self, event: str, **kwargs: Any) -> None:
         cb = self.reference_callback
@@ -511,9 +583,18 @@ class MoAChatCompletions:
         ).hexdigest()
         _cache_key = (self.preset_name, _sig, tuple(_slot_label(s) for s in reference_models))
         _refs_from_cache = _cache_key == self._ref_cache_key and bool(self._ref_cache_outputs)
+        _latest_user = _latest_user_content(messages)
+        _reuse_after_overflow = (
+            self._reuse_reference_outputs_after_overflow
+            and bool(self._ref_cache_outputs)
+            and _latest_user is not None
+            and _latest_user == self._overflow_retry_user_content
+        )
 
-        if _refs_from_cache:
+        if _refs_from_cache or _reuse_after_overflow:
             reference_outputs = list(self._ref_cache_outputs)
+            if _reuse_after_overflow:
+                self._ref_cache_key = _cache_key
         else:
             reference_outputs = _run_references_parallel(
                 reference_models,
@@ -571,6 +652,19 @@ class MoAChatCompletions:
         if aggregator.get("provider") == "moa":
             raise RuntimeError("MoA aggregator cannot be another MoA preset")
         agg_kwargs = dict(api_kwargs)
+        try:
+            _raise_if_aggregator_context_overflow(
+                messages=agg_messages,
+                aggregator=aggregator,
+                tools=agg_kwargs.get("tools"),
+            )
+        except MoAAggregatorContextOverflow:
+            self._reuse_reference_outputs_after_overflow = True
+            self._overflow_retry_user_content = _latest_user
+            raise
+
+        self._reuse_reference_outputs_after_overflow = False
+        self._overflow_retry_user_content = None
         agg_kwargs["messages"] = agg_messages
         # The aggregator is the acting model. Resolve its slot to the provider's
         # real runtime (base_url/api_key/api_mode) and call it through the same

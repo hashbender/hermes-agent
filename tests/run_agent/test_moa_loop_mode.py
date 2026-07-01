@@ -486,6 +486,70 @@ moa:
     assert agg_call["tools"] is not None
 
 
+def test_moa_facade_measures_aggregator_context_before_call_and_reuses_references(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+moa:
+  default_preset: review
+  presets:
+    review:
+      reference_models:
+        - provider: openai-codex
+          model: gpt-5.5
+      aggregator:
+        provider: openrouter
+        model: anthropic/claude-opus-4.8
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from agent import moa_loop
+    from agent.moa_loop import MoAAggregatorContextOverflow, MoAChatCompletions
+
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 1_000,
+    )
+
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        if kwargs["task"] == "moa_reference":
+            return _response("reference advice")
+        return _response("aggregator acted")
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+
+    facade = MoAChatCompletions("review")
+    current_user = "what should we do next?"
+    oversized_history = [
+        {"role": "user", "content": "old context " * 8_000},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": current_user},
+    ]
+
+    with pytest.raises(MoAAggregatorContextOverflow) as exc_info:
+        facade.create(messages=oversized_history, tools=[{"type": "function"}])
+
+    assert exc_info.value.estimated_tokens > exc_info.value.context_length
+    assert [c["task"] for c in calls] == ["moa_reference"]
+
+    compressed_history = [
+        {"role": "assistant", "content": "[summary of old context]"},
+        {"role": "user", "content": current_user},
+    ]
+    response = facade.create(messages=compressed_history, tools=[{"type": "function"}])
+
+    assert response.choices[0].message.content == "aggregator acted"
+    assert [c["task"] for c in calls] == ["moa_reference", "moa_aggregator"]
+
+
 def test_moa_disabled_preset_skips_references(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
