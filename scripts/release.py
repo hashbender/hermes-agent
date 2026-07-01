@@ -111,6 +111,7 @@ AUTHOR_MAP = {
     "yashiel@skyner.co.za": "yashiels",  # PR #53284 salvage (discord markdown table-to-bullet conversion; #21168)
     "46495124+yungchentang@users.noreply.github.com": "yungchentang",  # PR #53622 salvage (drain Telegram general send pool on pool timeout before retry; #53524)
     "15205536+595650661@users.noreply.github.com": "595650661",  # PR #37851 salvage (classify MiniMax new_sensitive content filter → content_policy_blocked; #32421)
+    "qWaitCrypto@users.noreply.github.com": "qWaitCrypto",  # PR #52534 salvage (preserve assistant tool_use cache_control marker in Anthropic conversion so cache breakpoints aren't dropped from the wire)
     "benbenwyb@gmail.com": "benbenlijie",  # PR #47205 salvage (named custom-provider extra_body + Z.AI Coding overload adaptive backoff; #50663)
     "dana@added-value.co.il": "Danamove",  # PR #46726 salvage (kill venv-resident pythonw gateway before recreating venv on Windows; #47036/#47557/#47910)
     "rcint@klaith.com": "rc-int",  # PR #9126 salvage / co-author (cap subagent summary size vs parent context overflow)
@@ -216,6 +217,8 @@ AUTHOR_MAP = {
     "157689911+itsflownium@users.noreply.github.com": "itsflownium",
     "dirtyren@users.noreply.github.com": "dirtyren",
     "13277570+justin-cyhuang@users.noreply.github.com": "justin-cyhuang",
+    "agent@tranquil-flow.dev": "Tranquil-Flow",
+    "jason@hermes-jc": "jcjc81",
     "290862769+friendshipisover@users.noreply.github.com": "friendshipisover",
     "51421+MattKotsenas@users.noreply.github.com": "MattKotsenas",
     "92324143+ypwcharles@users.noreply.github.com": "ypwcharles",
@@ -1699,6 +1702,7 @@ AUTHOR_MAP = {
     "35164907+MoonJuhan@users.noreply.github.com": "MoonJuhan",  # PR #28288 salvage (unreadable JSONL transcripts)
     "codemike@naver.com": "MoonJuhan",
     "201563152+outsourc-e@users.noreply.github.com": "outsourc-e",  # PR #28164 salvage (cron emoji ZWJ)
+    "eric@outsourc-e.com": "outsourc-e",  # PR #28177 salvage (Teams recording path traversal)
     "201803425+Zyrixtrex@users.noreply.github.com": "Zyrixtrex",  # PR #28275 salvage (Google OAuth timeout)
     "zyrixtrex@gmail.com": "Zyrixtrex",
     "120500656+ooovenenoso@users.noreply.github.com": "ooovenenoso",  # PR #28256 salvage (tool loop recovery hints)
