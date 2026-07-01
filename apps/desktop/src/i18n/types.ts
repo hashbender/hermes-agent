@@ -128,8 +128,7 @@ export interface Translations {
       remoteTitle: string
       remoteDescription: string
       retry: string
-      repairInstall: string
-      useLocalGateway: string
+      configureGateway: string
       openLogs: string
       repairHint: string
       remoteSignInHint: string
@@ -223,7 +222,6 @@ export interface Translations {
     muteHaptics: string
     unmuteHaptics: string
     openSettings: string
-    openStarmap: string
     openKeybinds: string
   }
 
@@ -650,33 +648,6 @@ export interface Translations {
     failedToUpdate: (name: string) => string
   }
 
-  starmap: {
-    title: string
-    subtitle: (nodes: number, clusters: number) => string
-    close: string
-    refresh: string
-    memory: string
-    filterAll: string
-    filterUsed: string
-    filterLearned: string
-    viewGraph: string
-    loadFailed: string
-    loading: string
-    emptyTitle: string
-    emptyDesc: string
-    share: string
-    shareHint: string
-    shareTitle: string
-    sharePlaceholder: string
-    copy: string
-    copied: string
-    importMap: string
-    importBtn: string
-    importEmpty: string
-    importSuccess: (nodes: number) => string
-    importedBadge: string
-    resetToMine: string
-  }
   agents: {
     close: string
     title: string
@@ -1104,7 +1075,6 @@ export interface Translations {
       copyPath: string
       removeFromSidebar: string
       createFailed: string
-      staleBackend: string
       deleteConfirm: string
       startWork: string
       newWorktreeTitle: string
@@ -1527,8 +1497,6 @@ export interface Translations {
       running: (count: number) => string
       cron: string
       openCron: string
-      starmap: string
-      openStarmap: string
       turnRunning: string
       currentTurnElapsed: string
       contextUsage: string

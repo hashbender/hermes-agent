@@ -41,7 +41,6 @@ import type {
   SessionMessagesResponse,
   SessionSearchResponse,
   SkillInfo,
-  StarmapGraph,
   StatusResponse,
   ToolsetConfig,
   ToolsetInfo
@@ -49,15 +48,6 @@ import type {
 
 const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
-// prompt.submit is effectively fire-and-forget: turn completion is signaled by
-// stream / message.complete events, NOT by the RPC return. A long turn (MoA
-// presets running references + aggregator in series, deep reasoning, large tool
-// chains) can legitimately take minutes to ACK, so bounding the ack by the
-// generic 30s default surfaces a false "request timed out" toast while the turn
-// is still running and will succeed (issue #55024). Match the backend's
-// agent-turn ceiling (agent.gateway_timeout = 1800s) so the ack timeout only
-// ever fires when the turn itself would have been abandoned server-side.
-export const PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1_800_000
 
 export type {
   ActionResponse,
@@ -123,7 +113,6 @@ export type {
   SessionSearchResult,
   SkillInfo,
   StaleAuxAssignment,
-  StarmapGraph,
   StatusResponse,
   ToolsetConfig,
   ToolsetInfo
@@ -132,10 +121,10 @@ export type {
 export class HermesGateway extends JsonRpcGatewayClient {
   constructor() {
     super({
-      closedErrorMessage: 'Hermes gateway connection closed',
-      connectErrorMessage: 'Could not connect to Hermes gateway',
+      closedErrorMessage: 'Reuben gateway connection closed',
+      connectErrorMessage: 'Could not connect to Reuben gateway',
       createRequestId: nextId => nextId,
-      notConnectedErrorMessage: 'Hermes gateway is not connected',
+      notConnectedErrorMessage: 'Reuben gateway is not connected',
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
     })
   }
@@ -144,9 +133,8 @@ export class HermesGateway extends JsonRpcGatewayClient {
 // Profile that profile-scoped REST settings (config/env/skills/tools/model/…)
 // should target. Mirrors $activeGatewayProfile, pushed in from the store via
 // setApiRequestProfile so this module needs no store import (avoids a cycle).
-// Electron main consumes request.profile to pick which backend *process* serves
-// the call; each pooled backend already has its own HERMES_HOME, so no backend
-// change is needed. Null → primary, so single-profile users are unaffected.
+// Electron main consumes request.profile to pick the configured remote gateway
+// scope for the call. Null → primary, so single-profile users are unaffected.
 let _apiProfile: null | string = null
 
 export function setApiRequestProfile(profile: null | string): void {
@@ -500,47 +488,6 @@ export function getSkills(): Promise<SkillInfo[]> {
   })
 }
 
-export function getStarmapGraph(): Promise<StarmapGraph> {
-  return window.hermesDesktop.api<StarmapGraph>({
-    ...profileScoped(),
-    // Backend REST contract — stays /api/learning even though the UI feature is
-    // now "star map". Renaming this would break against an un-upgraded backend.
-    path: '/api/learning/graph'
-  })
-}
-
-export interface LearningNodeDetail {
-  content: string
-  kind: 'memory' | 'skill'
-  label: string
-  ok: boolean
-}
-
-export function getLearningNode(id: string): Promise<LearningNodeDetail> {
-  return window.hermesDesktop.api<LearningNodeDetail>({
-    ...profileScoped(),
-    path: `/api/learning/node?id=${encodeURIComponent(id)}`
-  })
-}
-
-export function deleteLearningNode(id: string): Promise<{ message: string; ok: boolean }> {
-  return window.hermesDesktop.api<{ message: string; ok: boolean }>({
-    ...profileScoped(),
-    path: '/api/learning/node',
-    method: 'DELETE',
-    body: { id }
-  })
-}
-
-export function editLearningNode(id: string, content: string): Promise<{ message: string; ok: boolean }> {
-  return window.hermesDesktop.api<{ message: string; ok: boolean }>({
-    ...profileScoped(),
-    path: '/api/learning/node',
-    method: 'PUT',
-    body: { content, id }
-  })
-}
-
 export function toggleSkill(name: string, enabled: boolean): Promise<{ ok: boolean; name: string; enabled: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean; name: string; enabled: boolean }>({
     ...profileScoped(),
@@ -829,29 +776,19 @@ export function setModelAssignment(body: ModelAssignmentRequest): Promise<ModelA
 }
 
 export function restartGateway(): Promise<ActionResponse> {
-  return window.hermesDesktop.api<ActionResponse>({
-    ...profileScoped(),
-    path: '/api/gateway/restart',
-    method: 'POST'
-  })
+  return Promise.reject(new Error('Reuben Desktop does not restart remote backends.'))
 }
 
 export function updateHermes(): Promise<ActionResponse> {
-  return window.hermesDesktop.api<ActionResponse>({
-    ...profileScoped(),
-    path: '/api/hermes/update',
-    method: 'POST'
-  })
+  return Promise.reject(new Error('Reuben Desktop does not update or mutate remote backends.'))
 }
 
 /** Query the connected backend's own update state. In remote mode this is the
  *  authoritative source for the backend's behind-count + "what's changed",
  *  distinct from the Electron client clone's git state. */
 export function checkHermesUpdate(force = false): Promise<BackendUpdateCheckResponse> {
-  return window.hermesDesktop.api<BackendUpdateCheckResponse>({
-    ...profileScoped(),
-    path: `/api/hermes/update/check${force ? '?force=true' : ''}`
-  })
+  void force
+  return Promise.reject(new Error('Remote backend updates are managed outside Reuben Desktop.'))
 }
 
 export function getActionStatus(name: string, lines = 200): Promise<ActionStatusResponse> {
