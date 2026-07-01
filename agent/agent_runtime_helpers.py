@@ -1120,8 +1120,15 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_index = 0
         return False
 
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
-        return False  # primary still in rate-limit cooldown, stay on fallback
+    from agent.cooldown_manager import get_cooldown_manager, build_cooldown_key
+    _primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
+    _primary_key = ((agent._primary_runtime or {}).get("api_key") or "").strip()
+    # Check both provider-level (billing) and key-level (rate_limit) cooldowns
+    _mgr = get_cooldown_manager()
+    _ck_provider = _primary_provider
+    _ck_key = build_cooldown_key(_primary_provider, _primary_key or None, "rate_limit")
+    if _mgr.is_cooling(_ck_provider) or _mgr.is_cooling(_ck_key):
+        return False  # primary still on cooldown, stay on fallback
 
     rt = agent._primary_runtime
     try:
@@ -1442,21 +1449,6 @@ def anthropic_prompt_cache_policy(
     eff_base_url = base_url if base_url is not None else (agent.base_url or "")
     eff_api_mode = api_mode if api_mode is not None else (agent.api_mode or "")
     eff_model = (model if model is not None else agent.model) or ""
-
-    # Global kill switch: prompt_caching.enabled=false disables cache_control
-    # markers on every path (init, /model switch, fallback re-derivation).
-    # Escape hatch for strict Anthropic-compatible proxies that inject their
-    # own markers server-side — stacking ours on top exceeds Anthropic's
-    # 4-breakpoint limit and 400s. Gating here (not just at init) keeps the
-    # switch honored after a model switch or fallback re-evaluates the policy.
-    try:
-        from hermes_cli.config import load_config as _load_pc_cfg
-
-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        if isinstance(_pc_cfg, dict) and _pc_cfg.get("enabled") is False:
-            return False, False
-    except Exception:
-        pass
 
     model_lower = eff_model.lower()
     provider_lower = eff_provider.lower()

@@ -451,10 +451,14 @@ class TestRestoreInRunConversation:
 # =============================================================================
 
 class TestRateLimitCooldown:
-    """Verify _restore_primary_runtime() respects the 60s rate-limit cooldown."""
+    """Verify _restore_primary_runtime() respects the rate-limit cooldown."""
 
     def test_restore_blocked_during_cooldown(self):
-        """While _rate_limited_until is in the future, restore returns False."""
+        """While the primary provider is cooling, restore returns False."""
+        from agent.cooldown_manager import CooldownManager, set_cooldown_manager, build_cooldown_key
+        mgr = CooldownManager(storage_path=False)
+        set_cooldown_manager(mgr)
+
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
         )
@@ -464,15 +468,21 @@ class TestRateLimitCooldown:
 
         assert agent._fallback_activated is True
 
-        # Manually set cooldown well into the future
-        agent._rate_limited_until = time.monotonic() + 60
+        # Manually arm cooldown on the primary provider
+        primary_provider = (agent._primary_runtime or {}).get("provider", "bedrock")
+        mgr.mark_failure(primary_provider, "rate_limit")
 
         result = agent._restore_primary_runtime()
         assert result is False
         assert agent._fallback_activated is True  # still on fallback
 
     def test_restore_allowed_after_cooldown_expires(self):
-        """Once the cooldown window passes, restore proceeds normally."""
+        """Once the cooldown expires, restore proceeds normally."""
+        from agent.cooldown_manager import CooldownManager, set_cooldown_manager
+        # Install a fresh manager with no active cooldowns
+        mgr = CooldownManager(storage_path=False)
+        set_cooldown_manager(mgr)
+
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
         )
@@ -482,9 +492,7 @@ class TestRateLimitCooldown:
 
         assert agent._fallback_activated is True
 
-        # Cooldown already expired
-        agent._rate_limited_until = time.monotonic() - 1
-
+        # No cooldown active — restore should proceed
         with patch("run_agent.OpenAI", return_value=MagicMock()):
             result = agent._restore_primary_runtime()
 
@@ -492,22 +500,33 @@ class TestRateLimitCooldown:
         assert agent._fallback_activated is False
 
     def test_cooldown_set_on_rate_limit_reason(self):
-        """_try_activate_fallback with rate_limit reason sets _rate_limited_until."""
+        """_try_activate_fallback with rate_limit reason registers a cooldown."""
         from run_agent import FailoverReason
+        from agent.cooldown_manager import CooldownManager, set_cooldown_manager
+        mgr = CooldownManager(storage_path=False)
+        set_cooldown_manager(mgr)
+
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
         )
-        before = time.monotonic()
         mock_client = _mock_resolve()
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
             agent._try_activate_fallback(reason=FailoverReason.rate_limit)
 
-        assert hasattr(agent, "_rate_limited_until")
-        assert agent._rate_limited_until > before + 50  # ~60s from now
+        status = mgr.get_cooldown_status()
+        assert len(status["cooling"]) >= 1
+        # Exponential: first rate_limit hit = base 60s
+        remaining = list(mgr.get_all_states().values())[0]["remaining_seconds"]
+        assert remaining > 50  # ~60s
 
     def test_cooldown_not_set_when_already_on_fallback(self):
-        """Chain-switching while already on fallback must not reset cooldown."""
+        """Chain-switching while already on fallback must not re-arm cooldown
+        for the primary provider."""
         from run_agent import FailoverReason
+        from agent.cooldown_manager import CooldownManager, set_cooldown_manager
+        mgr = CooldownManager(storage_path=False)
+        set_cooldown_manager(mgr)
+
         agent = _make_agent(
             fallback_model=[
                 {"provider": "openrouter", "model": "model-a"},
@@ -518,11 +537,12 @@ class TestRateLimitCooldown:
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
             # First call: leaving primary → cooldown should be set
             agent._try_activate_fallback(reason=FailoverReason.rate_limit)
-            first_cooldown = getattr(agent, "_rate_limited_until", 0)
+            first_states = dict(mgr.get_all_states())
 
-            # Second call: already on fallback (provider != primary) → cooldown must not advance
+            # Second call: already on fallback → primary cooldown must not advance
             agent._try_activate_fallback(reason=FailoverReason.rate_limit)
-            second_cooldown = getattr(agent, "_rate_limited_until", 0)
+            second_states = dict(mgr.get_all_states())
 
-        # second call should not have extended the cooldown
-        assert second_cooldown == first_cooldown
+        # The count for the primary-keyed entry must not have incremented
+        for key in first_states:
+            assert first_states[key]["count"] == second_states.get(key, {}).get("count", first_states[key]["count"])
