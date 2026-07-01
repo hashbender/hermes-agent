@@ -88,15 +88,12 @@ def _find_hermes_md(cwd: Path) -> Optional[Path]:
     stop_at = _find_git_root(cwd)
     current = cwd.resolve()
 
-    # When there is no git root, only check cwd itself – walking parents
-    # could pick up a .hermes.md planted in /tmp, /home, etc.
-    search_dirs = [current, *current.parents] if stop_at else [current]
-
-    for directory in search_dirs:
+    for directory in [current, *current.parents]:
         for name in _HERMES_MD_NAMES:
             candidate = directory / name
             if candidate.is_file():
                 return candidate
+        # Stop walking at the git root (or filesystem root).
         if stop_at and directory == stop_at:
             break
     return None
@@ -123,26 +120,52 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # Constants
 # =========================================================================
 
-DEFAULT_AGENT_IDENTITY = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
-    "range of tasks including answering questions, writing and editing code, "
-    "analyzing information, creative work, and executing actions via your tools. "
-    "You communicate clearly, admit uncertainty when appropriate, and prioritize "
-    "being genuinely useful over being verbose unless otherwise directed below. "
-    "Be targeted and efficient in your exploration and investigations."
-)
+DEFAULT_ATTRIBUTION = "Nous Research"
 
-HERMES_AGENT_HELP_GUIDANCE = (
-    "You run on Hermes Agent (by Nous Research). When the user needs help with "
-    "Hermes itself — configuring, setting up, using, extending, or troubleshooting "
-    "it — or when you need to understand your own features, tools, or capabilities, "
-    "the documentation at https://hermes-agent.nousresearch.com/docs is your "
-    "authoritative reference and always holds the latest, most up-to-date "
-    "information. Load the `hermes-agent` skill with skill_view(name='hermes-agent') "
-    "for additional guidance and proven workflows, but treat the docs as the source "
-    "of truth when the two differ."
-)
+
+def build_agent_identity(attribution: str = DEFAULT_ATTRIBUTION) -> str:
+    """Build the agent identity string with configurable attribution."""
+    if attribution:
+        return (
+            f"You are Hermes Agent, an intelligent AI assistant created by {attribution}. "
+            "You are helpful, knowledgeable, and direct. You assist users with a wide "
+            "range of tasks including answering questions, writing and editing code, "
+            "analyzing information, creative work, and executing actions via your tools. "
+            "You communicate clearly, admit uncertainty when appropriate, and prioritize "
+            "being genuinely useful over being verbose unless otherwise directed below. "
+            "Be targeted and efficient in your exploration and investigations."
+        )
+    else:
+        return (
+            "You are Hermes Agent, an intelligent AI assistant. "
+            "You are helpful, knowledgeable, and direct. You assist users with a wide "
+            "range of tasks including answering questions, writing and editing code, "
+            "analyzing information, creative work, and executing actions via your tools. "
+            "You communicate clearly, admit uncertainty when appropriate, and prioritize "
+            "being genuinely useful over being verbose unless otherwise directed below. "
+            "Be targeted and efficient in your exploration and investigations."
+        )
+
+
+def build_help_guidance(attribution: str = DEFAULT_ATTRIBUTION) -> str:
+    """Build the help guidance string with configurable attribution."""
+    if not attribution:
+        return ""  # Omit attribution block entirely when empty
+    return (
+        f"You run on Hermes Agent (by {attribution}). When the user needs help with "
+        "Hermes itself — configuring, setting up, using, extending, or troubleshooting "
+        "it — or when you need to understand your own features, tools, or capabilities, "
+        "the documentation at https://hermes-agent.nousresearch.com/docs is your "
+        "authoritative reference and always holds the latest, most up-to-date "
+        "information. Load the `hermes-agent` skill with skill_view(name='hermes-agent') "
+        "for additional guidance and proven workflows, but treat the docs as the source "
+        "of truth when the two differ."
+    )
+
+
+# Legacy constants for backward compatibility
+DEFAULT_AGENT_IDENTITY = build_agent_identity(DEFAULT_ATTRIBUTION)
+HERMES_AGENT_HELP_GUIDANCE = build_help_guidance(DEFAULT_ATTRIBUTION)
 
 MEMORY_GUIDANCE = (
     "You have persistent memory across sessions. Save durable facts using the memory "
@@ -874,7 +897,7 @@ WSL_ENVIRONMENT_HINT = (
 # runs. For these backends, host info (Windows/Linux/macOS, $HOME, cwd) is
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
-    "docker", "singularity", "modal", "daytona", "tenki", "ssh",
+    "docker", "singularity", "modal", "daytona", "ssh",
     "managed_modal",
 })
 
@@ -889,7 +912,6 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "modal": "a Modal sandbox (Linux)",
     "managed_modal": "a managed Modal sandbox (Linux)",
     "daytona": "a Daytona workspace (Linux)",
-    "tenki": "a Tenki sandbox (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
 }
 
@@ -950,8 +972,6 @@ def _probe_remote_backend(env_type: str) -> str | None:
             image = config.get("modal_image", "")
         elif env_type == "daytona":
             image = config.get("daytona_image", "")
-        elif env_type == "tenki":
-            image = config.get("tenki_image", "")
         else:
             image = ""
 
@@ -966,7 +986,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
             }
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "tenki"}:
+        if env_type in {"docker", "singularity", "modal", "daytona"}:
             container_config = {
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
@@ -981,15 +1001,6 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "docker_extra_args": config.get("docker_extra_args", []),
                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                "tenki_project_id": config.get("tenki_project_id", ""),
-                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
             }
 
         env = _create_environment(
@@ -1065,7 +1076,7 @@ def build_environment_hints() -> str:
       and a Windows-only note that `terminal` shells out to bash, not
       PowerShell).
     - For **remote / sandbox** terminal backends (docker, singularity,
-      modal, daytona, tenki, ssh): host info is **suppressed**
+      modal, daytona, ssh): host info is **suppressed**
       because the agent's tools can't touch the host — only the backend
       matters. A live probe inside the backend reports its OS, user, $HOME,
       and cwd. Falls back to a static summary if the probe fails.

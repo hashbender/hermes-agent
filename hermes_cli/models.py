@@ -2662,11 +2662,13 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
     entry is removed. Used by ``/model --refresh`` and
     ``hermes model --refresh``.
     """
+    global _openrouter_catalog_cache
     try:
         if provider is None:
             path = _provider_models_cache_path()
             if path.exists():
                 path.unlink()
+            _openrouter_catalog_cache = None
             return
         cache = _load_provider_models_cache()
         normalized = normalize_provider(provider) or provider or ""
@@ -2902,19 +2904,13 @@ def _is_github_models_base_url(base_url: Optional[str]) -> bool:
 
 
 def _lmstudio_server_root(base_url: Optional[str]) -> Optional[str]:
-    """Return the LM Studio server root for native ``/api/v1`` endpoints.
+    """Strip ``/v1`` suffix from an LM Studio base URL to get the native API root.
 
-    Users commonly copy either the OpenAI-compatible runtime URL
-    (``.../v1``) or the native API prefix (``.../api`` / ``.../api/v1``).
-    Native probes append ``/api/v1/...`` themselves, so normalize all accepted
-    forms back to the bare server root to avoid ``/api/api/v1`` requests.
     Returns ``None`` when the base URL is empty/invalid.
     """
     root = (base_url or "").strip().rstrip("/")
-    for suffix in ("/api/v1", "/api", "/v1"):
-        if root.endswith(suffix):
-            root = root[: -len(suffix)].rstrip("/")
-            break
+    if root.endswith("/v1"):
+        root = root[:-3].rstrip("/")
     return root or None
 
 
