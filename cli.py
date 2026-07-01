@@ -8385,7 +8385,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif canonical == "copy":
             self._handle_copy_command(cmd_original)
         elif canonical == "debug":
-            self._handle_debug_command()
+            self._handle_debug_command(cmd_original)
         elif canonical == "update":
             if self._handle_update_command():
                 return False
@@ -11641,6 +11641,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except Exception:
                 pass
 
+    def _fire_kanban_worker_started_hook_once(self) -> None:
+        task_id = os.environ.get("HERMES_KANBAN_TASK")
+        if not task_id or getattr(self, "_kanban_worker_started_hook_fired", False):
+            return
+        self._kanban_worker_started_hook_fired = True
+        run_id = None
+        raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+        if raw_run_id:
+            try:
+                run_id = int(raw_run_id)
+            except ValueError:
+                run_id = None
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            _kb._fire_kanban_lifecycle_hook(
+                "kanban_worker_started",
+                task_id,
+                board=os.environ.get("HERMES_KANBAN_BOARD"),
+                assignee=os.environ.get("HERMES_PROFILE"),
+                run_id=run_id,
+                workspace=os.environ.get("HERMES_KANBAN_WORKSPACE"),
+            )
+        except Exception:
+            pass
+
     def chat(self, message, images: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -11687,6 +11713,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             request_overrides=turn_route.get("request_overrides"),
         ):
             return None
+
+        self._fire_kanban_worker_started_hook_once()
         
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
