@@ -93,13 +93,6 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
 
     - Direct api.openai.com endpoints need the Responses API for GPT-5.x
       tool calls with reasoning (chat/completions returns 400).
-    - Direct api.anthropic.com endpoints must use the native Messages
-      API (``/v1/messages``).  Anthropic also exposes an OpenAI-compat
-      ``/chat/completions`` shim on the same host, but Pro/Max OAuth
-      subscriptions are only billed against the native Messages route;
-      hitting the shim accounts against a separate "extra usage" pool
-      that is empty by default and surfaces as HTTP 400 "You're out of
-      extra usage."  See issue #32243.
     - Third-party Anthropic-compatible gateways (MiniMax, Zhipu GLM,
       LiteLLM proxies, etc.) conventionally expose the native Anthropic
       protocol under a ``/anthropic`` suffix — treat those as
@@ -115,12 +108,6 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
         return "codex_responses"
     if hostname == "api.openai.com":
         return "codex_responses"
-    # Direct native Anthropic host: realign with providers.determine_api_mode,
-    # which already maps this host to anthropic_messages. The exact-hostname
-    # match rejects lookalike subdomains (api.anthropic.com.attacker.test) and
-    # path-segment spoofing (proxy.test/api.anthropic.com/v1). (#32243)
-    if hostname == "api.anthropic.com":
-        return "anthropic_messages"
     path = urlparse(normalized).path.rstrip("/")
     if path.endswith("/anthropic") or path.endswith("/anthropic/v1"):
         return "anthropic_messages"
@@ -504,6 +491,13 @@ def _resolve_runtime_from_pool_entry(
     # https://opencode.ai/zen/go/v1/messages instead of .../v1/v1/messages).
     if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
         base_url = re.sub(r"/v1/?$", "", base_url)
+    elif api_mode == "chat_completions" and provider in {"opencode-zen", "opencode-go"}:
+        # Ensure /v1 suffix for OpenAI-compatible models (GLM, Kimi, etc.)
+        # Fixes: config may be missing /v1 if user manually edited or previous
+        # bug saved without it. The OpenAI SDK does NOT auto-append /v1, so we
+        # must ensure it's present.
+        if base_url and not re.search(r"/v1/?$", base_url):
+            base_url = base_url.rstrip("/") + "/v1"
 
     # Optional opt-in: route OpenAI/Codex turns through `codex app-server`.
     # Inert when `model.openai_runtime` is unset or "auto".
