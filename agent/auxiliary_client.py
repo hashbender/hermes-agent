@@ -124,15 +124,6 @@ def _openai_http_client_kwargs(
 
 def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
-    # Hermes owns auxiliary retry + provider/model fallback policy (the
-    # same-provider transient retry in call_llm plus the except-chain
-    # fallback). The OpenAI SDK's own default (max_retries=2 → up to 3
-    # attempts) silently multiplies the effective wall time of every aux call
-    # by 3× on a slow/hung endpoint, so a 120s timeout can stall ~360s before
-    # Hermes sees a single failure (issue #54465). Disable SDK-internal retries
-    # by default and let Hermes control the budget; explicit callers can still
-    # override via kwargs.
-    kwargs.setdefault("max_retries", 0)
     return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
 
 
@@ -434,8 +425,8 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     when nothing is configured. No allocation when there are no overrides.
     """
     try:
-        from hermes_cli.config import cfg_get, load_config
-        user_headers = cfg_get(load_config(), "model", "default_headers")
+        from hermes_cli.config import cfg_get, load_config_readonly
+        user_headers = cfg_get(load_config_readonly(), "model", "default_headers")
     except Exception:
         return headers
     if not isinstance(user_headers, dict) or not user_headers:
@@ -461,15 +452,15 @@ def build_or_headers(or_config: dict | None = None) -> dict:
             Overrides ``openrouter.response_cache_ttl`` in config.yaml.
 
     *or_config* is the ``openrouter`` section from config.yaml.  When *None*,
-    falls back to reading config from disk via ``load_config()``.
+    falls back to reading config from disk via ``load_config_readonly()``.
     """
     headers = dict(_OR_HEADERS_BASE)
 
     # Resolve config from disk if not provided.
     if or_config is None:
         try:
-            from hermes_cli.config import load_config
-            or_config = load_config().get("openrouter", {})
+            from hermes_cli.config import load_config_readonly
+            or_config = load_config_readonly().get("openrouter", {})
         except Exception:
             or_config = {}
 
@@ -1624,7 +1615,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             extra = {}
             if base_url_host_matches(base_url, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
-            elif base_url_host_matches(base_url, "githubcopilot.com"):
+            elif base_url_host_matches(base_url, "api.githubcopilot.com"):
                 from hermes_cli.models import copilot_default_headers
 
                 extra["default_headers"] = copilot_default_headers()
@@ -1664,7 +1655,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         extra = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
             extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
-        elif base_url_host_matches(base_url, "githubcopilot.com"):
+        elif base_url_host_matches(base_url, "api.githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers
 
             extra["default_headers"] = copilot_default_headers()
@@ -1868,8 +1859,8 @@ def _read_main_model() -> str:
     if isinstance(override, str) and override.strip():
         return override.strip()
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, str) and model_cfg.strip():
             return model_cfg.strip()
@@ -1895,8 +1886,8 @@ def _read_main_provider() -> str:
     if isinstance(override, str) and override.strip():
         return override.strip().lower()
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, dict):
             provider = model_cfg.get("provider", "")
@@ -2207,12 +2198,12 @@ def _try_azure_foundry(
     try:
         from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
         from hermes_cli.auth import AuthError
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
     except ImportError:
         return None, None
 
     try:
-        cfg = load_config()
+        cfg = load_config_readonly()
         model_cfg = cfg.get("model") if isinstance(cfg, dict) else {}
         if not isinstance(model_cfg, dict):
             model_cfg = {}
@@ -2318,8 +2309,8 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
     # see issue #52608.
     base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
         model_cfg = cfg.get("model")
         if isinstance(model_cfg, dict):
             cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -2597,27 +2588,6 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         )):
             return True
     return False
-
-
-def _is_timeout_error(exc: Exception) -> bool:
-    """Detect a request timeout — the full-budget stall, distinct from a fast
-    connection drop.
-
-    A timeout burns the entire configured ``timeout`` before surfacing, so a
-    same-provider retry on the critical compression path doubles the
-    user-visible wall time (issue #54465). A streaming-close / dropped
-    connection, by contrast, fails fast and is cheap to retry — those stay on
-    the retry path even for compression.
-    """
-    try:
-        from openai import APITimeoutError
-        if isinstance(exc, APITimeoutError):
-            return True
-    except ImportError:
-        pass
-    if "Timeout" in type(exc).__name__:
-        return True
-    return "timed out" in str(exc).lower()
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -2954,7 +2924,7 @@ def _recoverable_pool_provider(
         return "nous"
     if base_url_host_matches(base, "api.anthropic.com"):
         return "anthropic"
-    if base_url_host_matches(base, "githubcopilot.com"):
+    if base_url_host_matches(base, "api.githubcopilot.com"):
         return "copilot"
     if base_url_host_matches(base, "api.kimi.com"):
         return "kimi-coding"
@@ -3519,10 +3489,10 @@ def _try_main_fallback_chain(
     participate in the same order as the main agent.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
         from hermes_cli.fallback_config import get_fallback_chain
 
-        chain = get_fallback_chain(load_config())
+        chain = get_fallback_chain(load_config_readonly())
     except Exception as exc:
         logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", exc)
         return None, None, ""
@@ -3684,10 +3654,10 @@ def _resolve_auto(
     # with that real provider+model. Mirrors the MoA context-length resolution.
     if main_provider == "moa":
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config import load_config_readonly
             from hermes_cli.moa_config import resolve_moa_preset
 
-            _preset = resolve_moa_preset(load_config().get("moa") or {}, main_model)
+            _preset = resolve_moa_preset(load_config_readonly().get("moa") or {}, main_model)
             _agg = _preset.get("aggregator") or {}
             _agg_provider = str(_agg.get("provider") or "").strip()
             _agg_model = str(_agg.get("model") or "").strip()
@@ -3823,7 +3793,7 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     sync_base_url = str(sync_client.base_url)
     if base_url_host_matches(sync_base_url, "openrouter.ai"):
         async_kwargs["default_headers"] = build_or_headers()
-    elif base_url_host_matches(sync_base_url, "githubcopilot.com"):
+    elif base_url_host_matches(sync_base_url, "api.githubcopilot.com"):
         from hermes_cli.copilot_auth import copilot_request_headers
 
         async_kwargs["default_headers"] = copilot_request_headers(
@@ -3854,9 +3824,6 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         **_openai_http_client_kwargs(sync_base_url, async_mode=True),
         **async_kwargs,
     }
-    # See _create_openai_client: disable SDK-internal retries so Hermes owns
-    # the auxiliary retry/timeout budget (issue #54465).
-    async_kwargs.setdefault("max_retries", 0)
     return AsyncOpenAI(**async_kwargs), model
 
 
@@ -4128,7 +4095,7 @@ def resolve_provider_client(
                 extra["default_query"] = _dq
             if base_url_host_matches(custom_base, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
-            elif base_url_host_matches(custom_base, "githubcopilot.com"):
+            elif base_url_host_matches(custom_base, "api.githubcopilot.com"):
                 from hermes_cli.copilot_auth import copilot_request_headers
                 extra["default_headers"] = copilot_request_headers(
                     is_agent_turn=True, is_vision=is_vision
@@ -4381,7 +4348,7 @@ def resolve_provider_client(
         headers = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
             headers["User-Agent"] = "claude-code/0.1.0"
-        elif base_url_host_matches(base_url, "githubcopilot.com"):
+        elif base_url_host_matches(base_url, "api.githubcopilot.com"):
             from hermes_cli.copilot_auth import copilot_request_headers
 
             headers.update(copilot_request_headers(
@@ -4593,11 +4560,11 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
     """
     try:
         from agent.image_routing import _lookup_supports_vision
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
     except ImportError:
         return True
     try:
-        supports = _lookup_supports_vision(provider, model, load_config())
+        supports = _lookup_supports_vision(provider, model, load_config_readonly())
     except Exception:  # pragma: no cover - defensive
         return True
     if supports is None:
@@ -4854,14 +4821,9 @@ def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> di
     or_key = os.getenv("OPENROUTER_API_KEY")
     # Use max_completion_tokens for direct OpenAI-compatible providers that reject
     # max_tokens on newer GPT-4o/o-series/GPT-5-style models.
-    _custom_host = base_url_hostname(custom_base) or ""
     if (not or_key
             and _read_nous_auth() is None
-            and (
-                _custom_host == "api.openai.com"
-                or _custom_host == "api.githubcopilot.com"
-                or _custom_host.endswith(".githubcopilot.com")
-            )):
+            and base_url_hostname(custom_base) in {"api.openai.com", "api.githubcopilot.com"}):
         return {"max_completion_tokens": value}
     # ...and for any caller serving a newer OpenAI-family model by name.
     if model_forces_max_completion_tokens(model):
@@ -5238,10 +5200,9 @@ def _resolve_task_provider_model(
       3. "auto" (full auto-detection chain)
 
     Returns (provider, model, base_url, api_key, api_mode) where model may
-    be None (use provider default). A bare base_url is treated as custom, but
-    a first-class provider plus base_url keeps the provider identity so its
-    auth, transport, and request-shaping behavior still apply. api_mode is one
-    of "chat_completions", "codex_responses", or None (auto-detect).
+    be None (use provider default). When base_url is set, provider is forced
+    to "custom" and the task uses that direct endpoint. api_mode is one of
+    "chat_completions", "codex_responses", or None (auto-detect).
     """
     cfg_provider = None
     cfg_model = None
@@ -5274,35 +5235,11 @@ def _resolve_task_provider_model(
             return prov, existing_base
         return "custom", existing_base or target_base
 
-    def _preserve_provider_with_base_url(prov: Optional[str]) -> bool:
-        normalized = str(prov or "").strip().lower()
-        if normalized in {"", "auto", "custom"} or normalized.startswith("custom:"):
-            return False
-        try:
-            from hermes_cli.providers import get_provider
-
-            return get_provider(normalized) is not None
-        except Exception:
-            # Keep the high-risk provider-backed routes safe even if provider
-            # catalog loading is unavailable during early import/test paths.
-            return normalized in {
-                "anthropic",
-                "copilot",
-                "copilot-acp",
-                "minimax-oauth",
-                "nous",
-                "openai-codex",
-                "qwen-oauth",
-                "xai-oauth",
-            }
-
     if provider:
         provider, base_url = _expand_direct_api_alias(provider, base_url)
     if cfg_provider:
         cfg_provider, cfg_base_url = _expand_direct_api_alias(cfg_provider, cfg_base_url)
 
-    if base_url and _preserve_provider_with_base_url(provider):
-        return provider, resolved_model, base_url, api_key, resolved_api_mode
     if base_url:
         return "custom", resolved_model, base_url, api_key, resolved_api_mode
     if provider:
@@ -5344,8 +5281,8 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     if not task:
         return {}
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
     except ImportError:
         return {}
     aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
@@ -5710,9 +5647,6 @@ def call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
-    api_mode: str = None,
-    stream: bool = False,
-    stream_options: dict = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -5725,32 +5659,21 @@ def call_llm(
               Reads provider:model from config/env. Ignored if provider is set.
         provider: Explicit provider override.
         model: Explicit model override.
-        api_mode: Explicit API mode override (e.g. "codex_responses",
-              "anthropic_messages"). Takes precedence over task config.
         messages: Chat messages list.
         temperature: Sampling temperature (None = provider default).
         max_tokens: Max output tokens (handles max_tokens vs max_completion_tokens).
         tools: Tool definitions (for function calling).
         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
         extra_body: Additional request body fields.
-        stream: When True, return the raw SDK streaming iterator instead of a
-            validated complete response. The caller is responsible for consuming
-            chunks (and for any fallback). Used by the MoA aggregator so its
-            output can stream to the user.
-        stream_options: Passed through to the request when stream is True
-            (e.g. {"include_usage": True}).
 
     Returns:
-        Response object with .choices[0].message.content, OR — when stream=True —
-        the raw streaming iterator from client.chat.completions.create().
+        Response object with .choices[0].message.content
 
     Raises:
         RuntimeError: If no provider is configured.
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
-    if api_mode:
-        resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -5844,20 +5767,6 @@ def call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
-    # Streaming path: return the raw SDK Stream iterator directly. This is used by
-    # the MoA aggregator so its tokens stream to the user. It deliberately skips
-    # _validate_llm_response and the temperature/max_tokens/payment fallback chain
-    # below — those all assume a complete response object, whereas a stream is
-    # consumed chunk-by-chunk by the caller. The caller (the agent's streaming
-    # consumer) owns chunk reassembly, stale-stream detection, and falling back to
-    # a non-streaming call on error. stream_options is best-effort: providers that
-    # reject it surface an error the caller's fallback already handles.
-    if stream:
-        kwargs["stream"] = True
-        if stream_options:
-            kwargs["stream_options"] = stream_options
-        return client.chat.completions.create(**kwargs)
-
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
     try:
@@ -5875,21 +5784,6 @@ def call_llm(
                 client.chat.completions.create(**kwargs), task)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
-                raise
-            # Compression is on the critical preflight path: a user cannot
-            # continue or resume an oversized session until it compacts. A
-            # same-provider retry on a timeout means another full ``timeout``-
-            # long wall-clock block before the except-chain below can fall
-            # back — doubling the user-visible stall (issue #54465). Skip the
-            # same-provider retry for compression on a full-budget timeout and
-            # fall straight through to provider/model fallback; fast blips (a
-            # streaming-close or a 5xx) still retry, since those are cheap.
-            if task == "compression" and _is_timeout_error(transient_err):
-                logger.info(
-                    "Auxiliary compression: timeout on the critical path; "
-                    "skipping same-provider retry and falling back: %s",
-                    transient_err,
-                )
                 raise
             logger.info(
                 "Auxiliary %s: transient transport error; retrying once on "
@@ -6415,16 +6309,6 @@ async def async_call_llm(
                 await client.chat.completions.create(**kwargs), task)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
-                raise
-            # See call_llm(): compression is on the critical preflight path,
-            # so skip the same-provider retry on a full-budget timeout and
-            # fall straight through to fallback (issue #54465).
-            if task == "compression" and _is_timeout_error(transient_err):
-                logger.info(
-                    "Auxiliary compression (async): timeout on the critical "
-                    "path; skipping same-provider retry and falling back: %s",
-                    transient_err,
-                )
                 raise
             logger.info(
                 "Auxiliary %s (async): transient transport error; retrying "

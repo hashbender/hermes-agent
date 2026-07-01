@@ -518,7 +518,7 @@ def init_agent(
     # sessions with >5-minute pauses between turns (#14971).
     agent._cache_ttl = "5m"
     try:
-        from hermes_cli.config import load_config as _load_pc_cfg
+        from hermes_cli.config import load_config_readonly as _load_pc_cfg
 
         _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
         _ttl = _pc_cfg.get("cache_ttl", "5m")
@@ -776,7 +776,7 @@ def init_agent(
         # Guardrail config — read from config.yaml at init time.
         agent._bedrock_guardrail_config = None
         try:
-            from hermes_cli.config import load_config as _load_br_cfg
+            from hermes_cli.config import load_config_readonly as _load_br_cfg
             _gr = _load_br_cfg().get("bedrock", {}).get("guardrail", {})
             if _gr.get("guardrail_identifier") and _gr.get("guardrail_version"):
                 agent._bedrock_guardrail_config = {
@@ -828,7 +828,7 @@ def init_agent(
                 client_kwargs["default_headers"] = build_nvidia_nim_headers(effective_base)
             elif base_url_host_matches(effective_base, "api.routermint.com"):
                 client_kwargs["default_headers"] = _ra()._routermint_headers()
-            elif base_url_host_matches(effective_base, "githubcopilot.com"):
+            elif base_url_host_matches(effective_base, "api.githubcopilot.com"):
                 from hermes_cli.models import copilot_default_headers
 
                 client_kwargs["default_headers"] = copilot_default_headers()
@@ -1124,7 +1124,7 @@ def init_agent(
     # reads the JSON files directly.  See run_agent._save_session_log.
     agent._session_json_enabled = False
     try:
-        from hermes_cli.config import load_config as _load_sess_cfg
+        from hermes_cli.config import load_config_readonly as _load_sess_cfg
         _sess_cfg = (_load_sess_cfg().get("sessions") or {})
         agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
     except Exception:
@@ -1179,7 +1179,7 @@ def init_agent(
     
     # Load config once for memory, skills, and compression sections
     try:
-        from hermes_cli.config import load_config as _load_agent_config
+        from hermes_cli.config import load_config_readonly as _load_agent_config
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
@@ -1665,12 +1665,6 @@ def init_agent(
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
         )
-    _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
-    if callable(_bind_session_state):
-        try:
-            _bind_session_state(session_db=session_db, session_id=agent.session_id)
-        except Exception:
-            pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
 
