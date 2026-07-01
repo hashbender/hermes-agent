@@ -321,6 +321,12 @@ def _is_petdex_host(url: str) -> bool:
     return host == "petdex.dev" or host.endswith(".petdex.dev")
 
 
+def _ensure_petdex_response_host(resp, original_url: str) -> None:
+    final_url = str(getattr(resp, "url", "") or original_url)
+    if not _is_petdex_host(final_url):
+        raise PetStoreError(f"refusing non-petdex redirect for {original_url}")
+
+
 def thumbnail_png(slug: str, *, source_url: str = "", timeout: float = 30.0) -> bytes | None:
     """Return a small idle-frame PNG for *slug*, cached on disk.
 
@@ -363,6 +369,7 @@ def thumbnail_png(slug: str, *, source_url: str = "", timeout: float = 30.0) -> 
                 follow_redirects=True,
                 headers={"User-Agent": "hermes-agent-petdex"},
             )
+            _ensure_petdex_response_host(resp, source_url)
             resp.raise_for_status()
             sheet_bytes = resp.content
         except Exception as exc:  # noqa: BLE001 - cosmetic, degrade to placeholder
@@ -479,6 +486,7 @@ def _download(url: str, dest: Path, *, timeout: float) -> None:
             follow_redirects=True,
             headers={"User-Agent": "hermes-agent-petdex"},
         ) as resp:
+            _ensure_petdex_response_host(resp, url)
             resp.raise_for_status()
             tmp = dest.with_suffix(dest.suffix + ".part")
             with tmp.open("wb") as fh:
@@ -498,6 +506,7 @@ def _download_json(url: str, *, timeout: float) -> dict:
         follow_redirects=True,
         headers={"User-Agent": "hermes-agent-petdex"},
     )
+    _ensure_petdex_response_host(resp, url)
     resp.raise_for_status()
     data = resp.json()
     return data if isinstance(data, dict) else {}
