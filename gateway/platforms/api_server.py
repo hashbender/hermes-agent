@@ -4027,6 +4027,47 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 self._active_run_agents[run_id] = agent
 
+                def _card_notify(card_type: str, data: Any) -> None:
+                    """Push a card event to the run's SSE queue (mirrors _approval_notify)."""
+                    try:
+                        loop.call_soon_threadsafe(q.put_nowait, {
+                            "event": "card",
+                            "card": card_type,
+                            "data": data,
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                        })
+                    except Exception:
+                        pass
+
+                agent.push_card = _card_notify
+
+                def _clarify_callback_sync(question, choices):
+                    """无状态 clarify（生产式）：推 clarify.request 后中断当前 run，释放 agent 线程。
+                    用户答复走多轮对话（前端发新 run + conversation_history），不阻塞、不 POST 回填。
+
+                    机制：设 agent._interrupt_requested → conversation_loop 下次迭代检测后
+                    break tool loop（conversation_loop.py:617）→ run 结束 → run_in_executor
+                    线程释放。每次新 run 重建 agent（agent_init 重置 _interrupt_requested）。
+                    """
+                    import uuid as _uuid
+                    _clarify_id = _uuid.uuid4().hex[:10]
+                    try:
+                        loop.call_soon_threadsafe(q.put_nowait, {
+                            "event": "clarify.request",
+                            "clarify_id": _clarify_id,
+                            "run_id": run_id,
+                            "question": question,
+                            "choices": list(choices) if choices else None,
+                            "timestamp": time.time(),
+                        })
+                    except Exception:
+                        pass
+                    # 非阻塞：中断当前 run（释放线程）。用户答复由前端以新一轮对话送回。
+                    agent._interrupt_requested = True
+                    return "[awaiting user clarification]"
+                agent.clarify_callback = _clarify_callback_sync
+
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
                     # Redact credentials from the command before it enters the
@@ -4244,6 +4285,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
+                # CORS：cors_middleware 无法对 StreamResponse 注入 header（prepare 后已发送），
+                # 手动补，否则浏览器跨域订阅 events stream 被 CORS 拦截
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+                "Access-Control-Max-Age": "600",
             },
         )
         await response.prepare(request)
