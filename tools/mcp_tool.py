@@ -1867,7 +1867,15 @@ class MCPServerTask:
                 write_stream,
             ):
                 # Capture the newly spawned subprocess PID for force-kill cleanup.
-                new_pids = _snapshot_child_pids() - pids_before
+                # Filter out non-MCP children that race into the snapshot window:
+                # slash_worker and LSP servers (jdtls/pyright/yaml-ls) are spawned
+                # directly by the gateway without start_new_session, so their pgid
+                # equals the TUI parent PID. If they leak into _stdio_pgids, the
+                # shutdown sweep's killpg() kills the TUI parent itself.
+                # See agent/lsp/client.py for the complementary start_new_session fix.
+                new_pids = _filter_mcp_children(
+                    _snapshot_child_pids() - pids_before
+                )
                 if new_pids:
                     # Capture pgid while the child is alive — once it exits we
                     # can no longer call ``os.getpgid`` on it, and the cleanup
@@ -3005,6 +3013,56 @@ def _snapshot_child_pids() -> set:
     return set()
 
 
+# Non-MCP gateway children that can race into the _snapshot_child_pids() delta
+# during stdio MCP server spawn. LSP servers and slash_worker now use
+# start_new_session=True too; this remains defense-in-depth for any future
+# non-MCP child spawn that briefly appears in the MCP snapshot delta. Match
+# argv markers instead of argv[0] because Python/Java children begin with the
+# interpreter or binary path.
+_NON_MCP_CHILD_CMDLINE_MARKERS: tuple[str, ...] = (
+    "tui_gateway.slash_worker",
+    "tui_gateway.entry",
+    "-dorg.eclipse.equinox.launcher",  # jdtls (legacy arg style)
+    "eclipse.jdt.ls",
+    "org.eclipse.equinox.launcher_",
+)
+
+
+def _filter_mcp_children(pids: set) -> set:
+    """Remove non-MCP children from a PID snapshot delta.
+
+    _snapshot_child_pids() returns *all* direct children of the gateway. When
+    a stdio MCP server spawns concurrently with a slash_worker or LSP server
+    spawn, the delta ``_snapshot_child_pids() - pids_before`` can include
+    PIDs that are NOT the MCP server. Tracking those PIDs in _stdio_pgids is
+    catastrophic if a future child lacks start_new_session: its pgid can be the
+    TUI parent's PID, so the shutdown sweep's killpg() kills the TUI itself.
+    """
+    if not pids:
+        return pids
+    try:
+        import psutil
+    except ImportError:
+        # psutil unavailable — keep all PIDs (preserves prior behavior).
+        return pids
+    filtered: set = set()
+    for pid in pids:
+        try:
+            argv = psutil.Process(pid).cmdline()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            # Process raced away or is a zombie — skip it; it cannot be the
+            # MCP server we just spawned and is not safe to track.
+            continue
+        if any(
+            marker in arg
+            for arg in argv[1:]
+            for marker in _NON_MCP_CHILD_CMDLINE_MARKERS
+        ):
+            continue
+        filtered.add(pid)
+    return filtered
+
+
 def _mcp_loop_exception_handler(loop, context):
     """Suppress benign 'Event loop is closed' noise during shutdown.
 
@@ -3331,7 +3389,21 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    # The native schema may rename its inner `arguments` field to
+                    # `tool_arguments` to avoid colliding with the outer tool call
+                    # envelope. Accept either name and fall back to the raw args
+                    # for direct/internal callers.  Preserve every sibling
+                    # parameter (e.g. tool_name / toolset_name for VibeUE's
+                    # call_tool wrapper) so the rename is not lossy.
+                    if isinstance(args, dict):
+                        tool_args = dict(args)
+                        if "tool_arguments" in tool_args:
+                            tool_args["arguments"] = tool_args.pop("tool_arguments")
+                        if "arguments" in tool_args and "tool_arguments" not in tool_args:
+                            pass  # already native shape
+                        result = await server.session.call_tool(tool_name, arguments=tool_args)
+                    else:
+                        result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
             # MCP CallToolResult has .content (list of content blocks) and .isError
@@ -3630,7 +3702,17 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
         name = args.get("name")
         if not name:
             return tool_error("Missing required parameter 'name'")
-        arguments = args.get("arguments", {})
+        # Name and arguments are the canonical MCP prompt parameters. Some
+        # prompt schemas expose the arguments under a top-level `arguments`
+        # property; Hermes' tool dispatch layer uses `arguments` for the whole
+        # tool-call envelope, so that parameter is renamed to `prompt_arguments`
+        # in the schema. Accept both names for backward compatibility.
+        if isinstance(args, dict) and "prompt_arguments" in args:
+            arguments = args["prompt_arguments"]
+        elif isinstance(args, dict) and "arguments" in args:
+            arguments = args["arguments"]
+        else:
+            arguments = {}
 
         async def _call():
             async with server._rpc_lock:
@@ -3731,11 +3813,43 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
         return {"type": "object", "properties": {}}
 
     def _rewrite_local_refs(node):
+        """Walk the schema, promoting legacy ``definitions`` to ``$defs``.
+
+        The promotion is contextual: ``definitions`` is renamed only when it
+        appears as a JSON Schema *meta-keyword* (sibling of ``properties`` /
+        ``$ref`` at a schema node), never when it appears as the *name of a
+        property* (i.e., as a key inside a ``properties`` dict).
+
+        Without this gate, MCP servers that legitimately expose a tool
+        parameter named ``definitions`` (e.g. a CI/pipelines tool that uses
+        ``definitions`` for an array of pipeline-definition IDs) would have
+        that user-facing property name silently rewritten to ``$defs``.
+        Anthropic and OpenAI both reject ``$`` in property names
+        (``^[a-zA-Z0-9_.-]{1,64}$``), so the whole tool array gets a 400 and
+        every conversation breaks.
+
+        The gate works by treating ``properties`` and ``patternProperties``
+        specially during descent: we iterate the property-name -> schema map
+        directly, leaving the property names verbatim, then recurse into each
+        property's schema where ordinary JSON Schema semantics resume (so any
+        legitimately-nested ``definitions`` meta-keyword inside a property's
+        schema is still promoted).
+        """
         if isinstance(node, dict):
             normalized = {}
             for key, value in node.items():
-                out_key = "$defs" if key == "definitions" else key
-                normalized[out_key] = _rewrite_local_refs(value)
+                if key in ("properties", "patternProperties") and isinstance(value, dict):
+                    # Keys of this dict are user-facing property names, not
+                    # meta-keywords. Preserve them verbatim; recurse only into
+                    # each property's schema, where ``definitions`` again has
+                    # its JSON Schema meaning.
+                    normalized[key] = {
+                        prop_name: _rewrite_local_refs(prop_schema)
+                        for prop_name, prop_schema in value.items()
+                    }
+                else:
+                    out_key = "$defs" if key == "definitions" else key
+                    normalized[out_key] = _rewrite_local_refs(value)
             ref = normalized.get("$ref")
             if isinstance(ref, str) and ref.startswith("#/definitions/"):
                 normalized["$ref"] = "#/$defs/" + ref[len("#/definitions/"):]
@@ -3833,10 +3947,43 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     safe_tool_name = sanitize_mcp_name_component(mcp_tool.name)
     safe_server_name = sanitize_mcp_name_component(server_name)
     prefixed_name = f"mcp_{safe_server_name}_{safe_tool_name}"
+    normalized = _normalize_mcp_input_schema(getattr(mcp_tool, "inputSchema", None))
+
+    # NOTE: Targeted wrapper for MCP tools whose native schema uses a top-level
+    # `arguments` parameter. Hermes' tool dispatch path uses `arguments` as
+    # the JSON-encoded string for the whole tool call, so a tool parameter
+    # literally named `arguments` collides with that envelope and can be
+    # dropped or mis-routed. For affected schemas we rename the user-facing
+    # parameter to `tool_arguments`; the handler maps it back before calling
+    # the server.
+    #
+    # Only apply the wrapper when the normalized schema has a top-level
+    # property named `arguments`; otherwise keep the original schema so the
+    # model sees the real parameters and descriptions.
+    properties = normalized.get("properties", {})
+    if "arguments" in properties:
+        wrapped_props = {**properties}
+        wrapped_props["tool_arguments"] = wrapped_props.pop("arguments")
+        required = list(normalized.get("required", []))
+        if "arguments" in required:
+            required = ["tool_arguments" if p == "arguments" else p for p in required]
+        wrapped = {
+            "type": "object",
+            "properties": wrapped_props,
+        }
+        if required:
+            wrapped["required"] = required
+        return {
+            "name": prefixed_name,
+            "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
+            "parameters": wrapped,
+            "_mcp_input_schema": dict(normalized),
+        }
+
     return {
         "name": prefixed_name,
         "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
-        "parameters": _normalize_mcp_input_schema(getattr(mcp_tool, "inputSchema", None)),
+        "parameters": normalized,
     }
 
 
@@ -3898,10 +4045,14 @@ def _build_utility_schemas(server_name: str) -> List[dict]:
                             "type": "string",
                             "description": "Name of the prompt to retrieve",
                         },
-                        "arguments": {
+                        "prompt_arguments": {
                             "type": "object",
-                            "description": "Optional arguments to pass to the prompt",
-                            "properties": {},
+                            "description": (
+                                "Optional arguments to pass to the prompt. "
+                                "Renamed from `arguments` to avoid colliding with the "
+                                "tool-call envelope used by the dispatch layer."
+                            ),
+                            "default": {},
                             "additionalProperties": True,
                         },
                     },
