@@ -7,11 +7,24 @@ Covers:
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import MessageType
+
+
+@pytest.fixture(autouse=True)
+def _whatsapp_open_optin(monkeypatch):
+    """Opt into WhatsApp allow-all so ``dm_policy: open`` dispatch tests run.
+
+    The adapter fails closed on ``open`` without an allow-all opt-in
+    (SECURITY.md 2.6); these formatting/dispatch-mechanics tests set
+    ``_dm_policy = "open"`` as a stand-in for "process this DM".
+    """
+    monkeypatch.setenv("WHATSAPP_ALLOW_ALL_USERS", "true")
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +47,7 @@ def _make_adapter():
     adapter._bridge_process = None
     adapter._reply_prefix = None
     adapter._running = True
-    adapter._message_handler = None
+    adapter._message_handler = MagicMock()
     adapter._fatal_error_code = None
     adapter._fatal_error_message = None
     adapter._fatal_error_retryable = True
@@ -297,6 +310,21 @@ class TestSendChunking:
         assert not result.success
         assert "Not connected" in result.error
 
+    @pytest.mark.asyncio
+    async def test_runtime_codex_advisory_is_suppressed(self):
+        adapter = _make_adapter()
+        adapter._http_session.post = MagicMock()
+
+        result = await adapter.send(
+            "chat1",
+            "ℹ Codex gpt-5.5 caps context at 272K, so auto-compaction was raised "
+            "to 95% (from 80%) to use more of the window before summarizing.\n"
+            "  Opt back out: hermes config set compression.codex_gpt55_autoraise false",
+        )
+
+        assert result.success is True
+        adapter._http_session.post.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # bridge event metadata
@@ -331,6 +359,101 @@ class TestBridgeEventMetadata:
         assert event.raw_message["quotedParticipant"] == "99999999999@s.whatsapp.net"
         assert event.raw_message["quotedRemoteJid"] == "15551234567@s.whatsapp.net"
         assert event.raw_message["hasQuotedMessage"] is True
+
+    @pytest.mark.asyncio
+    async def test_group_lookup_text_builds_normal_event_without_direct_reply_metadata(self):
+        adapter = _make_adapter()
+        data = {
+            "messageId": "msg-contact",
+            "chatId": "120363001234567890@g.us",
+            "senderId": "15551234567@s.whatsapp.net",
+            "senderName": "Test Sender",
+            "chatName": "WhatsApp Test",
+            "isGroup": True,
+            "body": "@Assistant who is the on-call contact?",
+            "hasMedia": False,
+            "mediaUrls": [],
+            "mentionedIds": ["15551230000@s.whatsapp.net"],
+            "botIds": ["15551230000@s.whatsapp.net"],
+        }
+
+        event = await adapter._build_message_event(data)
+
+        assert event is not None
+        assert event.text == "@Assistant who is the on-call contact?"
+        assert event.message_type == MessageType.TEXT
+        assert event.source.chat_type == "group"
+        assert "whatsapp_contact_lookup_reply" not in event.metadata
+        adapter._message_handler.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_group_document_request_builds_normal_event_without_direct_reply_metadata(self):
+        adapter = _make_adapter()
+        data = {
+            "messageId": "msg-drive",
+            "chatId": "120363001234567890@g.us",
+            "senderId": "15551234567@s.whatsapp.net",
+            "senderName": "Test Sender",
+            "chatName": "WhatsApp Test",
+            "isGroup": True,
+            "body": "@Assistant do we have the onboarding manual link?",
+            "hasMedia": False,
+            "mediaUrls": [],
+            "mentionedIds": ["15551230000@s.whatsapp.net"],
+            "botIds": ["15551230000@s.whatsapp.net"],
+        }
+
+        event = await adapter._build_message_event(data)
+
+        assert event is not None
+        assert event.text == "@Assistant do we have the onboarding manual link?"
+        assert "whatsapp_contact_lookup_reply" not in event.metadata
+
+    @pytest.mark.asyncio
+    async def test_dm_remains_normal_agent_event(self):
+        adapter = _make_adapter()
+        data = {
+            "messageId": "msg-dm",
+            "chatId": "15551234567@s.whatsapp.net",
+            "senderId": "15551234567@s.whatsapp.net",
+            "senderName": "Test Sender",
+            "chatName": "Test Sender",
+            "isGroup": False,
+            "body": "Who is the on-call contact?",
+            "hasMedia": False,
+            "mediaUrls": [],
+            "mentionedIds": [],
+            "botIds": ["15551230000@s.whatsapp.net"],
+        }
+
+        event = await adapter._build_message_event(data)
+
+        assert event is not None
+        assert event.text == "Who is the on-call contact?"
+        assert "whatsapp_contact_lookup_reply" not in event.metadata
+
+    @pytest.mark.asyncio
+    async def test_poll_enqueues_lookup_text_as_normal_event(self):
+        adapter = _make_adapter()
+        event = SimpleNamespace(
+            source=SimpleNamespace(chat_id="120363001234567890@g.us"),
+            metadata={},
+            message_id="msg-stdout",
+            message_type=MessageType.TEXT,
+        )
+        response = SimpleNamespace(status=200, json=AsyncMock(return_value=[{"messageId": "raw"}]))
+        adapter._http_session.get.return_value = _AsyncCM(response)
+        adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+        adapter._build_message_event = AsyncMock(return_value=event)
+        adapter.send = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        adapter._enqueue_text_event = MagicMock(side_effect=lambda *_: setattr(adapter, "_running", False))
+
+        await adapter._poll_messages()
+
+        adapter.send.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+        adapter._enqueue_text_event.assert_called_once_with(event)
 
 
 # ---------------------------------------------------------------------------
