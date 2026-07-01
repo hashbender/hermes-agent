@@ -70,8 +70,12 @@ def _simulate_config_bridge(cfg: dict, initial_env: dict | None = None):
     # --- Replicate lines 144-147: MESSAGING_CWD fallback ---
     configured_cwd = env.get("TERMINAL_CWD", "")
     if not configured_cwd or configured_cwd in {".", "auto", "cwd"}:
-        messaging_cwd = env.get("MESSAGING_CWD") or "/root"  # Path.home() for root
-        env["TERMINAL_CWD"] = messaging_cwd
+        backend = (env.get("TERMINAL_ENV") or "local").strip().lower()
+        if backend != "local":
+            env.pop("TERMINAL_CWD", None)
+        else:
+            messaging_cwd = env.get("MESSAGING_CWD") or "/root"  # Path.home() for root
+            env["TERMINAL_CWD"] = messaging_cwd
 
     return env
 
@@ -214,7 +218,23 @@ class TestNestedTerminalCwdPlaceholderSkip:
         result = _simulate_config_bridge(cfg, {"MESSAGING_CWD": "/from/env"})
         assert result["TERMINAL_ENV"] == "docker"
         assert result["TERMINAL_TIMEOUT"] == "300"
-        assert result["TERMINAL_CWD"] == "/from/env"
+        assert result.get("TERMINAL_CWD") is None
+
+    def test_docker_placeholder_does_not_inherit_host_home(self):
+        """terminal.cwd: '.' + docker must not resolve to MESSAGING_CWD/Path.home()."""
+        cfg = {"terminal": {"cwd": ".", "backend": "docker"}}
+        result = _simulate_config_bridge(cfg, {"MESSAGING_CWD": "/home/user"})
+        assert "TERMINAL_CWD" not in result
+
+    def test_ssh_placeholder_does_not_inherit_host_home(self):
+        cfg = {"terminal": {"cwd": "auto", "backend": "ssh"}}
+        result = _simulate_config_bridge(cfg, {"MESSAGING_CWD": "/home/user"})
+        assert "TERMINAL_CWD" not in result
+
+    def test_local_placeholder_still_falls_back_to_messaging_cwd(self):
+        cfg = {"terminal": {"cwd": ".", "backend": "local"}}
+        result = _simulate_config_bridge(cfg, {"MESSAGING_CWD": "/home/user"})
+        assert result["TERMINAL_CWD"] == "/home/user"
 
     def test_terminal_home_mode_bridges_to_env(self):
         cfg = {"terminal": {"home_mode": "profile"}}

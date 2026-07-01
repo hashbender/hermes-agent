@@ -1652,12 +1652,19 @@ os.environ["HERMES_EXEC_ASK"] = "1"
 # Set terminal working directory for messaging platforms.
 # config.yaml terminal.cwd is the canonical source (bridged to TERMINAL_CWD
 # by the config bridge above).  When it's unset or a placeholder, default
-# to home directory.  MESSAGING_CWD is accepted as a backward-compat
-# fallback (deprecated — the warning above tells users to migrate).
+# to home directory for the *local* backend only.  Non-local backends
+# (docker, ssh, modal, …) resolve their own sandbox cwd inside
+# terminal_tool and must not inherit host Path.home() here.
+# MESSAGING_CWD is accepted as a backward-compat fallback (deprecated).
+_CWD_PLACEHOLDERS = {".", "auto", "cwd"}
 _configured_cwd = os.environ.get("TERMINAL_CWD", "")
-if not _configured_cwd or _configured_cwd in {".", "auto", "cwd"}:
-    _fallback = os.getenv("MESSAGING_CWD") or str(Path.home())
-    os.environ["TERMINAL_CWD"] = _fallback
+if not _configured_cwd or _configured_cwd in _CWD_PLACEHOLDERS:
+    _terminal_backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
+    if _terminal_backend != "local":
+        os.environ.pop("TERMINAL_CWD", None)
+    else:
+        _fallback = os.getenv("MESSAGING_CWD") or str(Path.home())
+        os.environ["TERMINAL_CWD"] = _fallback
 
 from gateway.config import (
     Platform,
