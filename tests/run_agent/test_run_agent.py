@@ -55,6 +55,46 @@ def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
 
 
+def test_run_conversation_dict_returns_include_final_response():
+    """Structurally enforce final_response on dict returns from run_conversation().
+
+    This parses source, including nested helpers, so it requires the .py file
+    to be available. It guards key presence and literal None values; runtime
+    tests still cover branch-specific values.
+    """
+    from agent import conversation_loop
+
+    try:
+        source = inspect.getsource(conversation_loop.run_conversation)
+    except OSError as exc:
+        pytest.skip(f"run_conversation source is unavailable: {exc}")
+    tree = ast.parse(source)
+    missing = []
+    literal_none = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Dict):
+            continue
+        keys = [
+            key.value if isinstance(key, ast.Constant) else None
+            for key in node.value.keys
+        ]
+        if "final_response" not in keys:
+            missing.append(node.lineno)
+            continue
+        value = node.value.values[keys.index("final_response")]
+        if isinstance(value, ast.Constant) and value.value is None:
+            literal_none.append(node.lineno)
+
+    assert missing == [], (
+        "run_conversation() dict returns must preserve the final_response "
+        f"contract; missing at source-local lines {missing}"
+    )
+    assert literal_none == [], (
+        "run_conversation() dict returns must expose actionable final_response "
+        f"text instead of literal None; literal None at source-local lines {literal_none}"
+    )
+
+
 @pytest.fixture()
 def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
@@ -5037,8 +5077,8 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
 
         # Without think tags, the agent should attempt continuation retries
-        # (up to 3), not immediately fire thinking-exhaustion.
-        assert result["api_calls"] == 3
+        # (up to 4), not immediately fire thinking-exhaustion.
+        assert result["api_calls"] == 4
         assert result["completed"] is False
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
@@ -5379,6 +5419,7 @@ class TestRetryExhaustion:
         assert result.get("failed") is True
         assert "error" in result
         assert "Invalid API response" in result["error"]
+        assert result.get("final_response") == result["error"]
 
     def test_content_filter_refusal_surfaced_not_retried(self, agent):
         """A model refusal must be surfaced immediately, NOT laundered into
@@ -6707,6 +6748,26 @@ def _make_tc_delta(index=0, tc_id=None, name=None, arguments=None):
     return SimpleNamespace(index=index, id=tc_id, function=func)
 
 
+def _provider_sse_429_text(
+    code="Throttling.AllocationQuota",
+    message="Allocated quota exceeded.",
+):
+    return (
+        "id:1\n"
+        "event:error\n"
+        ":HTTP_STATUS/429\n"
+        f'data:{{"request_id":"req-123","code":"{code}","message":"{message}"}}'
+    )
+
+
+def _provider_sse_error_text(status=503, code="ServiceUnavailable", message="Busy"):
+    return (
+        "event: error\n"
+        f'data:{{"status":{status},"request_id":"req-456","code":"{code}",'
+        f'"message":"{message}"}}'
+    )
+
+
 class TestStreamingApiCall:
     """Tests for _streaming_api_call — voice TTS streaming pipeline."""
 
@@ -6729,6 +6790,108 @@ class TestStreamingApiCall:
         callback.assert_any_call("Hel")
         callback.assert_any_call("lo ")
         callback.assert_any_call("World")
+
+    def test_error_finish_http_status_429_stream_raises_rate_limit(self, agent):
+        error_text = _provider_sse_429_text()
+        chunks = [
+            _make_chunk(content=error_text[:5]),
+            _make_chunk(content=error_text[5:]),
+            _make_chunk(finish_reason="error_finish"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        with pytest.raises(Exception) as exc_info:
+            agent._interruptible_streaming_api_call({"messages": []})
+
+        exc = exc_info.value
+        assert getattr(exc, "status_code", None) == 429
+        assert "Throttling.AllocationQuota" in str(exc)
+        assert getattr(exc, "body", {})["error"]["code"] == "Throttling.AllocationQuota"
+        agent.stream_delta_callback.assert_not_called()
+
+    def test_error_finish_sse_data_status_raises_provider_status(self, agent):
+        chunks = [
+            _make_chunk(content=_provider_sse_error_text()),
+            _make_chunk(finish_reason="error_finish"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        with pytest.raises(Exception) as exc_info:
+            agent._interruptible_streaming_api_call({"messages": []})
+
+        exc = exc_info.value
+        assert getattr(exc, "status_code", None) == 503
+        assert getattr(exc, "body", {})["error"]["code"] == "ServiceUnavailable"
+        assert "Busy" in str(exc)
+        agent.stream_delta_callback.assert_not_called()
+
+    def test_provider_error_prefix_like_normal_text_flushes_to_callback(self, agent):
+        chunks = [
+            _make_chunk(content="id: product-42\n"),
+            _make_chunk(content="is ready"),
+            _make_chunk(finish_reason="stop"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp.choices[0].message.content == "id: product-42\nis ready"
+        assert [
+            call.args[0] for call in agent.stream_delta_callback.call_args_list
+        ] == ["id: product-42\n", "is ready"]
+
+    def test_literal_sse_error_example_with_stop_is_not_provider_error(self, agent):
+        chunks = [
+            _make_chunk(content='event: error\ndata: {"example": true}\n'),
+            _make_chunk(finish_reason="stop"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp.choices[0].message.content == 'event: error\ndata: {"example": true}\n'
+        assert [
+            call.args[0] for call in agent.stream_delta_callback.call_args_list
+        ] == ['event: error\ndata: {"example": true}\n']
+
+    def test_run_conversation_retries_stream_error_finish_rate_limit(self, agent):
+        first_attempt = iter([
+            _make_chunk(content=_provider_sse_429_text()),
+            _make_chunk(finish_reason="error_finish"),
+        ])
+        second_attempt = iter([
+            _make_chunk(content="Recovered"),
+            _make_chunk(finish_reason="stop"),
+        ])
+        agent.client.chat.completions.create.side_effect = [first_attempt, second_attempt]
+        agent.stream_delta_callback = MagicMock()
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+
+        import agent.conversation_loop as _conversation_loop
+
+        with (
+            patch.object(_conversation_loop, "jittered_backoff", return_value=0.0),
+            patch.object(
+                _conversation_loop,
+                "adaptive_rate_limit_backoff",
+                return_value=(0.0, None),
+            ),
+            patch.object(_conversation_loop.time, "sleep", return_value=None),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        assert agent.client.chat.completions.create.call_count == 2
+        assert not any(
+            "HTTP_STATUS/429" in str(call.args[0])
+            for call in agent.stream_delta_callback.call_args_list
+        )
 
     def test_tool_call_accumulation(self, agent):
         # Per OpenAI streaming spec, function names are delivered atomically
@@ -7110,7 +7273,16 @@ class TestPersistUserMessageOverride:
 
         agent._persist_session(messages, [])
 
-        assert messages[0]["content"] == "Hello there"
+        # The original messages list must NOT be mutated — the persist
+        # override is applied only to the DB row (resolved inside the flush
+        # chokepoint), so the live list keeps the original content for the
+        # API call (#48677).
+        assert (
+            messages[0]["content"]
+            == "[Voice input — respond concisely and conversationally, "
+            "2-3 sentences max. No code blocks or markdown.] Hello there"
+        )
+        # But the DB write must get the override.
         first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
         assert first_db_write["content"] == "Hello there"
 
