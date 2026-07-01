@@ -259,7 +259,9 @@ export const ENUM_OPTIONS: Record<string, string[]> = {
   'tts.elevenlabs.model_id': ['eleven_multilingual_v2', 'eleven_turbo_v2_5', 'eleven_flash_v2_5'],
   // NeuTTS local inference device.
   'tts.neutts.device': ['cpu', 'cuda', 'mps'],
-  'updates.non_interactive_local_changes': ['stash', 'discard']
+  'updates.non_interactive_local_changes': ['stash', 'discard'],
+  // Host sleep prevention mode: 'system' keeps work running while allowing the display to sleep.
+  'power.prevent_sleep.mode': ['system', 'display']
 }
 
 export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
@@ -412,6 +414,13 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
   },
   updates: {
     nonInteractiveLocalChanges: 'In-App Update Local Changes'
+  },
+  power: {
+    preventSleep: {
+      enabled: 'Prevent System Sleep',
+      surfaces: 'Prevent Sleep For',
+      mode: 'Sleep Prevention Mode'
+    }
   }
 })
 
@@ -482,6 +491,15 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   updates: {
     nonInteractiveLocalChanges:
       'When Hermes updates itself from the app (no terminal prompt), keep local source edits (stash) or throw them away (discard). Terminal updates always ask.'
+  },
+  power: {
+    preventSleep: {
+      enabled:
+        'Opt in to keeping this computer awake while selected Hermes surfaces are running. Off by default to avoid unexpected battery drain.',
+      surfaces: 'Comma-separated surfaces that hold the sleep assertion: desktop, gateway.',
+      mode:
+        'system prevents idle system sleep while allowing the display to turn off; display also keeps the screen awake.'
+    }
   }
 })
 
@@ -589,6 +607,12 @@ export const SECTIONS: DesktopConfigSection[] = [
       'voice.record_key',
       'voice.max_recording_seconds'
     ]
+  },
+  {
+    id: 'power',
+    label: 'Power',
+    icon: Moon,
+    keys: ['power.prevent_sleep.enabled', 'power.prevent_sleep.surfaces', 'power.prevent_sleep.mode']
   },
   {
     id: 'advanced',
