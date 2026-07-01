@@ -3920,7 +3920,7 @@ def validate_requested_model(
                     "message": None,
                 }
             # Auto-correct close matches (case-insensitive)
-            catalog_lower_list = list(catalog_lower.keys())
+            catalog_lower_list = list(catalog_lower)
             auto = get_close_matches(requested_for_lookup.lower(), catalog_lower_list, n=1, cutoff=0.9)
             if auto:
                 corrected = catalog_lower[auto[0]]
@@ -4163,7 +4163,7 @@ def validate_requested_model(
                 "recognized": True,
                 "message": None,
             }
-        catalog_lower_list = list(catalog_lower.keys())
+        catalog_lower_list = list(catalog_lower)
         auto = get_close_matches(
             requested_for_lookup.lower(), catalog_lower_list, n=1, cutoff=0.9
         )

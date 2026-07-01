@@ -161,7 +161,7 @@ def _model_flow_moa(config, current_model=""):
         print("No MoA presets configured. Run `hermes moa configure <name>` first.")
         return
 
-    names = list(presets.keys())
+    names = list(presets)
     default_name = moa.get("default_preset") or names[0]
 
     # Build labelled rows showing the aggregator so the picker is informative
