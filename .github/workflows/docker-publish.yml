@@ -51,7 +51,7 @@ jobs:
   build-amd64:
     # Only run on the upstream repository, not on forks
     if: github.repository == 'NousResearch/hermes-agent'
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 45
     outputs:
       digest: ${{ steps.push.outputs.digest }}
@@ -185,7 +185,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-arm64:
     if: github.repository == 'NousResearch/hermes-agent'
-    runs-on: ubuntu-24.04-arm
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 45
     outputs:
       digest: ${{ steps.push.outputs.digest }}
@@ -307,7 +307,7 @@ jobs:
   # ---------------------------------------------------------------------------
   merge:
     if: github.repository == 'NousResearch/hermes-agent' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'release')
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     needs: [build-amd64, build-arm64]
     timeout-minutes: 10
     steps:
