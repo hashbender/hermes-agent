@@ -1208,6 +1208,19 @@ def _get_cron_approval_mode() -> str:
         return "deny"
 
 
+def _get_kanban_approval_mode() -> str:
+    """Read the kanban-worker approval mode from config. Returns 'deny' or 'approve'."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        mode = str(cfg_get(config, "approvals", "kanban_mode", default="deny")).lower().strip()
+        if mode in {"approve", "off", "allow", "yes"}:
+            return "approve"
+        return "deny"
+    except Exception:
+        return "deny"
+
+
 def _strip_shell_comments(command: str) -> str:
     """Strip shell-style comments from a command before LLM assessment.
 
@@ -1408,6 +1421,20 @@ def check_dangerous_command(command: str, env_type: str,
                         "Find an alternative approach that avoids this command. "
                         "To allow dangerous commands in cron jobs, set "
                         "approvals.cron_mode: approve in config.yaml."
+                    ),
+                }
+        # Kanban worker subprocesses: same unattended-execution problem as
+        # cron — no user present to approve. Respect kanban_mode config.
+        if env_var_enabled("HERMES_KANBAN_SESSION"):
+            if _get_kanban_approval_mode() == "deny":
+                return {
+                    "approved": False,
+                    "message": (
+                        f"BLOCKED: Command flagged as dangerous ({description}) "
+                        "but kanban workers run without a user present to approve it. "
+                        "Find an alternative approach that avoids this command. "
+                        "To allow dangerous commands in kanban workers, set "
+                        "approvals.kanban_mode: approve in config.yaml."
                     ),
                 }
         logger.warning(
@@ -1674,6 +1701,22 @@ def check_all_command_guards(command: str, env_type: str,
                             "Find an alternative approach that avoids this command. "
                             "To allow dangerous commands in cron jobs, set "
                             "approvals.cron_mode: approve in config.yaml."
+                        ),
+                    }
+        # Kanban worker subprocesses: same unattended-execution problem as
+        # cron — no user present to approve. Respect kanban_mode config.
+        if env_var_enabled("HERMES_KANBAN_SESSION"):
+            if _get_kanban_approval_mode() == "deny":
+                is_dangerous, _pk, description = detect_dangerous_command(command)
+                if is_dangerous:
+                    return {
+                        "approved": False,
+                        "message": (
+                            f"BLOCKED: Command flagged as dangerous ({description}) "
+                            "but kanban workers run without a user present to approve it. "
+                            "Find an alternative approach that avoids this command. "
+                            "To allow dangerous commands in kanban workers, set "
+                            "approvals.kanban_mode: approve in config.yaml."
                         ),
                     }
         return {"approved": True, "message": None}
@@ -1999,6 +2042,26 @@ def check_execute_code_guard(code: str, env_type: str,
                     "to approve it. Use normal tools instead, or set "
                     "approvals.cron_mode: approve only if this cron profile "
                     "is intentionally trusted."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": "blocked",
+                "user_consent": False,
+            }
+        return {"approved": True, "message": None}
+
+    # Kanban worker subprocesses: same unattended-execution problem as cron.
+    if env_var_enabled("HERMES_KANBAN_SESSION"):
+        if _get_kanban_approval_mode() == "deny":
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: execute_code runs arbitrary local Python "
+                    "(including subprocess calls that bypass shell-string "
+                    "approval checks). Kanban workers run without a user "
+                    "present to approve it. Use normal tools instead, or set "
+                    "approvals.kanban_mode: approve only if this kanban "
+                    "profile is intentionally trusted."
                 ),
                 "pattern_key": pattern_key,
                 "description": description,
