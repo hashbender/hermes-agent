@@ -5,8 +5,8 @@ import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 're
 
 import { BootFailureOverlay } from '@/components/boot-failure-overlay'
 import { DesktopInstallOverlay } from '@/components/desktop-install-overlay'
+import { DesktopOnboardingOverlay } from '@/components/desktop-onboarding-overlay'
 import { GatewayConnectingOverlay } from '@/components/gateway-connecting-overlay'
-import { DesktopOnboardingOverlay } from '@/components/onboarding'
 import { Pane, PaneMain } from '@/components/pane-shell'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { useMediaQuery } from '@/hooks/use-media-query'
@@ -476,10 +476,25 @@ export function DesktopController() {
           const messages = toChatMessages(latest.messages)
           updateSessionState(
             runtimeSessionId,
-            state => ({
-              ...state,
-              messages: preserveLocalAssistantErrors(messages, state.messages)
-            }),
+            state => {
+              // A queue drain (auto-drain after interrupt, or manual send-now)
+              // may have seeded an optimistic user message into the session
+              // between when hydration was triggered and when the fetch
+              // resolved. Overwriting with the backend snapshot would erase that
+              // message — the backend hasn't persisted it yet. Bail so the
+              // optimistic bubble survives until the next hydration cycle picks
+              // it up from the backend.
+              const lastVisible = [...state.messages].reverse().find(m => !m.hidden)
+
+              if (lastVisible?.role === 'user') {
+                return state
+              }
+
+              return {
+                ...state,
+                messages: preserveLocalAssistantErrors(messages, state.messages)
+              }
+            },
             storedSessionId
           )
 
