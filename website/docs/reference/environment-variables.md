@@ -161,7 +161,6 @@ For native Anthropic auth, Hermes prefers Claude Code's own credential files whe
 | `HINDSIGHT_TIMEOUT` | Timeout in seconds for Hindsight memory-provider API calls (default: `60`). Bump this if your Hindsight instance is slow to respond during `/sync` or `on_session_switch` and you're seeing timeouts in `errors.log`. |
 | `SUPERMEMORY_API_KEY` | Semantic long-term memory with profile recall and session ingest ([supermemory.ai](https://supermemory.ai)) |
 | `DAYTONA_API_KEY` | Daytona cloud sandboxes ([daytona.io](https://daytona.io/)) |
-| `TENKI_AUTH_TOKEN` / `TENKI_API_KEY` | Tenki cloud sandboxes ([tenki.cloud](https://tenki.cloud)); alternatively run `tenki login` |
 
 ### Skill API Keys
 
@@ -205,7 +204,7 @@ These variables configure the [Tool Gateway](/user-guide/features/tool-gateway) 
 
 | Variable | Description |
 |----------|-------------|
-| `TERMINAL_ENV` | Backend: `local`, `docker`, `ssh`, `singularity`, `modal`, `daytona`, `tenki` |
+| `TERMINAL_ENV` | Backend: `local`, `docker`, `ssh`, `singularity`, `modal`, `daytona` |
 | `HERMES_DOCKER_BINARY` | Override the container binary Hermes shells out to (e.g. `podman`, `/usr/local/bin/docker`). When unset, Hermes auto-discovers `docker` or `podman` on `PATH`. Needed when both are installed and you want the non-default, or when the binary lives outside `PATH`. |
 | `TERMINAL_DOCKER_IMAGE` | Docker image (default: `nikolaik/python-nodejs:python3.11-nodejs20`) |
 | `TERMINAL_DOCKER_FORWARD_ENV` | JSON array of env var names to explicitly forward into Docker terminal sessions. Note: skill-declared `required_environment_variables` are forwarded automatically — you only need this for vars not declared by any skill. |
@@ -214,16 +213,6 @@ These variables configure the [Tool Gateway](/user-guide/features/tool-gateway) 
 | `TERMINAL_SINGULARITY_IMAGE` | Singularity image or `.sif` path |
 | `TERMINAL_MODAL_IMAGE` | Modal container image |
 | `TERMINAL_DAYTONA_IMAGE` | Daytona sandbox image |
-| `TERMINAL_TENKI_IMAGE` | Optional Tenki sandbox image/template; blank uses Tenki default |
-| `TERMINAL_TENKI_API_ENDPOINT` | Tenki API endpoint (default: `https://api.tenki.cloud`) |
-| `TERMINAL_TENKI_WORKSPACE_ID` | Tenki workspace ID; blank falls back to Tenki CLI config |
-| `TERMINAL_TENKI_PROJECT_ID` | Tenki project ID; blank falls back to Tenki CLI config |
-| `TERMINAL_TENKI_ALLOW_INBOUND` | Allow inbound network access in Tenki sandboxes (`true`/`false`, default: `false`) |
-| `TERMINAL_TENKI_ALLOW_OUTBOUND` | Allow outbound network access in Tenki sandboxes (`true`/`false`, default: `true`) |
-| `TERMINAL_TENKI_MAX_DURATION` | Tenki sandbox maximum duration in seconds (default: `3600`) |
-| `TERMINAL_TENKI_IDLE_TIMEOUT` | Tenki sandbox idle timeout in seconds; converted to minutes for the SDK (`0` disables explicit idle timeout) |
-| `TERMINAL_TENKI_PAUSE_RETENTION` | Tenki pause retention duration in seconds (`0` uses Tenki default) |
-| `TERMINAL_TENKI_SYNC_HERMES_HOME` | Opt-in sync of selected `~/.hermes` credentials, skills, and cache files into Tenki sandboxes (`true`/`false`, default: `false`) |
 | `TERMINAL_TIMEOUT` | Command timeout in seconds |
 | `TERMINAL_LIFETIME_SECONDS` | Max lifetime for terminal sessions in seconds |
 | `TERMINAL_CWD` | Deprecated direct override for gateway/cron terminal sessions. Prefer `terminal.cwd` in `config.yaml`; CLI still uses the launch directory. |
@@ -241,7 +230,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `TERMINAL_SSH_KEY` | Path to private key |
 | `TERMINAL_SSH_PERSISTENT` | Override persistent shell for SSH (default: follows `TERMINAL_PERSISTENT_SHELL`) |
 
-## Container Resources (Docker, Singularity, Modal, Daytona, Tenki)
+## Container Resources (Docker, Singularity, Modal, Daytona)
 
 | Variable | Description |
 |----------|-------------|
@@ -683,6 +672,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | `HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS` | Grace window before flushing queued Telegram media (default: `0.6`). |
 | `HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS` | Delay before sending a follow-up after the agent finishes, to avoid racing the last stream chunk. |
 | `HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT` / `_READ_TIMEOUT` / `_WRITE_TIMEOUT` / `_POOL_TIMEOUT` | Override the underlying `python-telegram-bot` HTTP timeouts (seconds). |
+| `HERMES_TELEGRAM_INIT_TIMEOUT` | Per-attempt cap (seconds) on the Telegram `initialize()` connect chain during gateway startup, so an unreachable fallback-IP chain can't block startup indefinitely (default: `30`). |
 | `HERMES_TELEGRAM_HTTP_POOL_SIZE` | Max concurrent HTTP connections to the Telegram API. |
 | `HERMES_TELEGRAM_DISABLE_FALLBACK_IPS` | Disable the hard-coded Cloudflare fallback IPs used when DNS fails (`true`/`false`). |
 | `HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS` | Grace window before flushing a queued Discord text chunk (default: `0.6`). |
@@ -720,7 +710,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 
 | Variable | Description |
 |----------|-------------|
-| `HERMES_MAX_ITERATIONS` | Max tool-calling iterations per conversation (default: 90) |
+| `HERMES_MAX_ITERATIONS` | Deprecated compatibility alias for the iteration budget. Prefer `agent.max_turns` in `config.yaml`; the setup wizard removes this variable automatically to avoid silent shadowing. |
 | `HERMES_INFERENCE_MODEL` | Override model name at process level (takes priority over `config.yaml` for the session). Also settable via `-m`/`--model` flag. |
 | `HERMES_YOLO_MODE` | Set to `1` to bypass dangerous-command approval prompts. Equivalent to `--yolo`. |
 | `HERMES_ACCEPT_HOOKS` | Auto-approve any unseen shell hooks declared in `config.yaml` without a TTY prompt. Equivalent to `--accept-hooks` or `hooks_auto_accept: true`. |
