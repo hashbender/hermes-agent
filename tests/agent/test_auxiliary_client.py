@@ -34,6 +34,7 @@ from agent.auxiliary_client import (
     _resolve_task_provider_model,
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
+    _pool_runtime_base_url,
 )
 
 
@@ -166,6 +167,55 @@ class TestResolveTaskProviderModel:
         assert base_url == "https://proxy.example/v1"
         assert api_key == "sk-test"
         assert api_mode is None
+
+    def test_explicit_model_auto_sentinel_is_normalized(self):
+        """MoA slots (agent/moa_loop.py's _slot_runtime) forward a preset's
+        `model:` field as the explicit `model` kwarg here, not through
+        auxiliary.<task> config. Only cfg_model was normalized before, so a
+        MoA reference/aggregator slot configured with `model: auto` sent the
+        literal string "auto" to the wire as a model id."""
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            provider="anthropic",
+            model="auto",
+        )
+
+        assert resolved_provider == "anthropic"
+        assert model is None
+
+    def test_explicit_model_auto_sentinel_case_insensitive(self):
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            provider="anthropic",
+            model="AUTO",
+        )
+
+        assert model is None
+
+    def test_explicit_model_auto_falls_back_to_cfg_model(self, monkeypatch):
+        """When the explicit model is the "auto" sentinel, it must not shadow
+        a real configured task model — the `model or cfg_model` fallback
+        chain should still reach cfg_model exactly as if model had been
+        omitted entirely."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda _task: {"provider": "openai", "model": "gpt-real-model"},
+        )
+
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            task="moa_reference",
+            model="auto",
+        )
+
+        assert model == "gpt-real-model"
+
+    def test_non_auto_model_is_unaffected(self):
+        """Regression guard: a real model name must not be touched by the
+        sentinel normalization."""
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            provider="openai",
+            model="gpt-4o-mini",
+        )
+
+        assert model == "gpt-4o-mini"
 
 
 class TestBuildCallKwargsMaxTokens:
@@ -4374,6 +4424,18 @@ class TestOpenRouterExplicitApiKey:
             assert call_kwargs["api_key"] == "env-fallback-key", (
                 f"Expected env fallback key to be used when explicit_api_key is None, got: {call_kwargs['api_key']}"
             )
+
+
+def test_pool_runtime_base_url_uses_nous_env_override(monkeypatch):
+    entry = SimpleNamespace(
+        provider="nous",
+        runtime_base_url="https://inference-api.nousresearch.com/v1",
+        inference_base_url="https://inference-api.nousresearch.com/v1",
+        base_url="https://inference-api.nousresearch.com/v1",
+    )
+    monkeypatch.setenv("NOUS_INFERENCE_BASE_URL", "https://ai.wildebeest-newton.ts.net/v1")
+
+    assert _pool_runtime_base_url(entry) == "https://ai.wildebeest-newton.ts.net/v1"
 
 
 class TestAnthropicExplicitApiKey:
