@@ -15,6 +15,7 @@ from tools.approval import (
     _normalize_approval_mode,
     _smart_approve,
     approve_session,
+    check_all_command_guards,
     detect_dangerous_command,
     is_approved,
     load_permanent,
@@ -865,6 +866,103 @@ class TestPatternKeyUniqueness:
         with mock_patch.object(approval_module, "_permanent_approved", set()):
             load_permanent({"find"})
             assert is_approved("legacy-find", key_delete) is True
+
+
+class TestConfigurableCommandPolicy:
+    def test_structured_allowlist_scopes_chmod_to_hermes_paths(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with (
+            mock_patch.object(approval_module, "_permanent_approved", set()),
+            mock_patch.object(approval_module, "_permanent_allowlist_rules", []),
+        ):
+            load_permanent([{"pattern": "chmod", "args_glob": ["$HERMES_HOME/**"]}])
+
+            assert approval_module._command_matches_permanent_allowlist(
+                f"chmod 777 {hermes_home}/skills/foo/run.sh"
+            ) is True
+            assert approval_module._command_matches_permanent_allowlist(
+                "chmod 777 /etc/passwd"
+            ) is False
+
+    def test_structured_allowlist_rejects_compound_commands(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with (
+            mock_patch.object(approval_module, "_permanent_approved", set()),
+            mock_patch.object(approval_module, "_permanent_allowlist_rules", []),
+        ):
+            load_permanent([{"pattern": "chmod", "args_glob": ["$HERMES_HOME/**"]}])
+
+            assert approval_module._command_matches_permanent_allowlist(
+                f"chmod 777 {hermes_home}/skills/foo/run.sh && ./run.sh"
+            ) is False
+
+    def test_path_scoped_allowlist_suppresses_matching_dangerous_prompt(
+        self, monkeypatch, tmp_path
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        target = hermes_home / "skills" / "foo" / "run.sh"
+        target.parent.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+
+        with (
+            mock_patch.object(approval_module, "_permanent_approved", set()),
+            mock_patch.object(approval_module, "_permanent_allowlist_rules", []),
+            mock_patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "approvals": {"mode": "manual"},
+                    "command_allowlist": [],
+                    "security": {"tirith_enabled": False},
+                },
+            ),
+        ):
+            load_permanent([{"pattern": "chmod", "args_glob": ["$HERMES_HOME/**"]}])
+            result = check_all_command_guards(f"chmod 777 {target}", "local")
+
+        assert result["approved"] is True
+
+    def test_configured_approval_required_overrides_broad_allowlist(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        session = "configured-required-test"
+        token = approval_module.set_current_session_key(session)
+        try:
+            _clear_session(session)
+            with (
+                mock_patch.object(approval_module, "_permanent_approved", set()),
+                mock_patch.object(approval_module, "_permanent_allowlist_rules", []),
+                mock_patch(
+                    "hermes_cli.config.load_config",
+                    return_value={
+                        "approvals": {
+                            "mode": "manual",
+                            "command_approval_required": [
+                                "systemctl --user restart openclaw-gateway*"
+                            ],
+                        },
+                        "command_allowlist": [],
+                        "security": {"tirith_enabled": False},
+                    },
+                ),
+            ):
+                load_permanent({"systemctl *"})
+                result = check_all_command_guards(
+                    "systemctl --user restart openclaw-gateway.service",
+                    "local",
+                )
+        finally:
+            approval_module.reset_current_session_key(token)
+            _clear_session(session)
+
+        assert result["approved"] is False
+        assert result["status"] == "pending_approval"
+        assert "configured approval-required command" in result["description"]
 
 
 class TestFullCommandAlwaysShown:

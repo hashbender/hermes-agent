@@ -1138,18 +1138,7 @@ DEFAULT_CONFIG = {
         "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
         "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
         "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
-        "tenki_image": "",
-        "tenki_api_endpoint": "https://api.tenki.cloud",
-        "tenki_workspace_id": "",
-        "tenki_project_id": "",
-        "tenki_name_prefix": "hermes",
-        "tenki_allow_inbound": False,
-        "tenki_allow_outbound": True,
-        "tenki_max_duration": 3600,
-        "tenki_idle_timeout": 0,
-        "tenki_pause_retention": 0,
-        "tenki_sync_hermes_home": False,
-        # Container resource limits (docker, singularity, modal, daytona, tenki — ignored for local/ssh)
+        # Container resource limits (docker, singularity, modal, daytona — ignored for local/ssh)
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)
         "container_disk": 51200,        # MB (default 50GB)
@@ -2394,10 +2383,16 @@ DEFAULT_CONFIG = {
     # cron_mode — what to do when a cron job hits a dangerous command:
     #   deny    — block the command and let the agent find another way (default, safe)
     #   approve — auto-approve all dangerous commands in cron jobs
+    #
+    # command_approval_required — deployment-local command patterns that must
+    # enter the same approval flow as built-in dangerous commands. Entries may
+    # be exact commands, shell-style command globs, bare verbs, or structured
+    # rules with pattern/args_glob.
     "approvals": {
         "mode": "manual",
         "timeout": 60,
         "cron_mode": "deny",
+        "command_approval_required": [],
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system
@@ -2417,7 +2412,10 @@ DEFAULT_CONFIG = {
         "destructive_slash_confirm": True,
     },
 
-    # Permanently allowed dangerous command patterns (added via "always" approval)
+    # Permanently allowed dangerous command patterns (added via "always" approval).
+    # Entries may be legacy strings ("recursive delete", "podman *") or
+    # structured path-scoped rules:
+    #   {"pattern": "chmod", "args_glob": ["~/.hermes/**"]}
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
@@ -6249,17 +6247,6 @@ TERMINAL_CONFIG_ENV_MAP = {
     "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
     "modal_image": "TERMINAL_MODAL_IMAGE",
     "daytona_image": "TERMINAL_DAYTONA_IMAGE",
-    "tenki_image": "TERMINAL_TENKI_IMAGE",
-    "tenki_api_endpoint": "TERMINAL_TENKI_API_ENDPOINT",
-    "tenki_workspace_id": "TERMINAL_TENKI_WORKSPACE_ID",
-    "tenki_project_id": "TERMINAL_TENKI_PROJECT_ID",
-    "tenki_name_prefix": "TERMINAL_TENKI_NAME_PREFIX",
-    "tenki_allow_inbound": "TERMINAL_TENKI_ALLOW_INBOUND",
-    "tenki_allow_outbound": "TERMINAL_TENKI_ALLOW_OUTBOUND",
-    "tenki_max_duration": "TERMINAL_TENKI_MAX_DURATION",
-    "tenki_idle_timeout": "TERMINAL_TENKI_IDLE_TIMEOUT",
-    "tenki_pause_retention": "TERMINAL_TENKI_PAUSE_RETENTION",
-    "tenki_sync_hermes_home": "TERMINAL_TENKI_SYNC_HERMES_HOME",
     "ssh_host": "TERMINAL_SSH_HOST",
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
@@ -7313,12 +7300,6 @@ def show_config():
         print(f"  Daytona image: {terminal.get('daytona_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
         daytona_key = get_env_value('DAYTONA_API_KEY')
         print(f"  API key:      {'configured' if daytona_key else '(not set)'}")
-    elif terminal.get('backend') == 'tenki':
-        print(f"  Tenki image:  {terminal.get('tenki_image') or '(Tenki default)'}")
-        print(f"  Endpoint:     {terminal.get('tenki_api_endpoint', 'https://api.tenki.cloud')}")
-        print(f"  Workspace:    {terminal.get('tenki_workspace_id') or '(from Tenki CLI)'}")
-        print(f"  Project:      {terminal.get('tenki_project_id') or '(from Tenki CLI)'}")
-        print(f"  Sync .hermes: {'enabled' if terminal.get('tenki_sync_hermes_home') else 'disabled'}")
     elif terminal.get('backend') == 'ssh':
         ssh_host = get_env_value('TERMINAL_SSH_HOST')
         ssh_user = get_env_value('TERMINAL_SSH_USER')
