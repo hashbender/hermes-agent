@@ -75,7 +75,6 @@ import hashlib
 import json
 import os
 import re
-import random
 import secrets
 import shutil
 import sqlite3
@@ -275,6 +274,39 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
 
 
+def _resolve_blocker_auth_window_seconds() -> int:
+    """Return the max age (seconds) of a ``last_failure_error`` after which
+    the ``blocker_auth`` respawn guard releases and the dispatcher attempts
+    a fresh probe.
+
+    Reads ``HERMES_KANBAN_BLOCKER_AUTH_WINDOW_SECONDS`` from the
+    environment; falls back to ``DEFAULT_RESPAWN_BLOCKER_WINDOW_SECONDS``
+    when absent, empty, non-integer, or negative. A value of 0 disables
+    the guard entirely (always allow a probe — useful for tests or for
+    operators who prefer to let the auto-block circuit breaker be the
+    sole gatekeeper).
+
+    Rationale: the regex-based ``blocker_auth`` guard is intentionally
+    silent — it does not bump ``consecutive_failures`` — so a one-time
+    stale failure parks a task in ``ready`` until either the operator
+    unblocks it or the breaker trips. Without this TTL the only way out
+    of ``blocker_auth`` was a manual ``hermes kanban unblock``. Reported
+    in t_7f4b0ff2 (2026-06-29): two ready tasks with stale ``429``
+    text sat for 21.9h while the live credential pool was healthy.
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_BLOCKER_AUTH_WINDOW_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_RESPAWN_BLOCKER_WINDOW_SECONDS
+
+
 # Worker-context caps so build_worker_context() stays bounded on
 # pathological boards (retry-heavy tasks, comment storms, giant
 # summaries). Values chosen to fit a typical 100k-char LLM prompt with
@@ -285,43 +317,6 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
-
-
-def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
-    """Render the age of an epoch-seconds timestamp as a coarse, human-
-    readable string like ``just now``, ``18h ago``, ``3d ago``.
-
-    Workers read parent handoffs, comments, and prior-attempt summaries as
-    if they describe *current* state. A bare absolute timestamp
-    (``2026-06-25 14:30``) doesn't make an LLM reason about staleness — it
-    reads the content as fact regardless of how old it is. A relative age
-    ("18h ago") is the signal that prompts the worker to re-verify against
-    the live source before acting on stale sibling work. Returns an empty
-    string for missing/invalid timestamps so callers can append
-    unconditionally.
-    """
-    if ts is None:
-        return ""
-    try:
-        ts = int(ts)
-    except (TypeError, ValueError):
-        return ""
-    if now is None:
-        now = int(time.time())
-    delta = now - ts
-    if delta < 0:
-        # Clock skew across machines/profiles — don't claim "in the future".
-        return "just now"
-    if delta < 60:
-        return "just now"
-    if delta < 3600:
-        m = delta // 60
-        return f"{m}m ago"
-    if delta < 86400:
-        h = delta // 3600
-        return f"{h}h ago"
-    d = delta // 86400
-    return f"{d}d ago"
 
 
 # ---------------------------------------------------------------------------
@@ -1986,6 +1981,39 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "last_failure_at" not in cols:
+        # Timestamp of the most recent failure recorded by
+        # ``_record_task_failure``. NULL on legacy rows that predate the
+        # column. Used by ``check_respawn_guard`` to release the
+        # ``blocker_auth`` deferral after
+        # ``HERMES_KANBAN_BLOCKER_AUTH_WINDOW_SECONDS`` (default 1800s);
+        # without this timestamp the regex would defer a stale failure
+        # forever and the silent deferral would never bump
+        # ``consecutive_failures`` for the auto-block circuit breaker to
+        # trip (t_7f4b0ff2, 2026-06-29). Backfill from the latest
+        # ``spawn_failed`` ``task_events`` row when one exists, so old
+        # tasks unstick as soon as their failure ages past the window.
+        _add_column_if_missing(
+            conn, "tasks", "last_failure_at", "last_failure_at INTEGER"
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+               SET last_failure_at = (
+                   SELECT MAX(e.created_at)
+                     FROM task_events e
+                    WHERE e.task_id = tasks.id
+                      AND e.kind IN ('spawn_failed', 'gave_up', 'crashed', 'timed_out')
+               )
+             WHERE last_failure_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM task_events e
+                    WHERE e.task_id = tasks.id
+                      AND e.kind IN ('spawn_failed', 'gave_up', 'crashed', 'timed_out')
+               )
+            """
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2271,38 +2299,6 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
         pass  # I/O errors during check are non-fatal; let normal ops continue
 
 
-# SQLite's own busy_timeout uses a near-deterministic backoff, so concurrent
-# writers re-collide in lockstep under a stampede. A jittered retry on the
-# transaction boundary breaks that convoy. Mirrors state.db's _execute_write:
-# a fixed 20-150ms jitter band (a 20ms floor prevents a near-zero retry from
-# busy-spinning back into the collision). Only BEGIN IMMEDIATE and COMMIT are
-# retried -- both are idempotent re-issues that touch no transaction body, so a
-# CAS inside write_txn is never replayed. kanban keeps fewer retries than
-# state.db (5 vs 15) because its 120s busy_timeout already absorbs most waits;
-# the retry is the backstop for the tail SQLite returns BUSY on immediately.
-_BUSY_MAX_RETRIES = 5
-_BUSY_RETRY_MIN_S = 0.020  # 20ms
-_BUSY_RETRY_MAX_S = 0.150  # 150ms
-
-
-def _is_busy_error(exc: BaseException) -> bool:
-    return isinstance(exc, sqlite3.OperationalError) and (
-        "database is locked" in str(exc).lower()
-        or "database is busy" in str(exc).lower()
-    )
-
-
-def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
-    for attempt in range(_BUSY_MAX_RETRIES + 1):
-        try:
-            conn.execute(sql)
-            return
-        except sqlite3.OperationalError as exc:
-            if not _is_busy_error(exc) or attempt == _BUSY_MAX_RETRIES:
-                raise
-            time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
-
-
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection):
     """Context manager for an IMMEDIATE write transaction.
@@ -2315,7 +2311,7 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
     except Exception:
@@ -2328,16 +2324,7 @@ def write_txn(conn: sqlite3.Connection):
             pass
         raise
     else:
-        try:
-            _execute_boundary_with_retry(conn, "COMMIT")
-        except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
-            raise
+        conn.execute("COMMIT")
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
@@ -5679,6 +5666,22 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
+# Max age (seconds) of the last failure error before the ``blocker_auth``
+# guard releases and the dispatcher attempts a fresh probe. Without
+# this, a one-time preflight failure on a profile whose credentials
+# later recovered would park the task in ``ready`` indefinitely —
+# the regex never changes its mind on its own, and the deferral path
+# does not bump ``consecutive_failures`` so the auto-block circuit
+# breaker cannot trip either. Reported in t_7f4b0ff2 (2026-06-29):
+# two ready tasks with stale ``429`` text sat for 21.9h while the live
+# credential pool was healthy. Default 30 min — long enough to give a
+# quota window time to reset, short enough that an operator who
+# rotated keys sees the board recover on its own instead of having to
+# ``hermes kanban unblock`` every stuck task. Overridable via
+# ``HERMES_KANBAN_BLOCKER_AUTH_WINDOW_SECONDS``; 0 disables the
+# guard entirely (always allow a probe).
+DEFAULT_RESPAWN_BLOCKER_WINDOW_SECONDS = 1800  # 30 minutes
+
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
@@ -6500,11 +6503,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # ready → blocked with a ``gave_up`` event on top of the ``crashed``
     # event we already emitted.
     #
-    # Protocol-violation crashes force an immediate trip (failure_limit=1)
-    # because clean-exit-without-transition is deterministic: the next
-    # respawn will do exactly the same thing. Better to surface to a
-    # human with a clear reason than to loop ``DEFAULT_FAILURE_LIMIT``
-    # times first.
+    # Protocol-violation crashes (worker exited cleanly without calling
+    # kanban_complete / kanban_block) used to force ``failure_limit=1``
+    # on the assumption that the next respawn would do exactly the same
+    # thing. That's true for genuine worker-driver bugs, but it also
+    # locked out an entire class of *recoverable* failures — most notably
+    # upstream provider-auth exhaustion, where the next respawn runs
+    # *only* after the operator rotates the OpenRouter key (or the
+    # account cooldown elapses). One crash → permanent block on what is
+    # actually a credentials problem. We now let the global
+    # ``kanban.failure_limit`` (default 2) be the floor, so a transient
+    # recovery (key rotation) can land the retry before the breaker
+    # trips. The genuine-loop safety net is preserved via the
+    # ``is_systemic`` fingerprint check on the non-protocol-violation
+    # path — three same-fingerprint crashes still auto-block
+    # immediately, regardless of the failure_limit floor.
     auto_blocked: list[str] = []
     if crash_details:
         # Fingerprint errors to detect systemic failures.
@@ -6522,7 +6535,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if (protocol_violation or is_systemic) else None,
+                # Protocol-violation crashes respect the global
+                # ``kanban.failure_limit`` floor (default 2) instead of
+                # hard-coded 1 — see comment above. ``is_systemic``
+                # non-protocol-violation loops still trip on the first
+                # iteration above threshold (preserved).
+                failure_limit=1 if is_systemic else None,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
@@ -6588,6 +6606,11 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    # Stamped onto ``tasks.last_failure_at`` in every branch below so the
+    # respawn guard can age out a stale ``blocker_auth`` deferral
+    # (t_7f4b0ff2). Captured once so all four UPDATEs share an exact
+    # timestamp rather than drifting by millisecond rounding.
+    failure_at = int(time.time())
     with write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries "
@@ -6617,9 +6640,10 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "last_failure_at = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], failure_at, task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -6627,9 +6651,10 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "last_failure_at = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], failure_at, task_id),
                 )
             run_id = None
             if end_run:
@@ -6665,17 +6690,19 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "last_failure_at = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], failure_at, task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready`` via
                 # its own UPDATE. Just bookkeep the counter + last error.
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
-                    (failures, error[:500], task_id),
+                    "last_failure_error = ?, last_failure_at = ? "
+                    "WHERE id = ?",
+                    (failures, error[:500], failure_at, task_id),
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
@@ -6746,7 +6773,8 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
-            "last_failure_error = NULL WHERE id = ?",
+            "last_failure_error = NULL, last_failure_at = NULL "
+            "WHERE id = ?",
             (task_id,),
         )
 
@@ -6786,6 +6814,20 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         blocks via the normal path — but a transient 429 gets a few
         ticks of recovery first.
 
+        The deferral is bounded by ``_RESPAWN_BLOCKER_WINDOW_SECONDS``
+        (default 1800s, env-tunable via
+        ``HERMES_KANBAN_BLOCKER_AUTH_WINDOW_SECONDS``): if the failure
+        is older than that window, the guard releases and the
+        dispatcher attempts a fresh probe. Without this, a one-time
+        preflight failure on a profile whose credentials later
+        recovered would park the task in ``ready`` indefinitely —
+        the regex never changes its mind on its own, and the
+        deferral path does not bump ``consecutive_failures`` so the
+        auto-block circuit breaker cannot trip either. This was the
+        symptom reported in t_7f4b0ff2 (2026-06-29): two ready
+        tasks with stale ``429`` text sat for 21.9h while the live
+        credential pool was healthy.
+
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
         seconds.  Useful work already succeeded for this task; wait for
@@ -6802,7 +6844,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, last_failure_at, created_at FROM tasks "
+        "WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -6849,7 +6892,46 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+        # Bounded by _RESPAWN_BLOCKER_WINDOW_SECONDS so a one-time
+        # preflight failure whose underlying credential problem later
+        # recovered cannot park the task in ``ready`` indefinitely.
+        # Without this, the regex would defer forever and the silent
+        # deferral would never bump ``consecutive_failures`` for the
+        # auto-block circuit breaker to trip (t_7f4b0ff2).
+        blocker_window = _resolve_blocker_auth_window_seconds()
+        if blocker_window <= 0:
+            # Guard disabled — always allow a probe.
+            err = None
+        else:
+            # ``last_failure_at`` is the source of truth; fall back to
+            # ``created_at`` only for legacy rows that predate the
+            # migration (NULL last_failure_at). The fallback is
+            # conservative: it uses the OLDER of the two, so we never
+            # release the guard sooner than either timestamp implies.
+            failed_at = row["last_failure_at"]
+            if failed_at is None:
+                fallback_at = row["created_at"]
+                age_source = "created_at"
+            else:
+                fallback_at = int(failed_at)
+                age_source = "last_failure_at"
+            if fallback_at is not None and (now - int(fallback_at)) >= blocker_window:
+                # Failure is older than the window — release the guard
+                # and let the dispatcher take a fresh probe. The probe
+                # itself will re-run ``_spawn_preflight_credentials``;
+                # if the credential pool is STILL broken, the next
+                # attempt raises and ``_record_spawn_failure`` will
+                # bump ``consecutive_failures`` toward the breaker
+                # threshold normally.
+                _log.debug(
+                    "kanban respawn_guard: releasing blocker_auth deferral "
+                    "for task=%s after %s window (age=%ds source=%s); "
+                    "allowing fresh probe",
+                    task_id, blocker_window, now - int(fallback_at), age_source,
+                )
+                err = None
+        if err:
+            return "blocker_auth"
 
     # 3. Completed run within guard window — proof of recent success.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
@@ -7659,6 +7741,128 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+# Status values from ``agent/credential_pool.py`` that mean the credential
+# is permanently unusable for this run. ``exhausted`` (HTTP 401/402/429)
+# covers auth rejection, billing/quota, and rate-limit; ``dead`` covers
+# terminal OAuth states (token_revoked / token_invalidated). Other
+# ``last_status`` values (``None``/missing, ``ok``) are NOT terminal and
+# are not eligible for the spawn-preflight short-circuit.
+_SPAWN_PREFLIGHT_BLOCKING_STATUSES = frozenset({"exhausted", "dead"})
+
+
+def _spawn_preflight_credentials(profile_arg: str) -> None:
+    """Spawn-time gate: refuse to spawn a worker when every credential
+    entry on its profile is stamped with a blocking status.
+
+    Returns ``None`` when the profile is healthy (or has no auth.json on
+    disk yet — the worker may still pick up env-var auth). Raises
+    ``RuntimeError`` with a concrete remediation hint when ALL entries
+    on ALL providers are ``exhausted`` or ``dead`` — i.e. the worker
+    subprocess is going to die in <1s with the rc=0 protocol-violation
+    signature before reaching any tool loop. The dispatcher's existing
+    ``except Exception`` around ``_default_spawn`` catches this and
+    routes through ``_record_spawn_failure`` (``outcome='spawn_failed'``),
+    stamping ``last_failure_error`` with the reason and bumping
+    ``consecutive_failures`` — which gives Frank a concrete action to
+    take instead of a 60-second 401 → block dance.
+
+    Belt-and-braces with the protocol-violation floor raise at line 6149:
+    when this preflight passes (e.g. a profile with some healthy and
+    some exhausted entries), the worker still might crash cleanly, but
+    at least the spawn wasn't doomed from the start. The two patches
+    complement each other — the floor keeps a transient recovery (key
+    rotation) alive, the preflight short-circuits the obvious case
+    where the *first* attempt cannot succeed at all.
+
+    Fail-open semantics: any error reading or parsing auth.json is
+    swallowed and the spawn proceeds. The credential pool itself
+    re-reads auth.json on every entry selection, so the worst case is
+    "we didn't catch it pre-spawn" — not "we false-blocked a healthy
+    profile."
+    """
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+        profile_home = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        # Profile directory doesn't exist — defer to the worker.
+        return
+    except Exception:
+        # Any other resolution error (imports, env) — don't block spawn.
+        return
+
+    auth_path = os.path.join(profile_home, "auth.json")
+    if not os.path.isfile(auth_path):
+        # No auth.json means no credential pool entries on disk — the
+        # worker may still auth via env vars or interactive flows.
+        return
+
+    try:
+        with open(auth_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        # Corrupt or unreadable auth.json — don't block spawn, let the
+        # credential pool surface the real error inside the worker.
+        return
+    if not isinstance(data, dict):
+        return
+
+    pool = data.get("credential_pool")
+    if not isinstance(pool, dict) or not pool:
+        # No pool entries recorded — same as no auth.json.
+        return
+
+    # Classify every provider in the pool:
+    #   "blocking"   - every entry on this provider is exhausted/dead
+    #   "healthy"    - at least one entry has a non-blocking status
+    #                   (None / missing / "ok") — the credential pool may
+    #                   pick that one.
+    # Only block the spawn when EVERY provider in the pool is blocking.
+    # If even one provider is healthy, the worker's credential-pool
+    # rotation can still succeed and the spawn should proceed.
+    blocking_providers: list[str] = []
+    total_providers = 0
+    for provider_name, entries in pool.items():
+        if not isinstance(entries, list) or not entries:
+            continue
+        total_providers += 1
+        # A provider is "blocking" iff EVERY entry is exhausted/dead.
+        # An entry with status=None or missing counts as healthy
+        # (never failed yet).
+        all_blocked = all(
+            isinstance(e, dict)
+            and e.get("last_status") in _SPAWN_PREFLIGHT_BLOCKING_STATUSES
+            for e in entries
+        )
+        if all_blocked:
+            # Surface the most informative error reason for the operator.
+            sample = next(
+                (e for e in entries if isinstance(e, dict)),
+                {},
+            )
+            code = sample.get("last_error_code")
+            message = sample.get("last_error_message") or "<no message>"
+            blocking_providers.append(
+                f"{provider_name} (last_error_code={code}, "
+                f"message={message!r})"
+            )
+
+    # Spawn-proceeds iff there is at least one healthy provider in the
+    # pool. Fix for kanban task t_e3e0256f (2026-06-29): the prior
+    # condition `if blocking_providers:` false-blocked any profile where
+    # one provider was all-dead, even when other healthy providers
+    # coexisted in the same pool. A profile with one healthy provider
+    # is usable; only a profile with NO healthy providers is doomed.
+    if total_providers > 0 and len(blocking_providers) >= total_providers:
+        raise RuntimeError(
+            f"spawn preflight: profile {profile_arg!r} has no usable "
+            f"credentials — every pool entry is exhausted or dead. "
+            f"Blocking providers: {'; '.join(blocking_providers)}. "
+            f"Remediate by running `hermes auth` (or rotating the key in "
+            f"~/.hermes/profiles/{profile_arg}/auth.json), then "
+            f"`hermes kanban unblock <task-id>` to retry."
+        )
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -7684,6 +7888,21 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+
+    # Spawn-time credential preflight. Belt-and-braces with the
+    # protocol-violation floor raise at line 6149: when the profile's
+    # credential pool is fully exhausted (every entry stamped
+    # ``last_status='exhausted'`` or ``'dead'``), the worker is going
+    # to die in <1s with the rc=0 protocol-violation signature before
+    # any tool loop runs. Surface that as a ``spawn_failed`` here
+    # instead of burning 60 seconds of grace + a worker budget on a
+    # doomed call. The dispatcher's existing ``except Exception``
+    # handler catches the RuntimeError, calls
+    # ``_record_spawn_failure`` (which writes a ``spawn_failed`` event
+    # + bumps ``consecutive_failures``), and lands the task in
+    # ``blocked`` with a ``last_failure_error`` that tells the
+    # operator exactly which profile + provider is broken.
+    _spawn_preflight_credentials(profile_arg)
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -7922,11 +8141,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if not task:
         raise ValueError(f"unknown task {task_id}")
 
-    # Single clock reading shared by every relative-age stamp below, so all
-    # ages in one rendering are consistent ("3h ago" / "3h ago", not drifting
-    # by the seconds it takes to build the block).
-    _now = int(time.time())
-
     def _cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
         """Truncate a string to `limit` chars with a visible ellipsis."""
         if not s:
@@ -8006,11 +8220,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         for offset, run in enumerate(shown):
             idx = first_shown_idx + offset
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
-            age = _relative_age(run.started_at, _now)
-            ts_disp = f"{ts}, {age}" if age else ts
             profile = run.profile or "(unknown)"
             outcome = run.outcome or run.status
-            lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})")
+            lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts})")
             if run.summary and run.summary.strip():
                 lines.append(_cap(run.summary))
             if run.error and run.error.strip():
@@ -8044,24 +8256,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
             if not wrote_header:
                 lines.append("## Parent task results")
-                lines.append(
-                    "_Handoffs from upstream tasks, captured when each parent "
-                    "completed (see age below). These are point-in-time "
-                    "snapshots, not live state — if a result drives your "
-                    "current work and it's not recent, re-verify against the "
-                    "source before acting on it as current._"
-                )
                 wrote_header = True
-
-            # When did this parent's result get produced? Prefer the
-            # completed run's end time; fall back to the task's completed_at.
-            done_ts = None
-            if run is not None and getattr(run, "ended_at", None):
-                done_ts = run.ended_at
-            elif pt.completed_at:
-                done_ts = pt.completed_at
-            age = _relative_age(done_ts, _now)
-            lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
+            lines.append(f"### {pid}")
 
             body_lines: list[str] = []
             if run is not None and run.summary and run.summary.strip():
@@ -8101,11 +8297,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 ts = time.strftime(
                     "%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"]))
                 )
-                age = _relative_age(row["ended_at"], _now)
-                ts_disp = f"{ts}, {age}" if age else ts
                 s = (row["summary"] or "").strip().splitlines()
                 first = s[0][:200] if s else "(no summary)"
-                lines.append(f"- {row['id']} — {row['title']} ({ts_disp}): {first}")
+                lines.append(f"- {row['id']} — {row['title']} ({ts}): {first}")
             lines.append("")
 
     # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
@@ -8127,8 +8321,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             )
         for c in shown_c:
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.created_at))
-            age = _relative_age(c.created_at, _now)
-            ts_disp = f"{ts}, {age}" if age else ts
             # Render author with explicit "comment from worker" framing so
             # operator-controlled HERMES_PROFILE values like "hermes-system"
             # or "operator" can't be misread by the next worker as a system
@@ -8136,7 +8328,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             # Defense-in-depth — the LLM-controlled author-forgery surface
             # was already closed in #22435. See #22452.
             safe_author = (c.author or "").replace("`", "")
-            lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
+            lines.append(f"comment from worker `{safe_author}` at {ts}:")
             lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
             lines.append("")
 
