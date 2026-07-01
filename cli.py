@@ -401,17 +401,6 @@ def load_cli_config() -> Dict[str, Any]:
             "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
             "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
             "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
-            "tenki_image": "",
-            "tenki_api_endpoint": "https://api.tenki.cloud",
-            "tenki_workspace_id": "",
-            "tenki_project_id": "",
-            "tenki_name_prefix": "hermes",
-            "tenki_allow_inbound": False,
-            "tenki_allow_outbound": True,
-            "tenki_max_duration": 3600,
-            "tenki_idle_timeout": 0,
-            "tenki_pause_retention": 0,
-            "tenki_sync_hermes_home": False,
             "docker_volumes": [],  # host:container volume mounts for Docker backend
             "docker_mount_cwd_to_workspace": False,  # explicit opt-in only; default off for sandbox isolation
         },
@@ -620,23 +609,12 @@ def load_cli_config() -> Dict[str, Any]:
         "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
-        "tenki_image": "TERMINAL_TENKI_IMAGE",
-        "tenki_api_endpoint": "TERMINAL_TENKI_API_ENDPOINT",
-        "tenki_workspace_id": "TERMINAL_TENKI_WORKSPACE_ID",
-        "tenki_project_id": "TERMINAL_TENKI_PROJECT_ID",
-        "tenki_name_prefix": "TERMINAL_TENKI_NAME_PREFIX",
-        "tenki_allow_inbound": "TERMINAL_TENKI_ALLOW_INBOUND",
-        "tenki_allow_outbound": "TERMINAL_TENKI_ALLOW_OUTBOUND",
-        "tenki_max_duration": "TERMINAL_TENKI_MAX_DURATION",
-        "tenki_idle_timeout": "TERMINAL_TENKI_IDLE_TIMEOUT",
-        "tenki_pause_retention": "TERMINAL_TENKI_PAUSE_RETENTION",
-        "tenki_sync_hermes_home": "TERMINAL_TENKI_SYNC_HERMES_HOME",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",
         "ssh_key": "TERMINAL_SSH_KEY",
-        # Container resource config (docker, singularity, modal, daytona, tenki -- ignored for local/ssh)
+        # Container resource config (docker, singularity, modal, daytona -- ignored for local/ssh)
         "container_cpu": "TERMINAL_CONTAINER_CPU",
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
@@ -10129,11 +10107,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             target=self._reload_mcp, daemon=True
         )
         _reload_thread.start()
-        # Do NOT join here — process_loop calls this from its idle branch, so a
-        # blocking join would freeze input consumption for up to 30s (and a hung
-        # MCP server could block far longer). The reload runs purely in the
-        # background daemon thread, which reports its own progress/completion
-        # status via print() inside _reload_mcp().
+        _reload_thread.join(timeout=30)
+        if _reload_thread.is_alive():
+            print("  ⚠️  MCP reload timed out (30s). Some servers may not have reconnected.")
 
     # Inline-skip tokens that bypass the destructive-slash confirmation modal.
     # A general escape hatch for non-interactive use (scripting/automation) and
@@ -10761,16 +10737,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except Exception:
             pass
 
-        # Recorder creation can fail (no input device, PortAudio init error).
-        # Reset the flag on failure or _voice_recording stays True forever and
-        # every future voice start is silently skipped by the guard above.
         if self._voice_recorder is None:
-            try:
-                self._voice_recorder = create_audio_recorder()
-            except Exception:
-                with self._voice_lock:
-                    self._voice_recording = False
-                raise
+            self._voice_recorder = create_audio_recorder()
 
         # Apply config-driven silence params (numeric-guarded so YAML
         # scalar corruption doesn't break recording start-up).
