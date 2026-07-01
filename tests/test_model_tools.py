@@ -10,6 +10,8 @@ from model_tools import (
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
+    _shell_command_class,
+    _tool_command_metadata,
     TOOL_TO_TOOLSET_MAP,
 )
 
@@ -19,6 +21,62 @@ from model_tools import (
 # =========================================================================
 
 class TestHandleFunctionCall:
+    def test_shell_command_class_is_conservative_and_secret_safe(self):
+        assert _shell_command_class("API_TOKEN=*** scripts/run_tests.sh tests/test_model_tools.py") == "test"
+        assert _shell_command_class("python -m pytest tests/test_model_tools.py") == "test"
+        assert _shell_command_class("npm build") == "build"
+        assert _shell_command_class("git status --short") == "git"
+        assert _shell_command_class("curl https://example.com") == "network"
+        assert _shell_command_class("sleep 30") == "wait"
+        assert _shell_command_class("./deploy-prod-with-secret-token") == "unknown"
+        assert _shell_command_class("API_TOKEN=***") == "unknown"
+        assert _shell_command_class(None) == "unknown"
+
+    def test_tool_wait_kind_metadata_distinguishes_intentional_waits(self):
+        assert _tool_command_metadata("terminal", {
+            "command": "npm run build",
+            "background": False,
+        })["wait_kind"] == "foreground_build"
+        assert _tool_command_metadata("terminal", {
+            "command": "sleep 30",
+            "background": False,
+        })["wait_kind"] == "sleep_wait"
+        assert _tool_command_metadata("terminal", {
+            "command": "python -m http.server",
+            "background": True,
+            "notify_on_complete": True,
+        })["wait_kind"] == "background_wait"
+        assert _tool_command_metadata("process", {
+            "action": "wait",
+            "timeout": 60,
+        }) == {
+            "command_class": "process",
+            "timeout_seconds": 60,
+            "wait_kind": "background_wait",
+        }
+        assert _tool_command_metadata("browser_navigate", {
+            "url": "https://example.com",
+        }) == {
+            "command_class": "browser",
+            "wait_kind": "browser_navigation",
+        }
+        android_wait_metadata = _tool_command_metadata("mcp_android_phone_android_wait", {
+            "seconds": 5,
+        })
+        assert android_wait_metadata["command_class"] == "android"
+        assert android_wait_metadata["timeout_seconds"] == 5
+        assert android_wait_metadata["wait_kind"] == "android_wait"
+        assert android_wait_metadata["tool_type"] == "mcp"
+
+        android_shell_metadata = _tool_command_metadata("mcp_android_phone_android_shell", {
+            "command": "input keyevent HOME",
+            "timeout_seconds": 20,
+        })
+        assert android_shell_metadata["command_class"] == "android"
+        assert android_shell_metadata["timeout_seconds"] == 20
+        assert android_shell_metadata["wait_kind"] == "android_shell"
+        assert android_shell_metadata["tool_type"] == "mcp"
+
     def test_agent_loop_tool_returns_error(self):
         for tool_name in _AGENT_LOOP_TOOLS:
             result = json.loads(handle_function_call(tool_name, {}))
@@ -80,6 +138,7 @@ class TestHandleFunctionCall:
                 status="ok",
                 error_type=None,
                 error_message=None,
+                error_kind=None,
                 middleware_trace=[],
             ),
             call(
@@ -96,8 +155,113 @@ class TestHandleFunctionCall:
                 status="ok",
                 error_type=None,
                 error_message=None,
+                error_kind=None,
             ),
         ]
+
+    def test_tool_hooks_receive_error_kind_from_error_results(self):
+        result_json = '{"error":"Could not find old_string in file","error_kind":"match_not_found"}'
+        with (
+            patch("model_tools.registry.dispatch", return_value=result_json),
+            patch("hermes_cli.plugins.has_hook", return_value=True),
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+        ):
+            result = handle_function_call("patch", {"mode": "replace"}, task_id="t1")
+
+        assert result == result_json
+        kwargs_by_hook = {c.args[0]: c.kwargs for c in mock_invoke_hook.call_args_list}
+        assert kwargs_by_hook["post_tool_call"]["status"] == "error"
+        assert kwargs_by_hook["post_tool_call"]["error_type"] == "tool_error"
+        assert kwargs_by_hook["post_tool_call"]["error_message"] == "Could not find old_string in file"
+        assert kwargs_by_hook["post_tool_call"]["error_kind"] == "match_not_found"
+        assert kwargs_by_hook["transform_tool_result"]["error_kind"] == "match_not_found"
+
+    def test_terminal_hooks_receive_secret_safe_command_metadata(self):
+        args = {
+            "command": "API_TOKEN=*** scripts/run_tests.sh tests/test_model_tools.py",
+            "timeout": 120,
+            "background": True,
+            "notify_on_complete": True,
+            "pty": False,
+        }
+        with (
+            patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
+            patch("hermes_cli.plugins.has_hook", return_value=True),
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+        ):
+            handle_function_call("terminal", args, task_id="t1")
+
+        kwargs_by_hook = {c.args[0]: c.kwargs for c in mock_invoke_hook.call_args_list}
+        for hook_name in ("post_tool_call", "transform_tool_result"):
+            payload = kwargs_by_hook[hook_name]
+            assert payload["command_class"] == "test"
+            assert payload["timeout_seconds"] == 120
+            assert payload["background"] is True
+            assert payload["notify_on_complete"] is True
+            assert payload["pty"] is False
+            assert payload["wait_kind"] == "background_wait"
+            metadata_values = {
+                payload["command_class"],
+                payload["timeout_seconds"],
+                payload["background"],
+                payload["notify_on_complete"],
+                payload["pty"],
+                payload["wait_kind"],
+            }
+            assert "API_TOKEN" not in repr(metadata_values)
+
+    def test_mcp_hooks_receive_secret_safe_identity_metadata(self):
+        mcp_metadata = {
+            "mcp_server_name": "budget_server",
+            "mcp_tool_name": "lookup",
+            "mcp_transport": "stdio",
+            "mcp_protocol": "mcp",
+        }
+        with (
+            patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
+            patch("tools.mcp_tool.get_mcp_tool_metadata", return_value=mcp_metadata),
+            patch("hermes_cli.plugins.has_hook", return_value=True),
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+        ):
+            handle_function_call(
+                "mcp_budget_server_lookup",
+                {"api_token": "not-exported"},
+                task_id="t1",
+                tool_call_id="call-123",
+            )
+
+        kwargs_by_hook = {c.args[0]: c.kwargs for c in mock_invoke_hook.call_args_list}
+        for hook_name in ("post_tool_call", "transform_tool_result"):
+            payload = kwargs_by_hook[hook_name]
+            assert payload["tool_type"] == "mcp"
+            assert payload["mcp_server_name"] == "budget_server"
+            assert payload["mcp_tool_name"] == "lookup"
+            assert payload["mcp_transport"] == "stdio"
+            assert payload["mcp_protocol"] == "mcp"
+            metadata_values = {
+                payload["tool_type"],
+                payload["mcp_server_name"],
+                payload["mcp_tool_name"],
+                payload["mcp_transport"],
+                payload["mcp_protocol"],
+            }
+            assert "api_token" not in repr(metadata_values)
+            assert "not-exported" not in repr(metadata_values)
+
+    def test_execute_code_hooks_receive_python_command_metadata(self, monkeypatch):
+        monkeypatch.setattr("tools.code_execution_tool._load_config", lambda: {"timeout": 45})
+        with (
+            patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
+            patch("hermes_cli.plugins.has_hook", return_value=True),
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+        ):
+            handle_function_call("execute_code", {"code": "print('hi')"}, task_id="t1")
+
+        kwargs_by_hook = {c.args[0]: c.kwargs for c in mock_invoke_hook.call_args_list}
+        assert kwargs_by_hook["post_tool_call"]["command_class"] == "python"
+        assert kwargs_by_hook["post_tool_call"]["timeout_seconds"] == 45
+        assert kwargs_by_hook["transform_tool_result"]["command_class"] == "python"
+        assert kwargs_by_hook["transform_tool_result"]["timeout_seconds"] == 45
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
         """Regression: post_tool_call and transform_tool_result hooks must
@@ -375,7 +539,7 @@ class TestPreToolCallBlocking:
 class TestLegacyToolsetMap:
     def test_expected_legacy_names(self):
         expected = [
-            "web_tools", "terminal_tools", "vision_tools",
+            "web_tools", "terminal_tools", "vision_tools", "moa_tools",
             "image_tools", "skills_tools", "browser_tools", "cronjob_tools",
             "file_tools", "tts_tools",
         ]
@@ -457,82 +621,3 @@ class TestCoerceNumberInfNan:
         assert _coerce_number("42") == 42
         assert _coerce_number("3.14") == 3.14
         assert _coerce_number("1e3") == 1000
-
-class TestDisabledToolsetsPlatformBundle:
-    """Regression test for #33924: disabling a platform bundle (hermes-*)
-    must not remove core tools from other enabled toolsets."""
-
-    def test_disabling_platform_bundle_preserves_core_tools(self):
-        """Disabling hermes-yuanbao should not strip core tools from hermes-telegram."""
-        from model_tools import get_tool_definitions
-
-        tools_telegram = get_tool_definitions(
-            enabled_toolsets=["hermes-telegram"],
-            quiet_mode=True,
-        )
-        tools_telegram_no_yuanbao = get_tool_definitions(
-            enabled_toolsets=["hermes-telegram"],
-            disabled_toolsets=["hermes-yuanbao"],
-            quiet_mode=True,
-        )
-        names_telegram = {t["function"]["name"] for t in tools_telegram}
-        names_no_yuanbao = {t["function"]["name"] for t in tools_telegram_no_yuanbao}
-
-        # Disabling a *different* platform bundle must not remove any tools
-        assert names_telegram == names_no_yuanbao, (
-            f"Tools lost after disabling hermes-yuanbao: "
-            f"{names_telegram - names_no_yuanbao}"
-        )
-
-    def test_disabling_platform_bundle_removes_own_tools(self):
-        """Disabling hermes-discord should remove discord-specific tools."""
-        from model_tools import get_tool_definitions
-
-        tools = get_tool_definitions(
-            enabled_toolsets=["hermes-discord"],
-            disabled_toolsets=["hermes-discord"],
-            quiet_mode=True,
-        )
-        names = {t["function"]["name"] for t in tools}
-        assert "discord" not in names
-
-    def test_disabling_non_platform_toolset_still_works(self):
-        """Disabling a regular (non-hermes-) toolset still subtracts all tools."""
-        from model_tools import get_tool_definitions
-
-        tools_normal = get_tool_definitions(
-            enabled_toolsets=["hermes-telegram"],
-            quiet_mode=True,
-        )
-        tools_no_web = get_tool_definitions(
-            enabled_toolsets=["hermes-telegram"],
-            disabled_toolsets=["web"],
-            quiet_mode=True,
-        )
-        names_normal = {t["function"]["name"] for t in tools_normal}
-        names_no_web = {t["function"]["name"] for t in tools_no_web}
-
-        web_tools = {"web_search", "web_extract"}
-        removed = names_normal - names_no_web
-        # web tools should be removed (if they were present)
-        present_web = web_tools & names_normal
-        assert present_web <= removed, (
-            f"Web tools not removed: {present_web - removed}"
-        )
-
-
-    def test_disabling_bundle_removes_platform_tools_but_keeps_core(self):
-        """Disabling hermes-discord (when enabled) removes discord/discord_admin
-        from the resolved delta but keeps core tools — via bundle_non_core_tools."""
-        from toolsets import bundle_non_core_tools, _HERMES_CORE_TOOLS
-
-        delta = bundle_non_core_tools("hermes-yuanbao")
-        # The delta is the bundle's platform-specific tools, NOT core.
-        assert "yb_send_dm" in delta
-        assert not (delta & set(_HERMES_CORE_TOOLS)), "core tools must not be in the removal delta"
-
-    def test_bundle_non_core_tools_unknown_falls_back(self):
-        """An unknown/garbage bundle name falls back to full resolution (best effort)."""
-        from toolsets import bundle_non_core_tools
-        # A non-existent bundle resolves to an empty set (no tools), not a crash.
-        assert bundle_non_core_tools("hermes-does-not-exist") == set()

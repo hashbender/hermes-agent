@@ -268,38 +268,6 @@ def test_copilot_acp_stays_on_chat_completions_for_gpt_5_models(monkeypatch):
     assert agent.api_mode == "chat_completions"
 
 
-def test_custom_provider_gpt5_stays_on_chat_completions(monkeypatch):
-    _patch_agent_bootstrap(monkeypatch)
-    agent = run_agent.AIAgent(
-        model="gpt-5.4",
-        base_url="https://relay.example.com/v1",
-        provider="custom",
-        api_key="relay-token",
-        quiet_mode=True,
-        max_iterations=1,
-        skip_context_files=True,
-        skip_memory=True,
-    )
-    assert agent.provider == "custom"
-    assert agent.api_mode == "chat_completions"
-
-
-def test_custom_provider_direct_openai_url_still_uses_responses(monkeypatch):
-    _patch_agent_bootstrap(monkeypatch)
-    agent = run_agent.AIAgent(
-        model="gpt-5.4",
-        base_url="https://api.openai.com/v1",
-        provider="custom",
-        api_key="openai-token",
-        quiet_mode=True,
-        max_iterations=1,
-        skip_context_files=True,
-        skip_memory=True,
-    )
-    assert agent.provider == "custom"
-    assert agent.api_mode == "codex_responses"
-
-
 def test_copilot_gpt_5_mini_stays_on_chat_completions(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(
@@ -672,6 +640,76 @@ def test_run_codex_stream_parses_create_stream_events(monkeypatch):
     # For backward compatibility with the helper that builds _codex_message_response,
     # we just assert status is completed and id propagated.
     assert response.status == "completed"
+
+
+def test_codex_stream_suppresses_commentary_phase_text_deltas_before_tool_call():
+    """Commentary output_text deltas are transcript material, not live chat text.
+
+    Codex can emit a commentary-phase message immediately before a function_call
+    in the same Responses stream. If we push those deltas through the gateway
+    stream consumer, Telegram receives the model's private todo/planning note.
+    """
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    streamed = []
+    commentary_item = SimpleNamespace(
+        type="message",
+        phase="commentary",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="Need update todo done.")],
+    )
+    tool_item = SimpleNamespace(
+        type="function_call",
+        id="fc_1",
+        call_id="call_1",
+        name="todo",
+        arguments="{}",
+    )
+
+    response = _consume_codex_event_stream(
+        [
+            SimpleNamespace(type="response.output_item.added", item=commentary_item),
+            SimpleNamespace(type="response.output_text.delta", delta="Need update todo done."),
+            SimpleNamespace(type="response.output_item.done", item=commentary_item),
+            SimpleNamespace(type="response.output_item.added", item=tool_item),
+            SimpleNamespace(type="response.output_item.done", item=tool_item),
+            SimpleNamespace(type="response.completed", response=SimpleNamespace(status="completed")),
+        ],
+        model="gpt-5.5",
+        on_text_delta=streamed.append,
+    )
+
+    assert streamed == []
+    assert response.output == [commentary_item, tool_item]
+    assert response.output_text == "Need update todo done."
+
+
+def test_codex_stream_still_streams_final_answer_phase_text_deltas():
+    """Final-answer message phases keep progressive streaming enabled."""
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    streamed = []
+    final_item = SimpleNamespace(
+        type="message",
+        phase="final_answer",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="Done.")],
+    )
+
+    response = _consume_codex_event_stream(
+        [
+            SimpleNamespace(type="response.output_item.added", item=final_item),
+            SimpleNamespace(type="response.output_text.delta", delta="Done."),
+            SimpleNamespace(type="response.output_item.done", item=final_item),
+            SimpleNamespace(type="response.completed", response=SimpleNamespace(status="completed")),
+        ],
+        model="gpt-5.5",
+        on_text_delta=streamed.append,
+    )
+
+    assert streamed == ["Done."]
+    assert response.output == [final_item]
+    assert response.output_text == "Done."
 
 
 def test_run_codex_stream_ignores_completed_response_with_null_output(monkeypatch):

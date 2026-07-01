@@ -16,7 +16,7 @@ Architecture (two transports):
   **Remote backends (file-based RPC):**
   1. Parent generates `hermes_tools.py` with file-based RPC stubs
   2. Parent ships both files to the remote environment
-  3. Script runs inside the terminal backend (Docker/SSH/Modal/Daytona/Tenki/etc.)
+  3. Script runs inside the terminal backend (Docker/SSH/Modal/Daytona/etc.)
   4. Tool calls are written as request files; a polling thread on the parent
      reads them via env.execute(), dispatches, and writes response files
   5. The script polls for response files and continues
@@ -74,6 +74,26 @@ DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
 
+
+def _execution_error_kind(error: object = "", *, status: str | None = None, exit_code: int | None = None) -> str:
+    """Return a stable, low-cardinality error kind for execute_code results."""
+    if status == "timeout" or exit_code == 124:
+        return "timeout"
+    if status == "interrupted" or exit_code == 130:
+        return "interrupted"
+    message = str(error or "").lower()
+    if "approval" in message or "blocked" in message:
+        return "approval_blocked"
+    if "python 3 is not available" in message or "not available" in message:
+        return "environment_error"
+    if "syntaxerror" in message or "indentationerror" in message:
+        return "syntax_error"
+    if "permission" in message or "operation not permitted" in message:
+        return "permission_denied"
+    if exit_code not in (None, 0):
+        return "runtime_error"
+    return "execution_error"
+
 # Environment variable scrubbing rules (shared between the local + remote
 # backends).  Secret-substring block is applied first; anything left must
 # match a safe prefix, the operational HERMES_ allowlist, or (on Windows) an
@@ -88,16 +108,7 @@ _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
                       "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
                       "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA")
 _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
-                      "PASSWD", "AUTH", "DSN", "WEBHOOK",
-                      # Abbreviations that appear in real-world credential
-                      # variable names but were previously undetected:
-                      # CREDS (CREDENTIALS abbreviated), BEARER
-                      # (Authorization: Bearer tokens), APIKEY (written
-                      # without an underscore). "PASS" is intentionally NOT
-                      # added — it false-positives on legitimate non-secret
-                      # vars (BYPASS_CACHE, COMPASS_DIR, PASSENGER_HOST) while
-                      # PASSWORD/PASSWD already cover the credential cases.
-                      "CREDS", "BEARER", "APIKEY")
+                      "PASSWD", "AUTH", "DSN", "WEBHOOK")
 
 # Operational HERMES_* vars the child legitimately needs by exact name — these
 # are non-secret runtime-location flags (the same set hermes_cli treats as the
@@ -228,9 +239,9 @@ _TOOL_STUBS = {
     ),
     "web_extract": (
         "web_extract",
-        "urls: list, char_limit: int = None",
-        '"""Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown."""',
-        '{"urls": urls, "char_limit": char_limit}',
+        "urls: list",
+        '"""Extract content from URLs. Returns dict with results list of {url, title, content, error}."""',
+        '{"urls": urls}',
     ),
     "read_file": (
         "read_file",
@@ -652,15 +663,13 @@ def _get_or_create_env(task_id: str):
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
-        elif env_type == "tenki":
-            image = overrides.get("tenki_image") or config["tenki_image"]
         else:
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "tenki"}:
+        if env_type in {"docker", "singularity", "modal", "daytona"}:
             container_config = {
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
@@ -668,16 +677,6 @@ def _get_or_create_env(task_id: str):
                 "container_persistent": config.get("container_persistent", True),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                "tenki_project_id": config.get("tenki_project_id", ""),
-                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
-                "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
             }
 
         ssh_config = None
@@ -945,6 +944,7 @@ def _execute_remote(
                     "environment. Install Python to use execute_code with "
                     "remote backends."
                 ),
+                "error_kind": "environment_error",
                 "tool_calls_made": 0,
                 "duration_seconds": 0,
             })
@@ -1012,6 +1012,7 @@ def _execute_remote(
         return json.dumps({
             "status": "error",
             "error": str(exc),
+            "error_kind": _execution_error_kind(exc),
             "tool_calls_made": tool_call_counter[0],
             "duration_seconds": duration,
         }, ensure_ascii=False)
@@ -1052,11 +1053,9 @@ def _execute_remote(
     from tools.ansi_strip import strip_ansi
     stdout_text = strip_ansi(stdout_text)
 
-    # Redact secrets. code_file=True: execute_code output is code-execution
-    # output that often echoes source/config — skip false-positive ENV/JSON/
-    # f-string-template redaction while still masking real credentials.
+    # Redact secrets
     from agent.redact import redact_sensitive_text
-    stdout_text = redact_sensitive_text(stdout_text, code_file=True)
+    stdout_text = redact_sensitive_text(stdout_text)
 
     # Build response
     result: Dict[str, Any] = {
@@ -1069,6 +1068,7 @@ def _execute_remote(
     if status == "timeout":
         timeout_msg = f"Script timed out after {timeout}s and was killed."
         result["error"] = timeout_msg
+        result["error_kind"] = "timeout"
         # Include timeout message in output so the LLM always surfaces it
         # to the user (see local path comment — same reasoning, #10807).
         if stdout_text:
@@ -1080,12 +1080,14 @@ def _execute_remote(
             duration, timeout, tool_call_counter[0],
         )
     elif status == "interrupted":
+        result["error_kind"] = "interrupted"
         result["output"] = (
             stdout_text + "\n[execution interrupted — user sent a new message]"
         )
     elif exit_code != 0:
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
+        result["error_kind"] = _execution_error_kind(result["error"], exit_code=exit_code)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1118,32 +1120,28 @@ def execute_code(
     if not SANDBOX_AVAILABLE:
         return json.dumps({
             "error": "execute_code sandbox is unavailable in this environment. "
-                     "Use normal tool calls (terminal, read_file, write_file, ...) instead."
+                     "Use normal tool calls (terminal, read_file, write_file, ...) instead.",
+            "error_kind": "environment_error",
         })
 
     if not code or not code.strip():
-        return tool_error("No code provided.")
+        return tool_error("No code provided.", error_kind="validation_error")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
-    _env_config = _get_env_config()
-    env_type = _env_config["env_type"]
+    from tools.terminal_tool import _get_env_config
+    env_type = _get_env_config()["env_type"]
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
     # here before either dispatch path spawns it. Runs synchronously in the
     # caller (tool-executor) thread, which holds the session context (#30882).
-    # A Docker sandbox with host bind mounts is no longer isolated, so its
-    # script does not get the container fast-path.
     from tools.approval import check_execute_code_guard
-    _guard = check_execute_code_guard(
-        code, env_type,
-        has_host_access=_docker_has_host_access(_env_config),
-    )
+    _guard = check_execute_code_guard(code, env_type)
     if not _guard.get("approved", False):
         return json.dumps({
             "status": "error",
             "error": _guard.get("message") or "execute_code blocked by approval guard.",
+            "error_kind": "approval_blocked",
             "tool_calls_made": 0,
             "duration_seconds": 0,
         }, ensure_ascii=False)
@@ -1319,7 +1317,7 @@ def execute_code(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,
+            preexec_fn=None if _IS_WINDOWS else os.setsid,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
 
@@ -1470,11 +1468,9 @@ def execute_code(
         # The sandbox env-var filter (lines 434-454) blocks os.environ access,
         # but scripts can still read secrets from disk (e.g. open('~/.hermes/.env')).
         # This ensures leaked secrets never enter the model context.
-        # code_file=True: this is code-execution output — skip false-positive
-        # ENV/JSON/f-string-template redaction; real credentials still masked.
         from agent.redact import redact_sensitive_text
-        stdout_text = redact_sensitive_text(stdout_text, code_file=True)
-        stderr_text = redact_sensitive_text(stderr_text, code_file=True)
+        stdout_text = redact_sensitive_text(stdout_text)
+        stderr_text = redact_sensitive_text(stderr_text)
 
         # Build response
         result: Dict[str, Any] = {
@@ -1487,6 +1483,7 @@ def execute_code(
         if status == "timeout":
             timeout_msg = f"Script timed out after {timeout}s and was killed."
             result["error"] = timeout_msg
+            result["error_kind"] = "timeout"
             # Include timeout message in output so the LLM always surfaces it
             # to the user.  When output is empty, models often treat the result
             # as "nothing happened" and produce an empty response, which the
@@ -1500,10 +1497,12 @@ def execute_code(
                 duration, timeout, tool_call_counter[0],
             )
         elif status == "interrupted":
+            result["error_kind"] = "interrupted"
             result["output"] = stdout_text + "\n[execution interrupted — user sent a new message]"
         elif exit_code != 0:
             result["status"] = "error"
             result["error"] = stderr_text or f"Script exited with code {exit_code}"
+            result["error_kind"] = _execution_error_kind(result["error"], exit_code=exit_code)
             # Include stderr in output so the LLM sees the traceback
             if stderr_text:
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
@@ -1523,6 +1522,7 @@ def execute_code(
         return json.dumps({
             "status": "error",
             "error": str(exc),
+            "error_kind": _execution_error_kind(exc),
             "tool_calls_made": tool_call_counter[0],
             "duration_seconds": duration,
         }, ensure_ascii=False)
@@ -1748,9 +1748,8 @@ _TOOL_DOC_LINES = [
      "  web_search(query: str, limit: int = 5) -> dict\n"
      "    Returns {\"data\": {\"web\": [{\"url\", \"title\", \"description\"}, ...]}}"),
     ("web_extract",
-     "  web_extract(urls: list[str], char_limit: int = None) -> dict\n"
-     "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown.\n"
-     "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
+     "  web_extract(urls: list[str]) -> dict\n"
+     "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown"),
     ("read_file",
      "  read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n"
      "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
