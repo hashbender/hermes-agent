@@ -337,6 +337,7 @@ class TenkiEnvironment(BaseEnvironment):
         _add_supported(kwargs, sig, ("project_id",), self._project_id)
         _add_supported(kwargs, sig, ("base_url", "api_endpoint"), self._api_endpoint)
         _add_supported(kwargs, sig, ("auth_token", "api_key"), self._auth_token)
+        _add_supported(kwargs, sig, ("env",), self._sandbox_env())
         _add_supported(
             kwargs,
             sig,
@@ -355,6 +356,26 @@ class TenkiEnvironment(BaseEnvironment):
         # timeout is set explicitly in _create_client(); readiness uses the
         # SDK's default wait budget.
         return kwargs
+
+    def _sandbox_env(self) -> dict[str, str]:
+        """Environment variables injected into Tenki sandbox processes.
+
+        Hermes uses the resolved token to create the parent sandbox. Forward
+        the same credential into the sandbox so code running there can create
+        child Tenki sandboxes without relying on synced host dotfiles.
+        """
+        env: dict[str, str] = {}
+        if self._auth_token:
+            env["TENKI_AUTH_TOKEN"] = self._auth_token
+            if self._auth_token.startswith("sk-"):
+                env["TENKI_API_KEY"] = self._auth_token
+        if self._api_endpoint:
+            env["TENKI_API_ENDPOINT"] = self._api_endpoint
+        if self._workspace_id:
+            env["TENKI_WORKSPACE_ID"] = self._workspace_id
+        if self._project_id:
+            env["TENKI_PROJECT_ID"] = self._project_id
+        return env
 
     def _create_client(self):
         if self._client is None:
@@ -601,7 +622,7 @@ class TenkiEnvironment(BaseEnvironment):
         timeout: int = 120,
     ) -> tuple[str, int]:
         flag = "-lc" if login else "-c"
-        result = sandbox.exec("bash", flag, command, timeout=timeout)
+        result = sandbox.exec("bash", flag, command, timeout=timeout, env=self._sandbox_env())
         return self._result_to_output(result)
 
     @staticmethod
@@ -631,13 +652,20 @@ class TenkiEnvironment(BaseEnvironment):
         flag = "-lc" if login else "-c"
         start = getattr(self._sandbox, "start", None)
         if not callable(start):
-            kwargs: dict[str, Any] = {"timeout": timeout}
+            kwargs: dict[str, Any] = {"timeout": timeout, "env": self._sandbox_env()}
             if stdin_data is not None:
                 kwargs["input"] = stdin_data
             result = self._sandbox.exec("bash", flag, cmd_string, **kwargs)
             return self._result_to_output(result)
 
-        process = start("bash", flag, cmd_string, timeout=timeout, stdin=stdin_data)
+        process = start(
+            "bash",
+            flag,
+            cmd_string,
+            timeout=timeout,
+            stdin=stdin_data,
+            env=self._sandbox_env(),
+        )
         if process_ref is not None:
             process_ref["process"] = process
         if stdin_data is None:

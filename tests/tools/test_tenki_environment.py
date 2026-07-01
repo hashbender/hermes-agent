@@ -266,6 +266,11 @@ def test_tenki_environment_uses_cli_config_and_terminates_by_default(monkeypatch
     assert kwargs["workspace_id"] == "ws-123"
     assert kwargs["project_id"] == "prj-456"
     assert kwargs["auth_token"] == "cookie:tok-secret"
+    assert kwargs["env"]["TENKI_AUTH_TOKEN"] == "cookie:tok-secret"
+    assert kwargs["env"]["TENKI_API_ENDPOINT"] == "https://api.tenki.test"
+    assert kwargs["env"]["TENKI_WORKSPACE_ID"] == "ws-123"
+    assert kwargs["env"]["TENKI_PROJECT_ID"] == "prj-456"
+    assert "TENKI_API_KEY" not in kwargs["env"]
     assert kwargs["allow_inbound"] is False
     assert kwargs["allow_outbound"] is True
     assert kwargs["cpu_cores"] == 1
@@ -280,9 +285,29 @@ def test_tenki_environment_uses_cli_config_and_terminates_by_default(monkeypatch
     assert exit_code == 0
 
     sandbox = _FakeSandboxFactory.sandboxes[0]
+    assert sandbox.exec_calls[-1][1]["env"]["TENKI_AUTH_TOKEN"] == "cookie:tok-secret"
     env.cleanup()
     assert sandbox.terminated is True
     assert sandbox.paused is False
+
+
+def test_tenki_environment_forwards_api_key_alias_to_sandbox(monkeypatch, tmp_path):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
+    monkeypatch.setenv("TENKI_API_KEY", "sk-test-key")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="api-key")
+
+    kwargs = _FakeSandboxFactory.created_kwargs[0]
+    assert kwargs["auth_token"] == "sk-test-key"
+    assert kwargs["env"]["TENKI_AUTH_TOKEN"] == "sk-test-key"
+    assert kwargs["env"]["TENKI_API_KEY"] == "sk-test-key"
+    env.cleanup()
 
 
 def test_tenki_environment_snapshots_when_persistent(monkeypatch, tmp_path):
@@ -356,6 +381,7 @@ def test_tenki_environment_resumes_existing_persistent_sandbox(monkeypatch, tmp_
     assert existing.resumed is True
     assert existing.waited is True
     assert _FakeSandboxFactory.created_kwargs == []
+    assert existing.exec_calls[-1][1]["env"]["TENKI_AUTH_TOKEN"] == "cookie:tok-secret"
     env.cleanup()
 
 
@@ -639,6 +665,7 @@ def test_tenki_execute_passes_stdin_natively_not_as_heredoc(monkeypatch, tmp_pat
     assert large_stdin not in command
     assert "HERMES_STDIN_" not in command
     assert sandbox.start_calls[-1][1]["stdin"] == large_stdin
+    assert sandbox.start_calls[-1][1]["env"]["TENKI_AUTH_TOKEN"] == "cookie:tok-secret"
     env.cleanup()
 
 
