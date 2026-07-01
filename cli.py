@@ -401,6 +401,17 @@ def load_cli_config() -> Dict[str, Any]:
             "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
             "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
             "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+            "tenki_image": "",
+            "tenki_api_endpoint": "https://api.tenki.cloud",
+            "tenki_workspace_id": "",
+            "tenki_project_id": "",
+            "tenki_name_prefix": "hermes",
+            "tenki_allow_inbound": False,
+            "tenki_allow_outbound": True,
+            "tenki_max_duration": 3600,
+            "tenki_idle_timeout": 0,
+            "tenki_pause_retention": 0,
+            "tenki_sync_hermes_home": False,
             "docker_volumes": [],  # host:container volume mounts for Docker backend
             "docker_mount_cwd_to_workspace": False,  # explicit opt-in only; default off for sandbox isolation
         },
@@ -609,12 +620,23 @@ def load_cli_config() -> Dict[str, Any]:
         "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+        "tenki_image": "TERMINAL_TENKI_IMAGE",
+        "tenki_api_endpoint": "TERMINAL_TENKI_API_ENDPOINT",
+        "tenki_workspace_id": "TERMINAL_TENKI_WORKSPACE_ID",
+        "tenki_project_id": "TERMINAL_TENKI_PROJECT_ID",
+        "tenki_name_prefix": "TERMINAL_TENKI_NAME_PREFIX",
+        "tenki_allow_inbound": "TERMINAL_TENKI_ALLOW_INBOUND",
+        "tenki_allow_outbound": "TERMINAL_TENKI_ALLOW_OUTBOUND",
+        "tenki_max_duration": "TERMINAL_TENKI_MAX_DURATION",
+        "tenki_idle_timeout": "TERMINAL_TENKI_IDLE_TIMEOUT",
+        "tenki_pause_retention": "TERMINAL_TENKI_PAUSE_RETENTION",
+        "tenki_sync_hermes_home": "TERMINAL_TENKI_SYNC_HERMES_HOME",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",
         "ssh_key": "TERMINAL_SSH_KEY",
-        # Container resource config (docker, singularity, modal, daytona -- ignored for local/ssh)
+        # Container resource config (docker, singularity, modal, daytona, tenki -- ignored for local/ssh)
         "container_cpu": "TERMINAL_CONTAINER_CPU",
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
@@ -8485,6 +8507,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_stop_command()
         elif canonical == "agents":
             self._handle_agents_command()
+        elif canonical == "journey":
+            try:
+                import argparse
+                import shlex
+
+                from hermes_cli.journey import register_cli as _register_journey_cli
+
+                parser = argparse.ArgumentParser(prog="/journey", add_help=False)
+                _register_journey_cli(parser)
+                argv = shlex.split(cmd_original.split(None, 1)[1]) if len(cmd_original.split(None, 1)) > 1 else []
+                args = parser.parse_args(argv)
+                args.func(args)
+            except SystemExit:
+                pass
+            except Exception as exc:
+                _cprint(f"  /journey failed: {exc}")
         elif canonical == "background":
             self._handle_background_command(cmd_original)
         elif canonical == "queue":

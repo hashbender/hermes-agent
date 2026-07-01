@@ -412,6 +412,17 @@ def show_status(args):
     elif terminal_env == "daytona":
         daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
         print(f"  Daytona Image: {daytona_image}")
+    elif terminal_env == "tenki":
+        tenki_image = os.getenv("TERMINAL_TENKI_IMAGE", "")
+        tenki_endpoint = os.getenv("TERMINAL_TENKI_API_ENDPOINT", "https://api.tenki.cloud")
+        tenki_workspace = os.getenv("TERMINAL_TENKI_WORKSPACE_ID", "")
+        tenki_project = os.getenv("TERMINAL_TENKI_PROJECT_ID", "")
+        tenki_sync = os.getenv("TERMINAL_TENKI_SYNC_HERMES_HOME", "false").lower() in {"true", "1", "yes"}
+        print(f"  Tenki Image:  {tenki_image or '(Tenki default)'}")
+        print(f"  Endpoint:     {tenki_endpoint}")
+        print(f"  Workspace:    {tenki_workspace or '(from Tenki CLI)'}")
+        print(f"  Project:      {tenki_project or '(from Tenki CLI)'}")
+        print(f"  Sync .hermes: {check_mark(tenki_sync)} {'enabled' if tenki_sync else 'disabled'}")
 
     sudo_password = os.getenv("SUDO_PASSWORD", "")
     print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
