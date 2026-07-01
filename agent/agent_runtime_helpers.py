@@ -249,6 +249,8 @@ def sanitize_tool_call_arguments(
     session_id: str = None,
 ) -> int:
     """Repair corrupted assistant tool-call argument JSON in-place."""
+    from agent.message_sanitization import repair_tool_call_arguments_with_status
+
     log = logger or logging.getLogger(__name__)
     if not isinstance(messages, list):
         return 0
@@ -308,6 +310,7 @@ def sanitize_tool_call_arguments(
             except json.JSONDecodeError:
                 tool_call_id = tool_call.get("id")
                 function_name = function.get("name", "?")
+                repair = repair_tool_call_arguments_with_status(arguments, function_name)
                 preview = arguments[:80]
                 log.warning(
                     "Corrupted tool_call arguments repaired before request "
@@ -318,7 +321,7 @@ def sanitize_tool_call_arguments(
                     function_name,
                     preview,
                 )
-                function["arguments"] = "{}"
+                function["arguments"] = repair.arguments
 
                 existing_tool_msg = None
                 scan_index = message_index + 1
@@ -1442,21 +1445,6 @@ def anthropic_prompt_cache_policy(
     eff_base_url = base_url if base_url is not None else (agent.base_url or "")
     eff_api_mode = api_mode if api_mode is not None else (agent.api_mode or "")
     eff_model = (model if model is not None else agent.model) or ""
-
-    # Global kill switch: prompt_caching.enabled=false disables cache_control
-    # markers on every path (init, /model switch, fallback re-derivation).
-    # Escape hatch for strict Anthropic-compatible proxies that inject their
-    # own markers server-side — stacking ours on top exceeds Anthropic's
-    # 4-breakpoint limit and 400s. Gating here (not just at init) keeps the
-    # switch honored after a model switch or fallback re-evaluates the policy.
-    try:
-        from hermes_cli.config import load_config as _load_pc_cfg
-
-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        if isinstance(_pc_cfg, dict) and _pc_cfg.get("enabled") is False:
-            return False, False
-    except Exception:
-        pass
 
     model_lower = eff_model.lower()
     provider_lower = eff_provider.lower()

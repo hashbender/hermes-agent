@@ -37,7 +37,7 @@ from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
-    _repair_tool_call_arguments,
+    repair_tool_call_arguments_with_status,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
     _sanitize_structure_non_ascii,
@@ -932,10 +932,10 @@ def run_conversation(
                             ),
                         }}
                     except Exception:
-                        tc["function"]["arguments"] = _repair_tool_call_arguments(
+                        tc["function"]["arguments"] = repair_tool_call_arguments_with_status(
                             tc["function"]["arguments"],
                             tc["function"].get("name", "?"),
-                        )
+                        ).arguments
                 new_tcs.append(tc)
             am["tool_calls"] = new_tcs
 
@@ -2034,27 +2034,11 @@ def run_conversation(
                         api_duration, _cache_pct,
                     )
 
-                    # On the MoA path, agent.model/provider are the virtual
-                    # preset name ("closed") and "moa", which have no pricing
-                    # entry — estimating against them returns None and silently
-                    # drops the aggregator's own spend, leaving the session cost
-                    # as advisor-fan-out only (a ~50% undercount when the
-                    # aggregator does the full acting loop). Price the aggregator
-                    # turn at its REAL model/provider, read from the MoA client's
-                    # resolved aggregator slot.
-                    _agg_cost_model = agent.model
-                    _agg_cost_provider = agent.provider
-                    _agg_cost_base_url = agent.base_url
-                    _agg_slot = getattr(_moa_client, "last_aggregator_slot", None) if _moa_client is not None else None
-                    if _agg_slot and _agg_slot.get("model"):
-                        _agg_cost_model = _agg_slot["model"]
-                        _agg_cost_provider = _agg_slot.get("provider") or agent.provider
-                        _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
                     cost_result = estimate_usage_cost(
-                        _agg_cost_model,
+                        agent.model,
                         aggregator_usage,
-                        provider=_agg_cost_provider,
-                        base_url=_agg_cost_base_url,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
                     if cost_result.amount_usd is not None:
@@ -4362,7 +4346,14 @@ def run_conversation(
                     try:
                         json.loads(args)
                     except json.JSONDecodeError as e:
-                        invalid_json_args.append((tc.function.name, str(e)))
+                        repair = repair_tool_call_arguments_with_status(
+                            args,
+                            tc.function.name,
+                        )
+                        if repair.success:
+                            tc.function.arguments = repair.arguments
+                            continue
+                        invalid_json_args.append((tc, str(e)))
                 
                 if invalid_json_args:
                     # Check if the invalid JSON is due to truncation rather
@@ -4373,31 +4364,39 @@ def run_conversation(
                     # (after stripping whitespace) are cut off mid-stream.
                     _truncated = any(
                         not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
-                        for tc in assistant_message.tool_calls
-                        if tc.function.name in {n for n, _ in invalid_json_args}
+                        for tc, _ in invalid_json_args
                     )
                     if _truncated:
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Truncated tool call arguments detected "
-                            f"(finish_reason={finish_reason!r}) — refusing to execute.",
+                            f"(finish_reason={finish_reason!r}) — returning tool error.",
                             force=True,
                         )
                         agent._invalid_json_retries = 0
-                        agent._cleanup_task_resources(effective_task_id)
-                        agent._persist_session(messages, conversation_history)
-                        return {
-                            "final_response": "Response truncated due to output length limit",
-                            "messages": messages,
-                            "api_calls": api_call_count,
-                            "completed": False,
-                            "partial": True,
-                            "error": "Response truncated due to output length limit",
-                        }
+                        recovery_assistant = agent._build_assistant_message(assistant_message, finish_reason)
+                        messages.append(recovery_assistant)
+                        invalid_call_ids = {tc.id for tc, _ in invalid_json_args}
+                        for tc in assistant_message.tool_calls:
+                            if tc.id in invalid_call_ids:
+                                tool_result = (
+                                    "Error: Tool call arguments were truncated due to the "
+                                    "output length limit and could not be repaired. Please "
+                                    "shorten the content or split it into multiple tool calls."
+                                )
+                            else:
+                                tool_result = "Skipped: other tool call in this response had truncated arguments."
+                            messages.append({
+                                "role": "tool",
+                                "name": tc.function.name,
+                                "tool_call_id": tc.id,
+                                "content": tool_result,
+                            })
+                        continue
 
                     # Track retries for invalid JSON arguments
                     agent._invalid_json_retries += 1
 
-                    tool_name, error_msg = invalid_json_args[0]
+                    tool_name, error_msg = invalid_json_args[0][0].function.name, invalid_json_args[0][1]
                     agent._buffer_vprint(f"⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}")
 
                     if agent._invalid_json_retries < 3:
@@ -4415,10 +4414,10 @@ def run_conversation(
                         messages.append(recovery_assistant)
                         
                         # Respond with tool error results for each tool call
-                        invalid_names = {name for name, _ in invalid_json_args}
+                        invalid_call_ids = {tc.id for tc, _ in invalid_json_args}
                         for tc in assistant_message.tool_calls:
-                            if tc.function.name in invalid_names:
-                                err = next(e for n, e in invalid_json_args if n == tc.function.name)
+                            if tc.id in invalid_call_ids:
+                                err = next(e for invalid_tc, e in invalid_json_args if invalid_tc.id == tc.id)
                                 tool_result = (
                                     f"Error: Invalid JSON arguments. {err}. "
                                     f"For tools with no required parameters, use an empty object: {{}}. "
