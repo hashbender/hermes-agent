@@ -337,9 +337,9 @@ def _coding_mode(config: Optional[dict[str, Any]]) -> str:
     """Return the normalized ``agent.coding_context`` mode (auto/focus/on/off)."""
     if config is None:
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config import load_config_readonly
 
-            config = load_config()
+            config = load_config_readonly()
         except Exception:
             config = {}
     raw = ((config or {}).get("agent", {}) or {}).get("coding_context", "auto")
@@ -351,29 +351,6 @@ def _coding_mode(config: Optional[dict[str, Any]]) -> str:
     if mode in {"off", "false", "no", "0", "never"}:
         return "off"
     return "auto"
-
-
-def _coding_instructions(config: Optional[dict[str, Any]]) -> str:
-    """Standing operator instructions for the coding posture (config).
-
-    ``agent.coding_instructions`` — a string or list of strings appended to the
-    coding brief as an extra stable system block, so a user can pin project-wide
-    coding-workflow rules (e.g. "for UI work don't run tsc/lint until I approve;
-    clean the diff before committing") without editing the shipped brief.
-    Cache-safe: resolved once per session into the stable system-prompt tier,
-    like the rest of the posture.
-    """
-    if config is None:
-        try:
-            from hermes_cli.config import load_config
-
-            config = load_config()
-        except Exception:
-            config = {}
-    raw = ((config or {}).get("agent", {}) or {}).get("coding_instructions", "")
-    if isinstance(raw, (list, tuple)):
-        return "\n".join(str(item).strip() for item in raw if str(item).strip())
-    return str(raw or "").strip()
 
 
 def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
@@ -482,9 +459,6 @@ class RuntimeMode:
     # only to steer edit-format guidance toward the model's family — see
     # ``_edit_format_line``. Fixed for the session, so cache-safe.
     model: Optional[str] = None
-    # Standing operator instructions (``agent.coding_instructions``), appended
-    # as an extra stable system block. Empty unless the user configures it.
-    instructions: str = ""
 
     @property
     def kind(self) -> str:
@@ -531,10 +505,6 @@ class RuntimeMode:
         workspace = build_coding_workspace_block(self.cwd)
         if workspace:
             blocks.append(workspace)
-        # Operator instructions ride their own block so the brief (block 0) stays
-        # byte-stable and cache-keyed independently of user config.
-        if self.instructions:
-            blocks.append(f"Operator instructions (from config):\n{self.instructions}")
         return blocks
 
     def compact_skill_categories(self) -> frozenset[str]:
@@ -587,7 +557,6 @@ def resolve_runtime_mode(
         cwd=resolved_cwd,
         config_mode=mode,
         model=model,
-        instructions=_coding_instructions(config),
     )
 
 
