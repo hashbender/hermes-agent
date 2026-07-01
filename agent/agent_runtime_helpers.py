@@ -1184,11 +1184,23 @@ def restore_primary_runtime(agent) -> bool:
         if pool is not None and pool.has_available():
             entry = pool.select()
             if entry is not None:
+                entry_provider = str(getattr(entry, "provider", "") or "").strip().lower()
+                primary_provider = str(rt.get("provider") or "").strip().lower()
+                entry_matches_primary = entry_provider == primary_provider
+                if primary_provider == "custom" and entry_provider.startswith("custom:"):
+                    primary_base_url = str(rt.get("base_url") or "").strip().rstrip("/").lower()
+                    entry_base_url = str(
+                        getattr(entry, "runtime_base_url", None)
+                        or getattr(entry, "base_url", None)
+                        or ""
+                    ).strip().rstrip("/").lower()
+                    entry_matches_primary = bool(primary_base_url and entry_base_url == primary_base_url)
+
                 entry_key = (
                     getattr(entry, "runtime_api_key", None)
                     or getattr(entry, "access_token", "")
                 )
-                if entry_key:
+                if entry_key and entry_matches_primary:
                     # ``_swap_credential`` rebuilds the OpenAI/Anthropic client,
                     # reapplies base-url-scoped headers, and carries the
                     # accumulated base_url / OAuth-detection fixes (#33163).
@@ -1197,6 +1209,14 @@ def restore_primary_runtime(agent) -> bool:
                         "Restore re-selected pool entry %s (%s)",
                         getattr(entry, "id", "?"),
                         getattr(entry, "label", "?"),
+                    )
+                elif entry_key:
+                    logger.info(
+                        "Restore skipped pool entry %s (%s): provider %s does not match primary provider %s",
+                        getattr(entry, "id", "?"),
+                        getattr(entry, "label", "?"),
+                        entry_provider or "?",
+                        primary_provider or "?",
                     )
 
         # ── Reset fallback chain for the new turn ──
@@ -1442,21 +1462,6 @@ def anthropic_prompt_cache_policy(
     eff_base_url = base_url if base_url is not None else (agent.base_url or "")
     eff_api_mode = api_mode if api_mode is not None else (agent.api_mode or "")
     eff_model = (model if model is not None else agent.model) or ""
-
-    # Global kill switch: prompt_caching.enabled=false disables cache_control
-    # markers on every path (init, /model switch, fallback re-derivation).
-    # Escape hatch for strict Anthropic-compatible proxies that inject their
-    # own markers server-side — stacking ours on top exceeds Anthropic's
-    # 4-breakpoint limit and 400s. Gating here (not just at init) keeps the
-    # switch honored after a model switch or fallback re-evaluates the policy.
-    try:
-        from hermes_cli.config import load_config as _load_pc_cfg
-
-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        if isinstance(_pc_cfg, dict) and _pc_cfg.get("enabled") is False:
-            return False, False
-    except Exception:
-        pass
 
     model_lower = eff_model.lower()
     provider_lower = eff_provider.lower()
