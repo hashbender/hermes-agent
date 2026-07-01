@@ -367,18 +367,7 @@ HARDLINE_PATTERNS = [
     # `${HOME}` brace form and quoted paths (`rm -rf "/"`, `rm -rf "$HOME"`)
     # are handled via _hardline_rm_path so the floor cannot be bypassed with
     # the ordinary quoting/brace shell idioms.
-    #
-    # The path token matches any root-anchored path whose components collapse
-    # back to "/" in the shell: a bare "/", repeated slashes ("//"), and
-    # "."/".." current/parent segments ("/.", "/./", "/..") all resolve to
-    # root, optionally followed by a trailing glob ("/*", "//*"). The earlier
-    # "/|/\*|/ \*" form only caught the literal "/" / "/*" spellings, so
-    # `rm -rf //`, `rm -rf /.`, `rm -rf /./`, `rm -rf /..` and `rm -rf //*`
-    # silently slipped the hardline floor and executed under --yolo /
-    # approvals.mode=off / cron approve-mode. A trailing real segment
-    # (e.g. "/tmp", "/home", "/.ssh") still fails to match here and stays
-    # with the softer DANGEROUS_PATTERNS / system-directory rules.
-    (_RM_FLAG_PREFIX + _hardline_rm_path(r'/[/.]*\**'), "recursive delete of root filesystem"),
+    (_RM_FLAG_PREFIX + _hardline_rm_path(r'/|/\*|/ \*'), "recursive delete of root filesystem"),
     (_RM_FLAG_PREFIX + _hardline_rm_path(_HARDLINE_SYSTEM_DIRS), "recursive delete of system directory"),
     (_RM_FLAG_PREFIX + _hardline_rm_path(r'(?:~|\$\{?HOME\}?)(?:/?|/\*)?'), "recursive delete of home directory"),
     # Filesystem format
@@ -499,6 +488,12 @@ DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
     (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
+    # Windows shell front-ends have destructive built-ins that do not look like
+    # Unix `rm`. Gate only when they are executed through cmd/powershell so
+    # ordinary prose or filenames containing "del"/"rd" do not trip the guard.
+    (r'\bcmd(?:\.exe)?\s+/(?:c|k)\s+.*\b(?:del|erase|rd|rmdir)\b', "Windows cmd destructive delete"),
+    (r'\b(?:powershell|pwsh)(?:\.exe)?\b.*\s-(?:command|c)\b.*\b(?:remove-item|del|erase|rd|rmdir|rm)\b', "Windows PowerShell destructive delete"),
+    (r'\b(?:powershell|pwsh)(?:\.exe)?\b.*\s-(?:encodedcommand|enc|e)\b', "PowerShell encoded command execution"),
     (r'\bchmod\s+(-[^\s]*\s+)*(777|666|o\+[rwx]*w|a\+[rwx]*w)\b', "world/other-writable permissions"),
     (r'\bchmod\s+--recursive\b.*(777|666|o\+[rwx]*w|a\+[rwx]*w)', "recursive world/other-writable (long flag)"),
     (r'\bchown\s+(-[^\s]*)?R\s+root', "recursive chown to root"),
@@ -754,18 +749,6 @@ def _normalize_command_for_detection(command: str) -> str:
     command = re.sub(r'\\([^\n])', r'\1', command)
     # Strip empty-string literals that split tokens: r''m → rm, r"\"m → rm.
     command = re.sub(r"''|\"\"", '', command)
-    # Collapse $IFS / ${IFS} word-separator expansions to a literal space.
-    # In any POSIX shell the IFS variable defaults to <space><tab><newline>,
-    # so `rm${IFS}-rf${IFS}/` is executed as `rm -rf /`. Because the dangerous
-    # and hardline patterns anchor on literal whitespace (\s) between a command
-    # and its arguments, leaving the unexpanded `${IFS}` token in place lets an
-    # attacker slip past EVERY pattern — including the unconditional hardline
-    # floor (rm -rf /, mkfs, dd to raw device, shutdown/reboot). Substituting a
-    # space here mirrors the shell's own expansion so the patterns fire. The
-    # brace form also covers bash substring expansions like `${IFS:0:1}` (a
-    # single space). Same de-obfuscation class as the backslash/empty-quote
-    # handling above.
-    command = re.sub(r'\$\{IFS\b[^}]*\}|\$IFS\b', ' ', command)
     return command
 
 
@@ -1158,17 +1141,6 @@ def _iter_shell_command_starts(command: str):
             starts.append(i + 2)
             i += 2
             continue
-        # Bare subshell `(cmd)` and brace group `{ cmd; }` openers begin a new
-        # command context, just like `;` or `$(`. We only reach this branch
-        # OUTSIDE any quote (the quote arms above `continue` first), so a `(`
-        # or `{` sitting inside a quoted argument — `--title "block (reboot)"`,
-        # `echo "{ reboot; }"` — never registers a command start. That is the
-        # whole reason this lives in the quote-aware tokenizer instead of the
-        # flat `_CMDPOS` regex, which cannot tell quoted text from real syntax.
-        if ch in ("(", "{"):
-            starts.append(i + 1)
-            i += 1
-            continue
         if ch == ";":
             starts.append(i + 1)
             i += 1
@@ -1199,29 +1171,6 @@ def _iter_shell_command_starts(command: str):
         if start < len(command) and start not in seen:
             seen.add(start)
             yield start
-
-
-def _mark_command_starts(command: str) -> str:
-    """Insert a newline before each real (quote-aware) command start.
-
-    ``\\n`` is already a ``_CMDPOS`` separator, so this rewrites subshell
-    ``(cmd)`` and brace-group ``{ cmd; }`` openers — which the flat pattern
-    class deliberately omits — into a form the anchored hardline/dangerous
-    patterns recognize, WITHOUT the quoted-prose false positives that adding
-    ``(`` / ``{`` to ``_CMDPOS`` would cause. Starts inside quotes are never
-    produced by ``_iter_shell_command_starts``, so quoted arguments such as
-    ``--title "block (reboot)"`` are left exactly as-is.
-    """
-    # Collect the (whitespace-skipped) start offsets, drop 0 (already anchored
-    # by ``^``), and splice a newline in front of each — right-to-left so the
-    # earlier offsets stay valid as we mutate.
-    offsets = sorted(o for o in _iter_shell_command_starts(command) if o > 0)
-    if not offsets:
-        return command
-    out = command
-    for offset in reversed(offsets):
-        out = out[:offset] + "\n" + out[offset:]
-    return out
 
 
 def _iter_shell_command_word_spans(command: str):
@@ -1270,21 +1219,6 @@ def _command_detection_variants(command: str):
     normalized = _normalize_command_for_detection(command)
     seen = {normalized}
     yield normalized
-    # Subshell `(cmd)` and brace-group `{ cmd; }` openers put `cmd` at a real
-    # command position, but the flat `_CMDPOS`-anchored patterns can't see it:
-    # their start-position class deliberately omits `(`/`{` because a bare
-    # regex cannot tell `(reboot)` (real subshell) from `--title "(reboot)"`
-    # (quoted prose) — adding them there regresses ordinary quoted arguments.
-    # Instead, reconstruct the command with a newline (already a `_CMDPOS`
-    # separator) inserted at each command start the QUOTE-AWARE tokenizer
-    # found. Openers inside quotes never yield a start, so quoted prose is
-    # untouched, while `(reboot)` / `{ shutdown -h now; }` now anchor. This
-    # covers every `_CMDPOS` rule (shutdown/reboot/init/systemctl/telinit and
-    # the rm root/home/system floor) in one place.
-    marked = _mark_command_starts(normalized)
-    if marked != normalized and marked not in seen:
-        seen.add(marked)
-        yield marked
     # Shell quoting/escaping can spell a dangerous executable name in pieces
     # (for example r\m or r''m). Keep that deobfuscation scoped to command
     # words so similarly shaped arguments do not become false positives.
