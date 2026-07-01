@@ -32,7 +32,6 @@ from plugins.platforms.raft.adapter import (
     _on_session_end,
     _on_session_finalize,
     check_raft_requirements,
-    interactive_setup,
     register,
 )
 from gateway.session import build_session_key
@@ -426,33 +425,35 @@ class TestRaftConfig:
         assert _is_connected(PlatformConfig(enabled=True, extra={"enabled": True})) is True
         assert _is_connected(PlatformConfig(enabled=True, extra={})) is False
 
-    def test_interactive_setup_saves_raft_profile(self, monkeypatch, tmp_path, capsys):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.delenv("RAFT_PROFILE", raising=False)
-        monkeypatch.setattr("builtins.input", lambda _prompt: "dev-profile")
+    def test_spawn_bridge_strips_unneeded_hermes_secrets(self, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setenv("RAFT_PROFILE", "my-agent")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret")
+        monkeypatch.setenv("AUXILIARY_VISION_API_KEY", "sk-aux-secret")
+        monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
 
-        interactive_setup()
+        captured = {}
 
-        assert (tmp_path / ".env").read_text(encoding="utf-8") == "RAFT_PROFILE=dev-profile\n"
-        assert os.environ["RAFT_PROFILE"] == "dev-profile"
-        out = capsys.readouterr().out
-        assert "Raft configuration saved" in out
-        assert "hermes gateway restart" in out
+        class DummyProc:
+            pid = 1234
 
-    def test_interactive_setup_keeps_existing_profile_when_not_reconfigured(
-        self, monkeypatch, tmp_path, capsys
-    ):
-        env_path = tmp_path / ".env"
-        env_path.write_text("RAFT_PROFILE=existing\n", encoding="utf-8")
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setenv("RAFT_PROFILE", "existing")
-        monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            return DummyProc()
 
-        interactive_setup()
+        adapter = _make_adapter(bridge_token="bridge-token")
 
-        assert env_path.read_text(encoding="utf-8") == "RAFT_PROFILE=existing\n"
-        assert os.environ["RAFT_PROFILE"] == "existing"
-        assert "Keeping RAFT_PROFILE=existing" in capsys.readouterr().out
+        with patch("plugins.platforms.raft.adapter.shutil.which", return_value="/usr/bin/raft"), \
+             patch("plugins.platforms.raft.adapter.subprocess.Popen", side_effect=fake_popen):
+            adapter._spawn_bridge(4321)
+
+        env = captured["env"]
+        assert env["RAFT_PROFILE"] == "my-agent"
+        assert env["RAFT_CHANNEL_TOKEN"] == "bridge-token"
+        assert "OPENAI_API_KEY" not in env
+        assert "AUXILIARY_VISION_API_KEY" not in env
+        assert "GATEWAY_RELAY_SECRET" not in env
 
     def test_register_calls_register_platform(self):
         registered = {}
@@ -470,7 +471,6 @@ class TestRaftConfig:
         assert registered["name"] == "raft"
         assert registered["label"] == "Raft"
         assert registered["emoji"] == "🔔"
-        assert registered["setup_fn"] is interactive_setup
         assert "profile show" in registered["platform_hint"]
         assert "manual get" in registered["platform_hint"]
         assert "--profile" in registered["platform_hint"]
