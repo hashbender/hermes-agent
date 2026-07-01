@@ -1073,7 +1073,16 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
 
 def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,
                       task_id: str = "", session_id: str = "", tool_call_id: str = "",
-                      turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+                      turn_id: str = "", api_request_id: str = "", status: Optional[str] = None,
+                      error_type: Optional[str] = None, error_kind: Optional[str] = None,
+                      error_message: Optional[str] = None,
+                      command_class: Optional[str] = None,
+                      timeout_seconds: Optional[int] = None,
+                      background: Optional[bool] = None,
+                      notify_on_complete: Optional[bool] = None,
+                      pty: Optional[bool] = None,
+                      wait_kind: Optional[str] = None,
+                      **_: Any) -> None:
     task_key = _trace_key(
         task_id,
         session_id,
@@ -1118,10 +1127,36 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
                             function_payload["output"] = safe_result_value
                         break
 
+    metadata = {"tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)}
+    if status:
+        metadata["status"] = status
+    if error_type:
+        metadata["error_type"] = error_type
+    if error_kind:
+        metadata["error_kind"] = error_kind
+        metadata["hermes.tool.error_kind"] = error_kind
+    if error_message:
+        metadata["error_message"] = error_message
+    command_attrs = {
+        "command_class": command_class,
+        "hermes.tool.command_class": command_class,
+        "timeout_seconds": timeout_seconds,
+        "hermes.tool.timeout_seconds": timeout_seconds,
+        "background": background,
+        "hermes.tool.background": background,
+        "notify_on_complete": notify_on_complete,
+        "hermes.tool.notify_on_complete": notify_on_complete,
+        "pty": pty,
+        "hermes.tool.pty": pty,
+        "wait_kind": wait_kind,
+        "hermes.tool.wait_kind": wait_kind,
+    }
+    metadata.update({k: v for k, v in command_attrs.items() if v is not None})
+
     _end_observation(
         observation,
         output=safe_result_value,
-        metadata={"tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)},
+        metadata=metadata,
     )
 
 

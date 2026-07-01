@@ -27,6 +27,83 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+TELEMETRY_SCHEMA_VERSION = "hermes.observer.v1"
+
+
+def _string_attr(agent, name: str) -> str:
+    value = getattr(agent, name, "")
+    return value if isinstance(value, str) else ""
+
+
+def build_terminal_telemetry(
+    agent,
+    *,
+    completed: bool,
+    interrupted: bool,
+    failed: bool = False,
+    api_call_count: int | None = None,
+    turn_exit_reason: str = "",
+) -> dict[str, object]:
+    """Return normalized terminal-attribution fields for observer hooks."""
+
+    exit_reason = str(turn_exit_reason or "")
+    timeout_kind = _string_attr(agent, "_timeout_kind")
+    if not timeout_kind and (
+        exit_reason == "budget_exhausted"
+        or exit_reason.startswith("error_near_max_iterations")
+        or "max_iterations" in exit_reason
+    ):
+        timeout_kind = "max_turns"
+
+    terminal_status = _string_attr(agent, "_terminal_status")
+    if not terminal_status:
+        if timeout_kind:
+            terminal_status = "timeout"
+        elif interrupted:
+            terminal_status = "interrupted"
+        elif failed:
+            terminal_status = "error"
+        elif completed:
+            terminal_status = "completed"
+        else:
+            terminal_status = "incomplete"
+
+    interrupted_by = _string_attr(agent, "_interrupted_by")
+    if interrupted and not interrupted_by:
+        if timeout_kind.startswith("cron"):
+            interrupted_by = "cron_scheduler"
+        elif getattr(agent, "_interrupt_message", None):
+            interrupted_by = "user"
+        else:
+            interrupted_by = "unknown"
+
+    attrs: dict[str, object] = {
+        "telemetry_schema_version": TELEMETRY_SCHEMA_VERSION,
+        "terminal_status": terminal_status,
+        "turn_exit_reason": exit_reason,
+    }
+    if timeout_kind:
+        attrs["timeout_kind"] = timeout_kind
+    if interrupted_by:
+        attrs["interrupted_by"] = interrupted_by
+    if api_call_count is not None:
+        attrs["api_call_count"] = api_call_count
+
+    max_turns = getattr(agent, "max_iterations", None)
+    if max_turns is not None:
+        attrs["max_turns"] = max_turns
+
+    for attr_name, field_name in (
+        ("_cron_job_id", "cron_job_id"),
+        ("_cron_job_name", "cron_job_name"),
+    ):
+        value = _string_attr(agent, attr_name)
+        if value:
+            attrs[field_name] = value
+
+    return attrs
+
+
 def finalize_turn(
     agent,
     *,
@@ -122,14 +199,13 @@ def finalize_turn(
                 )
 
     # Determine if conversation completed successfully
-    normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (
         final_response is not None
-        and not failed
         and (
             api_call_count < agent.max_iterations
-            or normal_text_response
+            or str(_turn_exit_reason).startswith("text_response")
         )
+        and not failed
     )
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
@@ -166,44 +242,6 @@ def finalize_turn(
     # same empty-response loop again.
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
-
-        # When the turn was interrupted and the last message is a tool
-        # result, append a synthetic assistant message to close the
-        # tool-call sequence. Without this, the session persists a
-        # ``tool → user`` alternation that strict providers (Gemini,
-        # Claude) reject, causing them to hallucinate a continuation of
-        # the user's message on the next turn (#48879).
-        #
-        # ``_drop_trailing_empty_response_scaffolding`` only rewinds the
-        # tool tail when an empty-response scaffolding flag is present; a
-        # clean ``/stop`` interrupt after a successful tool sets no such
-        # flag, so the tool result survives as the tail and we close it
-        # here instead. On an interrupt ``final_response`` is typically
-        # empty, so fall back to an explicit placeholder rather than
-        # persisting an empty-content assistant turn.
-        if interrupted:
-            from agent.message_sanitization import close_interrupted_tool_sequence
-            close_interrupted_tool_sequence(messages, final_response)
-
-        # Some recovery/fallback paths return a real final_response without
-        # adding a closing assistant message to the transcript (e.g. the
-        # partial-stream and prior-turn-content recovery ``break`` sites in
-        # ``conversation_loop``). If persisted as-is, the durable session can
-        # end at a tool/user message even though the caller — and the gateway
-        # platform — already saw a completed assistant response. The next turn
-        # then replays a user-only backlog and the model re-answers every
-        # "unanswered" message. Close the durable turn at the source, at the
-        # single chokepoint every recovery ``break`` flows through, so the
-        # invariant "delivered final_response ⇒ assistant row in transcript"
-        # holds regardless of which path produced it. (#43849 / #44100)
-        if final_response and not interrupted:
-            try:
-                _tail_role = messages[-1].get("role") if messages else None
-            except Exception:
-                _tail_role = None
-            if _tail_role != "assistant":
-                messages.append({"role": "assistant", "content": final_response})
-
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
@@ -308,14 +346,7 @@ def finalize_turn(
                     and len(_stripped) <= 24
                     and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
                 )
-                _is_partial_stream_recovery = (
-                    str(_turn_exit_reason) == "partial_stream_recovery"
-                )
-                if (
-                    _is_empty_terminal
-                    or _is_partial_fragment
-                    or _is_partial_stream_recovery
-                ):
+                if _is_empty_terminal or _is_partial_fragment:
                     _explanation = agent._format_turn_completion_explanation(
                         _turn_exit_reason
                     )
@@ -428,6 +459,15 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    _terminal_telemetry = build_terminal_telemetry(
+        agent,
+        completed=completed,
+        interrupted=interrupted,
+        failed=failed,
+        api_call_count=api_call_count,
+        turn_exit_reason=_turn_exit_reason,
+    )
+    result.update(_terminal_telemetry)
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).
@@ -500,6 +540,7 @@ def finalize_turn(
             interrupted=interrupted,
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            **_terminal_telemetry,
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)

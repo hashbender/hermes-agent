@@ -3,17 +3,16 @@
 Terminal Tool Module
 
 A terminal tool that executes commands in local, Docker, Modal, SSH,
-Singularity, Daytona, and Tenki environments. Supports local execution,
+Singularity, and Daytona environments. Supports local execution,
 containerized backends, and cloud sandboxes, including managed Modal mode.
 
 Supported environments:
 - "local": Execute directly on the host machine (default, fastest)
 - "docker": Execute in Docker containers (isolated, requires Docker)
 - "modal": Execute in Modal cloud sandboxes (direct Modal or managed gateway)
-- "tenki": Execute in Tenki cloud sandboxes
 
 Features:
-- Multiple execution backends (local, docker, modal, tenki, etc.)
+- Multiple execution backends (local, docker, modal)
 - Background task support
 - VM/container lifecycle management
 - Automatic cleanup after inactivity
@@ -258,33 +257,10 @@ from tools.approval import (
 )
 
 
-def _docker_volume_uses_host_path(volume_spec: str) -> bool:
-    """Return True when a docker volume spec bind-mounts a host path."""
-    if not isinstance(volume_spec, str):
-        return False
-
-    vol = volume_spec.strip()
-    return bool(vol) and (
-        vol.startswith(("/", "~", "./", "../")) or
-        (len(vol) >= 3 and vol[1] == ":" and vol[2] in ("/", "\\"))
-    )
-
-
-def _docker_has_host_access(config: Dict[str, Any]) -> bool:
-    """Return True when a Docker sandbox exposes host paths through bind mounts."""
-    if config.get("env_type") != "docker":
-        return False
-    if config.get("host_cwd") and config.get("docker_mount_cwd_to_workspace"):
-        return True
-    return any(_docker_volume_uses_host_path(vol) for vol in config.get("docker_volumes", []))
-
-
-def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  approval_callback=_get_approval_callback())
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -340,43 +316,6 @@ def _handle_sudo_failure(output: str, env_type: str) -> str:
             return output + f"\n\n💡 Tip: To enable sudo over messaging, add SUDO_PASSWORD to {_dhh()}/.env on the agent machine."
     
     return output
-
-
-# sudo -S rejects a bad cached/interactive password with these messages.
-_SUDO_WRONG_PASSWORD_MARKERS = (
-    "sudo: authentication failed",
-    "sudo: incorrect password attempt",
-    "sudo: maximum 3 incorrect authentication attempts",
-    "sudo: 3 incorrect password attempts",
-)
-
-
-def _sudo_wrong_password_failure(output: str) -> bool:
-    """Return True when sudo rejected a piped password."""
-    if not output:
-        return False
-    lowered = output.lower()
-    return any(marker in lowered for marker in _SUDO_WRONG_PASSWORD_MARKERS)
-
-
-def _invalidate_cached_sudo_on_auth_failure(
-    command: str | None, output: str
-) -> bool:
-    """Drop a session-cached sudo password after sudo rejects it.
-
-    Env-configured ``SUDO_PASSWORD`` is left alone — that is an explicit
-    operator choice, not an interactive cache entry.
-    """
-    if "SUDO_PASSWORD" in os.environ:
-        return False
-    if not _sudo_wrong_password_failure(output):
-        return False
-    if _count_real_sudo_invocations(command or "") == 0:
-        return False
-    if not _get_cached_sudo_password():
-        return False
-    _set_cached_sudo_password("")
-    return True
 
 
 def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
@@ -558,16 +497,13 @@ def _read_shell_token(command: str, start: int) -> tuple[str, int]:
     return command[start:i], i
 
 
-def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
-    """Rewrite only real unquoted sudo command words, not plain text mentions.
-
-    Returns the rewritten command and the number of sudo invocations rewritten.
-    """
+def _rewrite_real_sudo_invocations(command: str) -> tuple[str, bool]:
+    """Rewrite only real unquoted sudo command words, not plain text mentions."""
     out: list[str] = []
     i = 0
     n = len(command)
     command_start = True
-    sudo_count = 0
+    found = False
 
     while i < n:
         ch = command[i]
@@ -609,7 +545,7 @@ def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
         token, next_i = _read_shell_token(command, i)
         if command_start and token == "sudo":
             out.append("sudo -S -p ''")
-            sudo_count += 1
+            found = True
         else:
             out.append(token)
 
@@ -619,63 +555,7 @@ def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
             command_start = False
         i = next_i
 
-    return "".join(out), sudo_count
-
-
-def _count_real_sudo_invocations(command: str) -> int:
-    """Return how many real sudo command words appear in *command*.
-
-    Lightweight scan that reuses the same tokeniser as
-    ``_rewrite_real_sudo_invocations`` but skips the string-building, so it
-    is cheap to call from the result-processing path.
-    """
-    count = 0
-    i = 0
-    n = len(command)
-    command_start = True
-
-    while i < n:
-        ch = command[i]
-
-        if ch.isspace():
-            if ch == "\n":
-                command_start = True
-            i += 1
-            continue
-
-        if ch == "#" and command_start:
-            comment_end = command.find("\n", i)
-            if comment_end == -1:
-                break
-            i = comment_end
-            continue
-
-        if command.startswith("&&", i) or command.startswith("||", i) or command.startswith(";;", i):
-            i += 2
-            command_start = True
-            continue
-
-        if ch in ";|&(":
-            i += 1
-            command_start = True
-            continue
-
-        if ch == ")":
-            i += 1
-            command_start = False
-            continue
-
-        token, next_i = _read_shell_token(command, i)
-        if command_start and token == "sudo":
-            count += 1
-
-        if command_start and _looks_like_env_assignment(token):
-            command_start = True
-        else:
-            command_start = False
-        i = next_i
-
-    return count
+    return "".join(out), found
 
 
 def _sudo_nopasswd_works() -> bool:
@@ -893,7 +773,7 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     should prepend sudo_stdin to their stdin_data and pass the merged bytes to
     Popen's stdin pipe.
 
-    Callers that cannot pipe subprocess stdin (modal, daytona, tenki) must embed
+    Callers that cannot pipe subprocess stdin (modal, daytona) must embed
     the password in the command string themselves; see their execute()
     methods for how they handle the non-None sudo_stdin case.
 
@@ -906,8 +786,8 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     """
     if command is None:
         return None, None
-    transformed, sudo_count = _rewrite_real_sudo_invocations(command)
-    if sudo_count == 0:
+    transformed, has_real_sudo = _rewrite_real_sudo_invocations(command)
+    if not has_real_sudo:
         return command, None
 
     has_configured_password = "SUDO_PASSWORD" in os.environ
@@ -936,10 +816,8 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
             _set_cached_sudo_password(sudo_password)
 
     if has_configured_password or sudo_password:
-        # Trailing newline is required: sudo -S reads one line per invocation.
-        # Compound commands (`sudo a && sudo b`) need one password line each.
-        password_line = sudo_password + "\n"
-        return transformed, password_line * sudo_count
+        # Trailing newline is required: sudo -S reads one line for the password.
+        return transformed, sudo_password + "\n"
 
     return command, None
 
@@ -1061,7 +939,7 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 
 
 # Per-task environment overrides registry.
-# Allows environments (e.g., TerminalBench2Env) to specify a custom Docker/Modal/Tenki
+# Allows environments (e.g., TerminalBench2Env) to specify a custom Docker/Modal
 # image for a specific task_id BEFORE the agent loop starts. When the terminal or
 # file tools create a new sandbox for that task_id, they check this registry first
 # and fall back to the TERMINAL_MODAL_IMAGE (etc.) env var if no override is set.
@@ -1080,7 +958,6 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
 
     Supported override keys:
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
-        - tenki_image: str -- Tenki sandbox image/template identifier
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
 
@@ -1148,7 +1025,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
-        "daytona_image", "tenki_image", "env_type",
+        "daytona_image", "env_type",
     })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
@@ -1209,36 +1086,6 @@ def _safe_getcwd() -> str:
         return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
 
 
-# Path prefixes that identify a *host* working directory which cannot exist
-# inside a container sandbox. Covers POSIX user dirs and Windows drive paths
-# (``C:\Users\...`` / ``C:/Users/...``) — the latter is how a Windows host's
-# cwd looks when it leaks toward a Linux container's ``-w`` flag.
-_HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
-
-_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "tenki"})
-
-
-def _is_unusable_container_cwd(cwd: str) -> bool:
-    """Return True if *cwd* is a host/relative path that won't work as the
-    working directory inside a container sandbox.
-
-    A container's cwd must be an absolute path that exists *inside* the
-    sandbox (e.g. ``/workspace`` or ``/root``). A host path (``/home/user``,
-    ``C:\\Users\\me``) or a relative path (``.``, ``src/``) is meaningless to
-    ``docker run -w`` and makes the container fail to start (exit 125).
-    """
-    if not cwd:
-        return False
-    if any(cwd.startswith(p) for p in _HOST_CWD_PREFIXES):
-        return True
-    # Relative paths (".", "src/") can't be a container workdir either. Windows
-    # drive paths are absolute on Windows but os.path.isabs() is False on a
-    # POSIX host, so they're already caught by the prefix check above.
-    if not os.path.isabs(cwd):
-        return True
-    return False
-
-
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -1246,7 +1093,7 @@ def _get_env_config() -> Dict[str, Any]:
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
-    container_backend = env_type in _CONTAINER_BACKENDS
+    container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
     docker_backend = env_type == "docker"
 
     # Docker/container-only env vars may be bridged from config.yaml even when
@@ -1280,8 +1127,6 @@ def _get_env_config() -> Dict[str, Any]:
         default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
-    elif env_type == "tenki":
-        default_cwd = "/home/tenki"
     else:
         default_cwd = "/root"
 
@@ -1293,18 +1138,21 @@ def _get_env_config() -> Dict[str, Any]:
     if cwd:
         cwd = os.path.expanduser(cwd)
     host_cwd = None
+    host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
-            any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
+            any(candidate.startswith(p) for p in host_prefixes)
             or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
         ):
             host_cwd = candidate
             cwd = "/workspace"
-    elif env_type in _CONTAINER_BACKENDS and cwd:
+    elif env_type in {"modal", "docker", "singularity", "daytona"} and cwd:
         # Host paths and relative paths that won't work inside containers
-        if _is_unusable_container_cwd(cwd) and cwd != default_cwd:
+        is_host_path = any(cwd.startswith(p) for p in host_prefixes)
+        is_relative = not os.path.isabs(cwd)  # e.g. "." or "src/"
+        if (is_host_path or is_relative) and cwd != default_cwd:
             logger.info("Ignoring TERMINAL_CWD=%r for %s backend "
                         "(host/relative path won't work in sandbox). Using %r instead.",
                         cwd, env_type, default_cwd)
@@ -1318,17 +1166,6 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
-        "tenki_image": os.getenv("TERMINAL_TENKI_IMAGE", ""),
-        "tenki_api_endpoint": os.getenv("TERMINAL_TENKI_API_ENDPOINT", ""),
-        "tenki_workspace_id": os.getenv("TERMINAL_TENKI_WORKSPACE_ID", ""),
-        "tenki_project_id": os.getenv("TERMINAL_TENKI_PROJECT_ID", ""),
-        "tenki_name_prefix": os.getenv("TERMINAL_TENKI_NAME_PREFIX", "hermes"),
-        "tenki_allow_inbound": os.getenv("TERMINAL_TENKI_ALLOW_INBOUND", "false").lower() in {"true", "1", "yes"},
-        "tenki_allow_outbound": os.getenv("TERMINAL_TENKI_ALLOW_OUTBOUND", "true").lower() in {"true", "1", "yes"},
-        "tenki_max_duration": _parse_env_var("TERMINAL_TENKI_MAX_DURATION", "3600"),
-        "tenki_idle_timeout": _parse_env_var("TERMINAL_TENKI_IDLE_TIMEOUT", "0"),
-        "tenki_pause_retention": _parse_env_var("TERMINAL_TENKI_PAUSE_RETENTION", "0"),
-        "tenki_sync_hermes_home": os.getenv("TERMINAL_TENKI_SYNC_HERMES_HOME", "false").lower() in {"true", "1", "yes"},
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1348,14 +1185,11 @@ def _get_env_config() -> Dict[str, Any]:
         ).lower() in {"true", "1", "yes"},
         "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
         # Container resource config (applies to docker, singularity, modal,
-        # daytona, tenki -- ignored for local/ssh)
+        # daytona -- ignored for local/ssh)
         "container_cpu": container_cpu,
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
-        "container_persistent": os.getenv(
-            "TERMINAL_CONTAINER_PERSISTENT",
-            "false" if env_type == "tenki" else "true",
-        ).lower() in {"true", "1", "yes"},
+        "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
@@ -1398,7 +1232,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "tenki", "ssh"
+            "daytona", "ssh"
         image: Docker/Singularity/Modal image name (ignored for local/ssh)
         cwd: Working directory
         timeout: Default command timeout
@@ -1519,30 +1353,6 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
 
-    elif env_type == "tenki":
-        from tools.environments.tenki import TenkiEnvironment as _TenkiEnvironment
-
-        return _TenkiEnvironment(
-            image=image,
-            cwd=cwd,
-            timeout=timeout,
-            cpu=cpu,
-            memory=memory,
-            disk=disk,
-            persistent_filesystem=persistent,
-            task_id=task_id,
-            api_endpoint=cc.get("tenki_api_endpoint", ""),
-            workspace_id=cc.get("tenki_workspace_id", ""),
-            project_id=cc.get("tenki_project_id", ""),
-            name_prefix=cc.get("tenki_name_prefix", "hermes"),
-            allow_inbound=cc.get("tenki_allow_inbound", False),
-            allow_outbound=cc.get("tenki_allow_outbound", True),
-            max_duration=cc.get("tenki_max_duration", 3600),
-            idle_timeout=cc.get("tenki_idle_timeout", 0),
-            pause_retention=cc.get("tenki_pause_retention", 0),
-            sync_hermes_home=cc.get("tenki_sync_hermes_home", False),
-        )
-
     elif env_type == "ssh":
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
             raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
@@ -1558,7 +1368,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'tenki', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', or 'ssh'"
         )
 
 
@@ -1881,6 +1691,32 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
     return None
 
 
+def _terminal_error_kind(message: object = "", *, exit_code: int | None = None, exit_note: str | None = None) -> str:
+    """Return a stable, low-cardinality error kind for terminal results."""
+    if exit_note:
+        return "expected_nonzero_exit"
+    if exit_code == 124:
+        return "timeout"
+    if exit_code == 130:
+        return "interrupted"
+    message_text = str(message or "").lower()
+    if "timed out" in message_text or "timeout" in message_text:
+        return "timeout"
+    if "approval" in message_text or "blocked" in message_text:
+        return "approval_blocked"
+    if "permission" in message_text or "operation not permitted" in message_text:
+        return "permission_denied"
+    if "not found" in message_text or "no such file" in message_text:
+        return "not_found"
+    if "failed to start background process" in message_text:
+        return "spawn_failed"
+    if "command execution failed" in message_text or "failed to execute command" in message_text:
+        return "execution_error"
+    if exit_code not in (None, 0):
+        return "nonzero_exit"
+    return "execution_error"
+
+
 def _command_requires_pipe_stdin(command: str) -> bool:
     """Return True when PTY mode would break stdin-driven commands.
 
@@ -2035,7 +1871,6 @@ def terminal_tool(
     background: bool = False,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
-    session_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
@@ -2050,7 +1885,6 @@ def terminal_tool(
         background: Whether to run in background (default: False)
         timeout: Command timeout in seconds (default: from config)
         task_id: Unique identifier for environment isolation (optional)
-        session_id: Conversation/session identifier for durable observability
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
@@ -2083,6 +1917,7 @@ def terminal_tool(
                 "output": "",
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
+                "error_kind": "validation_error",
                 "status": "error",
             }, ensure_ascii=False)
 
@@ -2113,31 +1948,10 @@ def terminal_tool(
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
-        elif env_type == "tenki":
-            image = overrides.get("tenki_image") or config["tenki_image"]
         else:
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
-        # A per-task cwd override (registered by the gateway/TUI for workspace
-        # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
-        # config["cwd"] was already sanitized for container backends in
-        # _get_env_config() while the override is raw. On a container backend a
-        # raw host path (e.g. a Windows desktop session's C:\Users\<user>, or a
-        # POSIX /home/<user>) reaches `docker run -w <host-path>` and the
-        # container fails to start (exit 125). Re-apply the same host/relative
-        # path guard to the *resolved* cwd so the override can't bypass it.
-        # Valid in-container override paths (RL/benchmark sandboxes that set
-        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
-        # through untouched.
-        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-            if cwd != config["cwd"]:
-                logger.info(
-                    "Ignoring host/relative cwd override %r for %s backend "
-                    "(won't exist in sandbox). Using %r instead.",
-                    cwd, env_type, config["cwd"],
-                )
-            cwd = config["cwd"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
@@ -2150,6 +1964,7 @@ def terminal_tool(
                     f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
                     f"notify_on_complete=true for long-running commands."
                 ),
+                "error_kind": "validation_error",
             }, ensure_ascii=False)
 
         # Guardrail: long-lived server/watch commands should run as managed
@@ -2161,6 +1976,7 @@ def terminal_tool(
                     "output": "",
                     "exit_code": -1,
                     "error": guidance,
+                    "error_kind": "validation_error",
                     "status": "error",
                 }, ensure_ascii=False)
 
@@ -2223,7 +2039,7 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in _CONTAINER_BACKENDS:
+                        if env_type in {"docker", "singularity", "modal", "daytona"}:
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
@@ -2238,16 +2054,6 @@ def terminal_tool(
                                 "docker_extra_args": config.get("docker_extra_args", []),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                                "tenki_project_id": config.get("tenki_project_id", ""),
-                                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                                "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
-                                "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
                             }
 
                         local_config = None
@@ -2272,6 +2078,7 @@ def terminal_tool(
                             "output": "",
                             "exit_code": -1,
                             "error": f"Terminal tool disabled: environment creation failed ({e})",
+                            "error_kind": "environment_error",
                             "status": "disabled"
                         }, ensure_ascii=False)
 
@@ -2301,6 +2108,7 @@ def terminal_tool(
                         "Run `hermes gateway restart` from a separate shell outside "
                         "the running gateway."
                     ),
+                    "error_kind": "approval_blocked",
                     "status": "error",
                 }, ensure_ascii=False)
 
@@ -2308,10 +2116,7 @@ def terminal_tool(
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
         if not force:
-            approval = _check_all_guards(
-                command, env_type,
-                has_host_access=_docker_has_host_access(config),
-            )
+            approval = _check_all_guards(command, env_type)
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
@@ -2335,6 +2140,7 @@ def terminal_tool(
                     "output": "",
                     "exit_code": -1,
                     "error": approval.get("message", fallback_msg),
+                    "error_kind": "approval_blocked",
                     "status": "blocked"
                 }, ensure_ascii=False)
             # Track whether approval was explicitly granted by the user
@@ -2355,6 +2161,7 @@ def terminal_tool(
                     "output": "",
                     "exit_code": -1,
                     "error": workdir_error,
+                    "error_kind": "validation_error",
                     "status": "blocked"
                 }, ensure_ascii=False)
 
@@ -2370,27 +2177,14 @@ def terminal_tool(
                 "EOF."
             )
 
-        # Claim the (shared "default") terminal env for the session driving this
-        # command. File tools read env.cwd_owner to decide whether the env's live
-        # cwd is THIS session's `cd` or a different worktree session's — without
-        # it, two open worktree sessions sharing the env route each other's edits
-        # to the wrong checkout. get_current_session_key()'s contextvar doesn't
-        # cross tool-worker threads, so fall back to the raw task_id (which IS the
-        # session_key for the top-level agent) — a stable, thread-safe anchor.
-        from tools.approval import get_current_session_key
-
-        session_key = get_current_session_key(default="") or (task_id or "")
-        try:
-            env.cwd_owner = session_key
-        except Exception:
-            pass
-
         if background:
             # Spawn a tracked background process via the process registry.
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
+            from tools.approval import get_current_session_key
             from tools.process_registry import process_registry
 
+            session_key = get_current_session_key(default="")
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 env=env,
@@ -2624,28 +2418,28 @@ def terminal_tool(
 
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
+                error_message = f"Failed to start background process: {str(e)}"
                 return json.dumps({
                     "output": "",
                     "exit_code": -1,
-                    "error": f"Failed to start background process: {str(e)}"
+                    "error": error_message,
+                    "error_kind": _terminal_error_kind(error_message, exit_code=-1),
                 }, ensure_ascii=False)
         else:
             # Run foreground command with retry logic
             max_retries = 3
             retry_count = 0
             result = None
-            command_cwd = None
             
             while retry_count <= max_retries:
                 try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        env=env,
-                        default_cwd=cwd,
-                    )
                     execute_kwargs = {
                         "timeout": effective_timeout,
-                        "cwd": command_cwd,
+                        "cwd": _resolve_command_cwd(
+                            workdir=workdir,
+                            env=env,
+                            default_cwd=cwd,
+                        ),
                     }
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
@@ -2654,7 +2448,8 @@ def terminal_tool(
                         return json.dumps({
                             "output": "",
                             "exit_code": 124,
-                            "error": f"Command timed out after {effective_timeout} seconds"
+                            "error": f"Command timed out after {effective_timeout} seconds",
+                            "error_kind": "timeout",
                         }, ensure_ascii=False)
                     
                     # Retry on transient errors
@@ -2668,10 +2463,12 @@ def terminal_tool(
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                  max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                    error_message = f"Command execution failed: {type(e).__name__}: {str(e)}"
                     return json.dumps({
                         "output": "",
                         "exit_code": -1,
-                        "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
+                        "error": error_message,
+                        "error_kind": _terminal_error_kind(error_message, exit_code=-1),
                     }, ensure_ascii=False)
                 
                 # Got a result
@@ -2683,19 +2480,6 @@ def terminal_tool(
 
             # Add helpful message for sudo failures in messaging context
             output = _handle_sudo_failure(output, env_type)
-
-            sudo_auth_failed = _sudo_wrong_password_failure(output)
-            sudo_cache_cleared = _invalidate_cached_sudo_on_auth_failure(
-                command, output
-            )
-            if sudo_cache_cleared:
-                has_sudo_prompt_callback = _get_sudo_password_callback() is not None
-                if has_sudo_prompt_callback or env_var_enabled("HERMES_INTERACTIVE"):
-                    output += (
-                        "\n\n⚠️ Sudo authentication failed — cached password "
-                        "cleared. You will be prompted again on the next sudo "
-                        "command."
-                    )
 
             # Foreground terminal output canonicalization seam: plugins receive
             # the full output string before default truncation and may only
@@ -2736,17 +2520,9 @@ def terminal_tool(
             from tools.ansi_strip import strip_ansi
             output = strip_ansi(output)
 
-            # Redact secrets from command output. For source/config dumps
-            # (MAX_TOKENS=100, "apiKey": "x" fixtures, postgresql:// f-string
-            # templates) the ENV/JSON/template passes are skipped to avoid
-            # false positives (code_file=True). But for env-dump commands
-            # (env/printenv/set/export/declare) the output IS a KEY=value
-            # credential dump, so redact_terminal_output runs the ENV pass
-            # (code_file=False) to mask opaque tokens with no vendor prefix.
-            # Real prefixes, auth headers, JWTs, private keys are masked in
-            # both modes. See issue #43025.
-            from agent.redact import redact_terminal_output
-            output = redact_terminal_output(output.strip(), command) if output else ""
+            # Redact secrets from command output (catches env/printenv leaking keys)
+            from agent.redact import redact_sensitive_text
+            output = redact_sensitive_text(output.strip()) if output else ""
 
             # Interpret non-zero exit codes that aren't real errors
             # (e.g. grep=1 means "no matches", diff=1 means "files differ")
@@ -2757,33 +2533,12 @@ def terminal_tool(
                 "exit_code": returncode,
                 "error": None,
             }
-            try:
-                from agent.verification_evidence import record_terminal_result
-
-                evidence = record_terminal_result(
-                    command=command,
-                    cwd=command_cwd,
-                    session_id=session_id or task_id or effective_task_id or "default",
-                    exit_code=returncode,
-                    output=output,
-                )
-                if evidence:
-                    result_dict["verification_evidence"] = {
-                        "status": evidence.get("status"),
-                        "kind": evidence.get("kind"),
-                        "scope": evidence.get("scope"),
-                        "canonical_command": evidence.get("canonical_command"),
-                    }
-            except Exception:
-                logger.debug("verification evidence recording failed", exc_info=True)
             if approval_note:
                 result_dict["approval"] = approval_note
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
-            if sudo_auth_failed:
-                result_dict["sudo_auth_failed"] = True
-            if sudo_cache_cleared:
-                result_dict["sudo_cache_cleared"] = True
+            if returncode != 0:
+                result_dict["error_kind"] = _terminal_error_kind(output, exit_code=returncode, exit_note=exit_note)
 
             return json.dumps(result_dict, ensure_ascii=False)
 
@@ -2791,10 +2546,12 @@ def terminal_tool(
         import traceback
         tb_str = traceback.format_exc()
         logger.error("terminal_tool exception:\n%s", tb_str)
+        error_message = f"Failed to execute command: {str(e)}"
         return json.dumps({
             "output": "",
             "exit_code": -1,
-            "error": f"Failed to execute command: {str(e)}",
+            "error": error_message,
+            "error_kind": _terminal_error_kind(error_message, exit_code=-1),
             "traceback": tb_str,
             "status": "error"
         }, ensure_ascii=False)
@@ -2898,42 +2655,10 @@ def check_terminal_requirements() -> bool:
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
-        elif env_type == "tenki":
-            if importlib.util.find_spec("tenki_sandbox") is None:
-                try:
-                    from tools.lazy_deps import ensure as _lazy_ensure
-
-                    _lazy_ensure("terminal.tenki", prompt=False)
-                    importlib.invalidate_caches()
-                except Exception as exc:
-                    logger.error(
-                        "tenki-sandbox is required for Tenki terminal backend: "
-                        "pip install tenki-sandbox==0.1.1 (%s)",
-                        exc,
-                    )
-                    return False
-                if importlib.util.find_spec("tenki_sandbox") is None:
-                    logger.error(
-                        "tenki-sandbox is required for Tenki terminal backend: "
-                        "pip install tenki-sandbox==0.1.1"
-                    )
-                    return False
-            try:
-                from tools.tenki_config import has_tenki_auth
-            except Exception:
-                has_tenki_auth = lambda: False  # noqa: E731
-            if not has_tenki_auth():
-                logger.error(
-                    "Tenki backend selected but no Tenki auth was found. Run `tenki login` "
-                    "or set TENKI_AUTH_TOKEN/TENKI_API_KEY."
-                )
-                return False
-            return True
-
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, tenki, ssh.",
+                "modal, daytona, ssh.",
                 env_type,
             )
             return False
@@ -2952,7 +2677,6 @@ if __name__ == "__main__":
     print(f"  Environment type: {config['env_type']}")
     print(f"  Docker image: {config['docker_image']}")
     print(f"  Modal image: {config['modal_image']}")
-    print(f"  Tenki image: {config['tenki_image'] or '(Tenki default)'}")
     print(f"  Working directory: {config['cwd']}")
     print(f"  Default timeout: {config['timeout']}s")
     print(f"  Lifetime: {config['lifetime_seconds']}s")
@@ -2977,13 +2701,12 @@ if __name__ == "__main__":
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
-        "(local/docker/singularity/modal/daytona/tenki/ssh)"
+        "(local/docker/singularity/modal/daytona/ssh)"
     )
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
     print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
     print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
-    print(f"  TERMINAL_TENKI_IMAGE: {os.getenv('TERMINAL_TENKI_IMAGE', '(Tenki default)')}")
     print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', _safe_getcwd())}")
     from hermes_constants import display_hermes_home as _dhh
     print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
@@ -3047,7 +2770,6 @@ def _handle_terminal(args, **kw):
         background=args.get("background", False),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
-        session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),

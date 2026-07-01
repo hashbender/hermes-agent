@@ -23,6 +23,7 @@ Public API (signatures preserved from the original 2,400-line version):
 import os
 import json
 import re
+import shlex
 import asyncio
 import logging
 import threading
@@ -33,10 +34,6 @@ from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
-
-# Tracks platform-bundle names already flagged in disabled_toolsets so the
-# advisory (#33924) is logged once per name, not on every tool recompute.
-_WARNED_DISABLED_BUNDLES: set = set()
 
 
 # =============================================================================
@@ -144,11 +141,7 @@ def _run_async(coro):
                 worker_loop.close()
 
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        # Carry the active profile + approval/sudo callbacks into the worker so
-        # async tools resolve get_hermes_home() under the active profile.
-        from tools.thread_context import propagate_context_to_thread
-
-        future = pool.submit(propagate_context_to_thread(_run_in_worker))
+        future = pool.submit(_run_in_worker)
         try:
             return future.result(timeout=300)
         except concurrent.futures.TimeoutError:
@@ -229,6 +222,7 @@ _LEGACY_TOOLSET_MAP = {
     "web_tools": ["web_search", "web_extract"],
     "terminal_tools": ["terminal"],
     "vision_tools": ["vision_analyze"],
+    "moa_tools": ["mixture_of_agents"],
     "image_tools": ["image_generate"],
     "skills_tools": ["skills_list", "skill_view", "skill_manage"],
     "browser_tools": [
@@ -399,29 +393,8 @@ def _compute_tool_definitions(
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
             if validate_toolset(toolset_name):
-                if toolset_name.startswith("hermes-"):
-                    # Platform bundles (hermes-*) include _HERMES_CORE_TOOLS, so
-                    # subtracting the whole bundle would strip core tools shared
-                    # by other enabled toolsets and empty the tool list (#33924).
-                    # Subtract only the bundle's non-core delta; keep core.
-                    from toolsets import bundle_non_core_tools
-                    to_remove = bundle_non_core_tools(toolset_name)
-                    tools_to_include.difference_update(to_remove)
-                    resolved = sorted(to_remove)
-                    if not quiet_mode and toolset_name not in _WARNED_DISABLED_BUNDLES:
-                        _WARNED_DISABLED_BUNDLES.add(toolset_name)
-                        logger.info(
-                            "agent.disabled_toolsets contains platform-bundle "
-                            "name '%s'; core tools are preserved and only its "
-                            "platform-specific tools (%s) are removed. Bundle "
-                            "names usually belong in `toolsets:`, not "
-                            "`disabled_toolsets` (#33924).",
-                            toolset_name,
-                            ", ".join(resolved) if resolved else "none",
-                        )
-                else:
-                    resolved = resolve_toolset(toolset_name)
-                    tools_to_include.difference_update(resolved)
+                resolved = resolve_toolset(toolset_name)
+                tools_to_include.difference_update(resolved)
                 if not quiet_mode:
                     print(f"🚫 Disabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")
             elif toolset_name in _LEGACY_TOOLSET_MAP:
@@ -840,14 +813,177 @@ def _coerce_boolean(value: str):
     return value
 
 
-def _tool_result_observer_fields(result: Any) -> tuple[str, Optional[str], Optional[str]]:
+def _tool_result_observer_fields(result: Any) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
     try:
         parsed_result = json.loads(result) if isinstance(result, str) else result
         if isinstance(parsed_result, dict) and parsed_result.get("error"):
-            return "error", "tool_error", str(parsed_result.get("error"))
+            error_kind = parsed_result.get("error_kind")
+            if error_kind is not None:
+                error_kind = str(error_kind)
+            return "error", "tool_error", str(parsed_result.get("error")), error_kind
+        if isinstance(parsed_result, dict) and parsed_result.get("error_kind"):
+            return "ok", None, None, str(parsed_result.get("error_kind"))
     except Exception:
         pass
-    return "ok", None, None
+    return "ok", None, None, None
+
+
+def _shell_command_class(command: Any) -> str:
+    """Return a low-cardinality, secret-safe class for a shell command."""
+    if not isinstance(command, str) or not command.strip():
+        return "unknown"
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = command.strip().split()
+    while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+        tokens.pop(0)
+    if not tokens:
+        return "unknown"
+
+    executable = os.path.basename(tokens[0])
+    subcommand = tokens[1] if len(tokens) > 1 else ""
+
+    if executable == "python" or re.match(r"^python\d+(?:\.\d+)?$", executable):
+        if subcommand == "-m" and len(tokens) > 2 and tokens[2] in {"pytest", "unittest", "tox"}:
+            return "test"
+        return "python"
+    if executable in {"pytest", "tox", "nox"} or executable.startswith("run_tests"):
+        return "test"
+    if executable in {"npm", "pnpm", "yarn"} and subcommand in {"test", "vitest", "jest"}:
+        return "test"
+    if executable == "cargo" and subcommand == "test":
+        return "test"
+    if executable in {"npm", "pnpm", "yarn"} and subcommand in {"build", "compile"}:
+        return "build"
+    if executable == "cargo" and subcommand in {"build", "check", "clippy"}:
+        return "build"
+    if executable in {"make", "cmake", "ninja", "tsc", "vite", "webpack", "rollup"}:
+        return "build"
+    if executable == "git":
+        return "git"
+    if executable in {"pip", "pip3", "uv", "poetry", "npm", "pnpm", "yarn", "bun"}:
+        return "package_manager"
+    if executable in {"curl", "wget", "ssh", "scp", "rsync"}:
+        return "network"
+    if executable in {"sleep", "wait"}:
+        return "wait"
+    if executable in {"ls", "pwd", "find", "grep", "rg", "cat", "head", "tail", "stat"}:
+        return "filesystem"
+    if subcommand in {"run", "serve", "server", "dev"}:
+        return "server"
+    return "unknown"
+
+
+def _tool_wait_kind(function_name: str, function_args: Dict[str, Any], command_class: Optional[str] = None) -> Optional[str]:
+    """Return a low-cardinality class for intentional tool waits."""
+    if function_name == "terminal":
+        if bool(function_args.get("background", False)):
+            return "background_wait"
+        if command_class == "server":
+            return "server_watch"
+        if command_class == "wait":
+            return "sleep_wait"
+        if command_class in {"build", "test", "package_manager"}:
+            return "foreground_build"
+        return None
+    if function_name == "process":
+        action = str(function_args.get("action") or "").strip().lower()
+        if action == "wait":
+            return "background_wait"
+        if action in {"poll", "log", "list"}:
+            return "poll"
+        return None
+    if function_name == "browser_navigate":
+        return "browser_navigation"
+    if function_name in {"browser_snapshot", "browser_vision"}:
+        return "browser_render_wait"
+    if function_name == "mcp_android_phone_android_wait":
+        return "android_wait"
+    if function_name == "mcp_android_phone_android_shell":
+        return "android_shell"
+    return None
+
+
+def _tool_command_metadata(function_name: str, function_args: Dict[str, Any]) -> Dict[str, Any]:
+    """Build secret-safe execution metadata for command-like tools."""
+    if function_name == "terminal":
+        command_class = _shell_command_class(function_args.get("command"))
+        metadata: Dict[str, Any] = {"command_class": command_class}
+        timeout = function_args.get("timeout")
+        if timeout is None:
+            try:
+                from tools.terminal_tool import _get_env_config
+
+                timeout = _get_env_config().get("timeout")
+            except Exception:
+                timeout = None
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            metadata["timeout_seconds"] = int(timeout)
+        for key in ("background", "notify_on_complete", "pty"):
+            metadata[key] = bool(function_args.get(key, False))
+        wait_kind = _tool_wait_kind(function_name, function_args, command_class)
+        if wait_kind:
+            metadata["wait_kind"] = wait_kind
+        return metadata
+    if function_name == "execute_code":
+        metadata = {"command_class": "python"}
+        try:
+            from tools.code_execution_tool import DEFAULT_TIMEOUT, _load_config
+
+            timeout = _load_config().get("timeout", DEFAULT_TIMEOUT)
+        except Exception:
+            timeout = None
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            metadata["timeout_seconds"] = int(timeout)
+        return metadata
+    if function_name == "process":
+        metadata = {"command_class": "process"}
+        timeout = function_args.get("timeout")
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            metadata["timeout_seconds"] = int(timeout)
+        wait_kind = _tool_wait_kind(function_name, function_args, "process")
+        if wait_kind:
+            metadata["wait_kind"] = wait_kind
+        return metadata
+    if function_name.startswith("browser_"):
+        metadata = {"command_class": "browser"}
+        wait_kind = _tool_wait_kind(function_name, function_args, "browser")
+        if wait_kind:
+            metadata["wait_kind"] = wait_kind
+        return metadata
+    if function_name.startswith("mcp_android_phone_android_"):
+        metadata = {"command_class": "android"}
+        if function_name == "mcp_android_phone_android_wait":
+            timeout = function_args.get("seconds")
+        else:
+            timeout = function_args.get("timeout_seconds")
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            metadata["timeout_seconds"] = int(timeout)
+        wait_kind = _tool_wait_kind(function_name, function_args, "android")
+        if wait_kind:
+            metadata["wait_kind"] = wait_kind
+        try:
+            from tools.mcp_tool import get_mcp_tool_metadata
+
+            mcp_metadata = get_mcp_tool_metadata(function_name)
+        except Exception:
+            mcp_metadata = {}
+        if mcp_metadata:
+            metadata.update(mcp_metadata)
+        metadata["tool_type"] = "mcp"
+        return metadata
+    if function_name.startswith("mcp_"):
+        try:
+            from tools.mcp_tool import get_mcp_tool_metadata
+
+            metadata = get_mcp_tool_metadata(function_name)
+        except Exception:
+            metadata = {}
+        if metadata:
+            metadata["tool_type"] = "mcp"
+        return metadata
+    return {}
 
 
 def _emit_post_tool_call_hook(
@@ -864,6 +1000,8 @@ def _emit_post_tool_call_hook(
     status: Optional[str] = None,
     error_type: Optional[str] = None,
     error_message: Optional[str] = None,
+    error_kind: Optional[str] = None,
+    command_metadata: Optional[Dict[str, Any]] = None,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Emit the ``post_tool_call`` observer hook.
@@ -880,23 +1018,25 @@ def _emit_post_tool_call_hook(
         if not has_hook("post_tool_call"):
             return
         if status is None:
-            status, error_type, error_message = _tool_result_observer_fields(result)
-        invoke_hook(
-            "post_tool_call",
-            tool_name=function_name,
-            args=function_args,
-            result=result,
-            task_id=task_id or "",
-            session_id=session_id or "",
-            tool_call_id=tool_call_id or "",
-            turn_id=turn_id or "",
-            api_request_id=api_request_id or "",
-            duration_ms=duration_ms,
-            status=status,
-            error_type=error_type,
-            error_message=error_message,
-            middleware_trace=list(middleware_trace or []),
-        )
+            status, error_type, error_message, error_kind = _tool_result_observer_fields(result)
+        payload = {
+            "tool_name": function_name,
+            "args": function_args,
+            "result": result,
+            "task_id": task_id or "",
+            "session_id": session_id or "",
+            "tool_call_id": tool_call_id or "",
+            "turn_id": turn_id or "",
+            "api_request_id": api_request_id or "",
+            "duration_ms": duration_ms,
+            "status": status,
+            "error_type": error_type,
+            "error_message": error_message,
+            "error_kind": error_kind,
+            "middleware_trace": list(middleware_trace or []),
+        }
+        payload.update(command_metadata or {})
+        invoke_hook("post_tool_call", **payload)
     except Exception as _hook_err:
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
@@ -1144,6 +1284,10 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        function_name=function_name,
                         enabled_tools=sandbox_enabled,
                     )
             else:
@@ -1152,6 +1296,10 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        function_name=function_name,
                         user_task=user_task,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
@@ -1174,6 +1322,7 @@ def handle_function_call(
                 except Exception:
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+        _command_metadata = _tool_command_metadata(function_name, function_args)
 
         _emit_post_tool_call_hook(
             function_name=function_name,
@@ -1185,6 +1334,7 @@ def handle_function_call(
             turn_id=turn_id,
             api_request_id=api_request_id,
             duration_ms=duration_ms,
+            command_metadata=_command_metadata,
             middleware_trace=list(_tool_middleware_trace),
         )
 
@@ -1199,22 +1349,24 @@ def handle_function_call(
         try:
             from hermes_cli.plugins import has_hook, invoke_hook
             if has_hook("transform_tool_result"):
-                status, error_type, error_message = _tool_result_observer_fields(result)
-                hook_results = invoke_hook(
-                    "transform_tool_result",
-                    tool_name=function_name,
-                    args=function_args,
-                    result=result,
-                    task_id=task_id or "",
-                    session_id=session_id or "",
-                    tool_call_id=tool_call_id or "",
-                    turn_id=turn_id or "",
-                    api_request_id=api_request_id or "",
-                    duration_ms=duration_ms,
-                    status=status,
-                    error_type=error_type,
-                    error_message=error_message,
-                )
+                status, error_type, error_message, error_kind = _tool_result_observer_fields(result)
+                payload = {
+                    "tool_name": function_name,
+                    "args": function_args,
+                    "result": result,
+                    "task_id": task_id or "",
+                    "session_id": session_id or "",
+                    "tool_call_id": tool_call_id or "",
+                    "turn_id": turn_id or "",
+                    "api_request_id": api_request_id or "",
+                    "duration_ms": duration_ms,
+                    "status": status,
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "error_kind": error_kind,
+                }
+                payload.update(_command_metadata)
+                hook_results = invoke_hook("transform_tool_result", **payload)
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
                         result = hook_result

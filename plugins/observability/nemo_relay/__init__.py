@@ -563,10 +563,30 @@ def on_post_tool_call(**kwargs: Any) -> None:
         if span is None:
             runtime.mark("hermes.tool.response.unmatched", kwargs)
             return
+        data = {
+            "status": kwargs.get("status"),
+            "duration_ms": kwargs.get("duration_ms"),
+            "command_class": kwargs.get("command_class"),
+            "hermes.tool.command_class": kwargs.get("command_class"),
+            "timeout_seconds": kwargs.get("timeout_seconds"),
+            "hermes.tool.timeout_seconds": kwargs.get("timeout_seconds"),
+            "background": kwargs.get("background"),
+            "hermes.tool.background": kwargs.get("background"),
+            "notify_on_complete": kwargs.get("notify_on_complete"),
+            "hermes.tool.notify_on_complete": kwargs.get("notify_on_complete"),
+            "pty": kwargs.get("pty"),
+            "hermes.tool.pty": kwargs.get("pty"),
+            "wait_kind": kwargs.get("wait_kind"),
+            "hermes.tool.wait_kind": kwargs.get("wait_kind"),
+            "error_type": kwargs.get("error_type"),
+            "error_kind": kwargs.get("error_kind"),
+            "hermes.tool.error_kind": kwargs.get("error_kind"),
+            "error_message": kwargs.get("error_message"),
+        }
         runtime.nemo_relay.tools.call_end(
             span,
             _jsonable(kwargs.get("result")),
-            data=_jsonable({"status": kwargs.get("status"), "duration_ms": kwargs.get("duration_ms")}),
+            data=_jsonable({k: v for k, v in data.items() if v is not None}),
             metadata=_metadata(kwargs),
         )
 
