@@ -26,6 +26,11 @@ from hermes_constants import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
+from agent.personality import (
+    PersonalityNotFoundError,
+    is_personality_clear_request,
+    resolve_personality,
+)
 from agent.replay_cleanup import sanitize_replay_history
 from tui_gateway import git_probe
 from tui_gateway.transport import (
@@ -201,12 +206,9 @@ _LONG_HANDLERS = frozenset(
         # round-trips per call — so it must never block the reader thread.
         "pet.generate",
         "pet.hatch",
-        "pet.info",
         "pet.select",
         "pet.thumb",
-        "learning.frames",
         "plugins.manage",
-        "process.list",
         "projects.discover_repos",
         "projects.record_repos",
         "projects.for_cwd",
@@ -214,7 +216,6 @@ _LONG_HANDLERS = frozenset(
         "projects.project_sessions",
         "session.branch",
         "session.compress",
-        "session.list",
         "session.resume",
         "shell.exec",
         "skills.manage",
@@ -224,7 +225,7 @@ _LONG_HANDLERS = frozenset(
 
 try:
     _rpc_pool_workers = max(
-        2, int(os.environ.get("HERMES_TUI_RPC_POOL_WORKERS") or "8")
+        2, int(os.environ.get("HERMES_TUI_RPC_POOL_WORKERS") or "4")
     )
 except (ValueError, TypeError):
     _rpc_pool_workers = 4
@@ -3025,7 +3026,7 @@ def _probe_config_health(cfg: dict) -> str:
         personality = str(display_cfg.get("personality", "") or "").strip().lower()
         if (
             personality
-            and personality not in {"default", "none", "neutral"}
+            and not is_personality_clear_request(personality)
             and isinstance(agent_cfg, dict)
             and agent_cfg.get("personalities") is None
         ):
@@ -3164,9 +3165,9 @@ def _session_info(agent, session: dict | None = None) -> dict:
 
 def _tool_ctx(name: str, args: dict) -> str:
     try:
-        from agent.display import build_tool_label
+        from agent.display import build_tool_preview
 
-        return build_tool_label(name, args, max_len=80) or ""
+        return build_tool_preview(name, args, max_len=80) or ""
     except Exception:
         return ""
 
@@ -3710,17 +3711,6 @@ def _wire_callbacks(sid: str):
     set_secret_capture_callback(secret_cb)
 
 
-def _render_personality_prompt(value) -> str:
-    if isinstance(value, dict):
-        parts = [value.get("system_prompt", "")]
-        if value.get("tone"):
-            parts.append(f'Tone: {value["tone"]}')
-        if value.get("style"):
-            parts.append(f'Style: {value["style"]}')
-        return "\n".join(p for p in parts if p)
-    return str(value)
-
-
 def _available_personalities(cfg: dict | None = None) -> dict:
     try:
         from cli import load_cli_config
@@ -3738,13 +3728,14 @@ def _available_personalities(cfg: dict | None = None) -> dict:
 
 def _validate_personality(value: str, cfg: dict | None = None) -> tuple[str, str]:
     raw = str(value or "").strip()
-    name = raw.lower()
-    if not name or name in {"none", "default", "neutral"}:
+    if is_personality_clear_request(raw):
         return "", ""
 
     personalities = _available_personalities(cfg)
-    if name not in personalities:
-        names = sorted(personalities)
+    try:
+        return resolve_personality(raw, personalities)
+    except PersonalityNotFoundError as exc:
+        names = sorted(exc.available_names)
         available = ", ".join(f"`{n}`" for n in names)
         base = f"Unknown personality: `{raw}`."
         if available:
@@ -3752,8 +3743,6 @@ def _validate_personality(value: str, cfg: dict | None = None) -> tuple[str, str
         else:
             base += "\n\nNo personalities configured."
         raise ValueError(base)
-
-    return name, _render_personality_prompt(personalities[name])
 
 
 def _prompt_text(value) -> str:
@@ -4213,25 +4202,12 @@ def _make_agent(
     if startup_skills:
         from agent.skill_commands import build_preloaded_skills_prompt
 
-        skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+        skills_prompt, _loaded_skills, missing_skills = build_preloaded_skills_prompt(
             startup_skills,
             task_id=session_id or key,
         )
         if missing_skills:
-            missing_display = ", ".join(missing_skills)
-            # Degrade gracefully when some skills loaded; only hard-fail when
-            # every requested skill is missing. Mirrors cli.py — a typo'd skill
-            # name should not crash the worker and auto-block the Kanban task.
-            if loaded_skills:
-                logger.warning(
-                    "Unknown skill(s) requested, skipping: %s. "
-                    "Continuing with: %s. "
-                    "List available skills with `hermes skills list`.",
-                    missing_display,
-                    ", ".join(loaded_skills),
-                )
-            else:
-                raise ValueError(f"Unknown skill(s): {missing_display}")
+            raise ValueError(f"Unknown skill(s): {', '.join(missing_skills)}")
         if skills_prompt:
             system_prompt = "\n\n".join(
                 part for part in (system_prompt, skills_prompt) if part
@@ -13469,63 +13445,6 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4016, f"unknown cron action: {action}")
     except Exception as e:
         return _err(rid, 5023, str(e))
-
-
-@method("learning.frames")
-def _(rid, params: dict) -> dict:
-    """Pre-render the learning timeline for the TUI ``/journey`` overlay.
-
-    Returns ``frames`` (reveal 0→1) plus static legend/summary/bucket metadata,
-    so Ink can render and walk the tree locally without round-tripping the
-    gateway. Shares its renderer with the ``hermes journey`` CLI.
-    """
-    try:
-        cols = int(params.get("cols", 80) or 80)
-        rows = int(params.get("rows", 24) or 24)
-        frames = int(params.get("frames", 48) or 48)
-    except (TypeError, ValueError):
-        cols, rows, frames = 80, 24, 48
-    try:
-        from agent.learning_graph import build_learning_graph
-        from agent.learning_graph_render import render_frames
-
-        payload = build_learning_graph()
-        return _ok(rid, render_frames(payload, cols=max(20, cols), rows=max(10, rows), frames=frames))
-    except Exception as exc:  # noqa: BLE001
-        return _err(rid, 5000, f"learning.frames failed: {exc}")
-
-
-@method("learning.detail")
-def _(rid, params: dict) -> dict:
-    """Current content of a journey node, for an edit prefill."""
-    try:
-        from agent.learning_mutations import node_detail
-
-        return _ok(rid, node_detail(str(params.get("id", ""))))
-    except Exception as exc:  # noqa: BLE001
-        return _err(rid, 5000, f"learning.detail failed: {exc}")
-
-
-@method("learning.delete")
-def _(rid, params: dict) -> dict:
-    """Delete a journey node — skills are archived (restorable), memories removed."""
-    try:
-        from agent.learning_mutations import delete_node
-
-        return _ok(rid, delete_node(str(params.get("id", ""))))
-    except Exception as exc:  # noqa: BLE001
-        return _err(rid, 5000, f"learning.delete failed: {exc}")
-
-
-@method("learning.edit")
-def _(rid, params: dict) -> dict:
-    """Rewrite a journey node's content (SKILL.md or memory chunk)."""
-    try:
-        from agent.learning_mutations import edit_node
-
-        return _ok(rid, edit_node(str(params.get("id", "")), str(params.get("content", ""))))
-    except Exception as exc:  # noqa: BLE001
-        return _err(rid, 5000, f"learning.edit failed: {exc}")
 
 
 @method("skills.manage")

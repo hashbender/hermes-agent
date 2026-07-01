@@ -854,7 +854,7 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
 
     assert server._history_to_messages(history) == [
         {"role": "user", "text": "first prompt"},
-        {"context": "Searching files for resume", "name": "search_files", "role": "tool"},
+        {"context": "resume", "name": "search_files", "role": "tool"},
         {"role": "assistant", "text": "first answer"},
         {"role": "user", "text": "second prompt"},
     ]
@@ -3714,6 +3714,51 @@ def test_config_set_personality_rejects_unknown_name(monkeypatch):
     assert "Unknown personality" in resp["error"]["message"]
 
 
+def test_config_set_personality_rejects_invalid_definition_without_mutation(
+    monkeypatch,
+):
+    writes = []
+    agent = types.SimpleNamespace(
+        ephemeral_system_prompt="before",
+        _cached_system_prompt="cached",
+    )
+    session = _session(agent=agent, history=[])
+    server._sessions["sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_available_personalities",
+        lambda cfg=None: {"broken": {"tone": 42}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_write_config_key",
+        lambda path, value: writes.append((path, value)),
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {
+                    "session_id": "sid",
+                    "key": "personality",
+                    "value": "broken",
+                },
+            }
+        )
+
+        assert "Invalid personality 'broken'" in resp["error"]["message"]
+        assert writes == []
+        assert server._sessions["sid"] is session
+        assert session["agent"] is agent
+        assert agent.ephemeral_system_prompt == "before"
+        assert agent._cached_system_prompt == "cached"
+        assert session["history"] == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
     agent = types.SimpleNamespace(
         ephemeral_system_prompt=None, _cached_system_prompt="old"
@@ -5461,23 +5506,13 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
         assert built, "agent build did not complete within timeout"
 
         # Build finished without a close race — nothing should have been
-        # cleaned up by the orphan check.  Scope the assertions to THIS
-        # test's own session_key: a daemon build thread leaked from a prior
-        # session.create test in the same shard process can fire close/
-        # unregister against its own (foreign) key after we've patched the
-        # global hooks, polluting these lists.  Filtering by this session's
-        # key keeps the regression intent (this session's worker/notify must
-        # survive) while making the test immune to shard composition.
-        # (flaky under -j 8: foreign key e.g. 20260629_210208_d4f545)
-        own_key = session["session_key"]
-        own_closed = [k for k in closed_workers if k == own_key]
-        own_unregistered = [k for k in unregistered_keys if k == own_key]
+        # cleaned up by the orphan check.
         assert (
-            own_closed == []
-        ), f"build thread closed its own worker despite no race: {own_closed}"
+            closed_workers == []
+        ), f"build thread closed its own worker despite no race: {closed_workers}"
         assert (
-            own_unregistered == []
-        ), f"build thread unregistered its own notify despite no race: {own_unregistered}"
+            unregistered_keys == []
+        ), f"build thread unregistered its own notify despite no race: {unregistered_keys}"
 
         # Session should have the live worker installed.
         assert session.get("slash_worker") is not None
