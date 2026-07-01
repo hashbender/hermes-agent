@@ -9740,13 +9740,16 @@ def _(rid, params: dict) -> dict:
 @method("config.set")
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
-    session = _sessions.get(params.get("session_id", ""))
+    session_id = str(params.get("session_id") or "")
+    session = _sessions.get(session_id) if session_id else None
 
     if key == "model":
         try:
             if not value:
                 return _err(rid, 4002, "model value required")
-            if session:
+            if session_id and session is None:
+                return _err(rid, 4001, "session not found")
+            if session is not None:
                 # Reject during an in-flight turn.  agent.switch_model()
                 # mutates self.model / self.provider / self.base_url /
                 # self.client in place; the worker thread running
@@ -9766,7 +9769,6 @@ def _(rid, params: dict) -> dict:
                 parsed_flags = parse_model_flags(value)
                 _model_input, explicit_provider, _persist_global, _force_refresh, _is_session = parsed_flags
                 if session.get("agent") is None and not explicit_provider.strip():
-                    session_id = params.get("session_id", "")
                     _start_agent_build(session_id, session)
                     init_err = _wait_agent(session, rid)
                     if init_err:
@@ -9774,7 +9776,7 @@ def _(rid, params: dict) -> dict:
                     if session.get("agent") is None:
                         return _err(rid, 5032, "agent initialization failed")
                 result = _apply_model_switch(
-                    params.get("session_id", ""),
+                    session_id,
                     session,
                     value,
                     confirm_expensive_model=bool(
