@@ -3,16 +3,17 @@
 Terminal Tool Module
 
 A terminal tool that executes commands in local, Docker, Modal, SSH,
-Singularity, and Daytona environments. Supports local execution,
+Singularity, Daytona, and Tenki environments. Supports local execution,
 containerized backends, and cloud sandboxes, including managed Modal mode.
 
 Supported environments:
 - "local": Execute directly on the host machine (default, fastest)
 - "docker": Execute in Docker containers (isolated, requires Docker)
 - "modal": Execute in Modal cloud sandboxes (direct Modal or managed gateway)
+- "tenki": Execute in Tenki cloud sandboxes
 
 Features:
-- Multiple execution backends (local, docker, modal)
+- Multiple execution backends (local, docker, modal, tenki, etc.)
 - Background task support
 - VM/container lifecycle management
 - Automatic cleanup after inactivity
@@ -892,7 +893,7 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     should prepend sudo_stdin to their stdin_data and pass the merged bytes to
     Popen's stdin pipe.
 
-    Callers that cannot pipe subprocess stdin (modal, daytona) must embed
+    Callers that cannot pipe subprocess stdin (modal, daytona, tenki) must embed
     the password in the command string themselves; see their execute()
     methods for how they handle the non-None sudo_stdin case.
 
@@ -1060,7 +1061,7 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 
 
 # Per-task environment overrides registry.
-# Allows environments (e.g., TerminalBench2Env) to specify a custom Docker/Modal
+# Allows environments (e.g., TerminalBench2Env) to specify a custom Docker/Modal/Tenki
 # image for a specific task_id BEFORE the agent loop starts. When the terminal or
 # file tools create a new sandbox for that task_id, they check this registry first
 # and fall back to the TERMINAL_MODAL_IMAGE (etc.) env var if no override is set.
@@ -1079,6 +1080,7 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
 
     Supported override keys:
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
+        - tenki_image: str -- Tenki sandbox image/template identifier
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
 
@@ -1146,7 +1148,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
-        "daytona_image", "env_type",
+        "daytona_image", "tenki_image", "env_type",
     })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
@@ -1213,7 +1215,7 @@ def _safe_getcwd() -> str:
 # cwd looks when it leaks toward a Linux container's ``-w`` flag.
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
-_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
+_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "tenki"})
 
 
 def _is_unusable_container_cwd(cwd: str) -> bool:
@@ -1244,7 +1246,7 @@ def _get_env_config() -> Dict[str, Any]:
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
-    container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
+    container_backend = env_type in _CONTAINER_BACKENDS
     docker_backend = env_type == "docker"
 
     # Docker/container-only env vars may be bridged from config.yaml even when
@@ -1278,6 +1280,8 @@ def _get_env_config() -> Dict[str, Any]:
         default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
+    elif env_type == "tenki":
+        default_cwd = "/home/tenki"
     else:
         default_cwd = "/root"
 
@@ -1314,6 +1318,17 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "tenki_image": os.getenv("TERMINAL_TENKI_IMAGE", ""),
+        "tenki_api_endpoint": os.getenv("TERMINAL_TENKI_API_ENDPOINT", ""),
+        "tenki_workspace_id": os.getenv("TERMINAL_TENKI_WORKSPACE_ID", ""),
+        "tenki_project_id": os.getenv("TERMINAL_TENKI_PROJECT_ID", ""),
+        "tenki_name_prefix": os.getenv("TERMINAL_TENKI_NAME_PREFIX", "hermes"),
+        "tenki_allow_inbound": os.getenv("TERMINAL_TENKI_ALLOW_INBOUND", "false").lower() in {"true", "1", "yes"},
+        "tenki_allow_outbound": os.getenv("TERMINAL_TENKI_ALLOW_OUTBOUND", "true").lower() in {"true", "1", "yes"},
+        "tenki_max_duration": _parse_env_var("TERMINAL_TENKI_MAX_DURATION", "3600"),
+        "tenki_idle_timeout": _parse_env_var("TERMINAL_TENKI_IDLE_TIMEOUT", "0"),
+        "tenki_pause_retention": _parse_env_var("TERMINAL_TENKI_PAUSE_RETENTION", "0"),
+        "tenki_sync_hermes_home": os.getenv("TERMINAL_TENKI_SYNC_HERMES_HOME", "false").lower() in {"true", "1", "yes"},
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1333,11 +1348,14 @@ def _get_env_config() -> Dict[str, Any]:
         ).lower() in {"true", "1", "yes"},
         "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
         # Container resource config (applies to docker, singularity, modal,
-        # daytona -- ignored for local/ssh)
+        # daytona, tenki -- ignored for local/ssh)
         "container_cpu": container_cpu,
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
-        "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
+        "container_persistent": os.getenv(
+            "TERMINAL_CONTAINER_PERSISTENT",
+            "false" if env_type == "tenki" else "true",
+        ).lower() in {"true", "1", "yes"},
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
@@ -1380,7 +1398,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "ssh"
+            "daytona", "tenki", "ssh"
         image: Docker/Singularity/Modal image name (ignored for local/ssh)
         cwd: Working directory
         timeout: Default command timeout
@@ -1501,6 +1519,30 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
 
+    elif env_type == "tenki":
+        from tools.environments.tenki import TenkiEnvironment as _TenkiEnvironment
+
+        return _TenkiEnvironment(
+            image=image,
+            cwd=cwd,
+            timeout=timeout,
+            cpu=cpu,
+            memory=memory,
+            disk=disk,
+            persistent_filesystem=persistent,
+            task_id=task_id,
+            api_endpoint=cc.get("tenki_api_endpoint", ""),
+            workspace_id=cc.get("tenki_workspace_id", ""),
+            project_id=cc.get("tenki_project_id", ""),
+            name_prefix=cc.get("tenki_name_prefix", "hermes"),
+            allow_inbound=cc.get("tenki_allow_inbound", False),
+            allow_outbound=cc.get("tenki_allow_outbound", True),
+            max_duration=cc.get("tenki_max_duration", 3600),
+            idle_timeout=cc.get("tenki_idle_timeout", 0),
+            pause_retention=cc.get("tenki_pause_retention", 0),
+            sync_hermes_home=cc.get("tenki_sync_hermes_home", False),
+        )
+
     elif env_type == "ssh":
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
             raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
@@ -1516,7 +1558,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'tenki', or 'ssh'"
         )
 
 
@@ -2071,6 +2113,8 @@ def terminal_tool(
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
+        elif env_type == "tenki":
+            image = overrides.get("tenki_image") or config["tenki_image"]
         else:
             image = ""
 
@@ -2179,7 +2223,7 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in {"docker", "singularity", "modal", "daytona"}:
+                        if env_type in _CONTAINER_BACKENDS:
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
@@ -2194,6 +2238,16 @@ def terminal_tool(
                                 "docker_extra_args": config.get("docker_extra_args", []),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
+                                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
+                                "tenki_project_id": config.get("tenki_project_id", ""),
+                                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
+                                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
+                                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
+                                "tenki_max_duration": config.get("tenki_max_duration", 3600),
+                                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
+                                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
+                                "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
                             }
 
                         local_config = None
@@ -2844,10 +2898,42 @@ def check_terminal_requirements() -> bool:
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
+        elif env_type == "tenki":
+            if importlib.util.find_spec("tenki_sandbox") is None:
+                try:
+                    from tools.lazy_deps import ensure as _lazy_ensure
+
+                    _lazy_ensure("terminal.tenki", prompt=False)
+                    importlib.invalidate_caches()
+                except Exception as exc:
+                    logger.error(
+                        "tenki-sandbox is required for Tenki terminal backend: "
+                        "pip install tenki-sandbox==0.1.1 (%s)",
+                        exc,
+                    )
+                    return False
+                if importlib.util.find_spec("tenki_sandbox") is None:
+                    logger.error(
+                        "tenki-sandbox is required for Tenki terminal backend: "
+                        "pip install tenki-sandbox==0.1.1"
+                    )
+                    return False
+            try:
+                from tools.tenki_config import has_tenki_auth
+            except Exception:
+                has_tenki_auth = lambda: False  # noqa: E731
+            if not has_tenki_auth():
+                logger.error(
+                    "Tenki backend selected but no Tenki auth was found. Run `tenki login` "
+                    "or set TENKI_AUTH_TOKEN/TENKI_API_KEY."
+                )
+                return False
+            return True
+
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, ssh.",
+                "modal, daytona, tenki, ssh.",
                 env_type,
             )
             return False
@@ -2866,6 +2952,7 @@ if __name__ == "__main__":
     print(f"  Environment type: {config['env_type']}")
     print(f"  Docker image: {config['docker_image']}")
     print(f"  Modal image: {config['modal_image']}")
+    print(f"  Tenki image: {config['tenki_image'] or '(Tenki default)'}")
     print(f"  Working directory: {config['cwd']}")
     print(f"  Default timeout: {config['timeout']}s")
     print(f"  Lifetime: {config['lifetime_seconds']}s")
@@ -2890,12 +2977,13 @@ if __name__ == "__main__":
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
-        "(local/docker/singularity/modal/daytona/ssh)"
+        "(local/docker/singularity/modal/daytona/tenki/ssh)"
     )
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
     print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
     print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
+    print(f"  TERMINAL_TENKI_IMAGE: {os.getenv('TERMINAL_TENKI_IMAGE', '(Tenki default)')}")
     print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', _safe_getcwd())}")
     from hermes_constants import display_hermes_home as _dhh
     print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
