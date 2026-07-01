@@ -142,6 +142,64 @@ delegation:
 
 If omitted, subagents use the same model as the parent.
 
+## Persona Presets
+
+For reusable specialist subagents, configure `delegation.personas` in `config.yaml` and pass the persona key to `delegate_task`. A persona can add child-local instructions and optional runtime defaults without switching the parent conversation.
+
+```yaml
+# In ~/.hermes/config.yaml
+delegation:
+  personas:
+    code_reviewer:
+      description: "Security- and correctness-focused code reviewer"
+      system_prompt: |
+        You are a senior code reviewer. Focus on correctness, regressions,
+        security, and minimal safe changes.
+      model: "anthropic/claude-sonnet-4"
+      provider: "openrouter"
+      toolsets: ["file", "terminal"]
+
+    quick_researcher:
+      description: "Fast web/documentation researcher"
+      system_prompt: |
+        Gather evidence with sources and separate facts from speculation.
+      model: "google/gemini-flash-2.0"
+      provider: "openrouter"
+      toolsets: ["web", "file"]
+```
+
+Then select a persona for one child or per task:
+
+```python
+delegate_task(
+    goal="Review the current diff for correctness and security",
+    persona="code_reviewer",
+)
+
+delegate_task(tasks=[
+    {"goal": "Find relevant docs", "persona": "quick_researcher"},
+    {"goal": "Review the patch", "persona": "code_reviewer"},
+])
+```
+
+Personas are **not** full Hermes profiles (`hermes -p ...`). They do not load separate memory, skills, or profile config. They are child-local presets for delegation only. The existing `role` parameter remains topology-only (`leaf` or `orchestrator`); use `persona` for specialist behavior.
+
+Persona `toolsets` are defaults, not authority escalation: Hermes still intersects them with the parent's available toolsets and strips blocked child tools.
+
+Personas are scoped to the active Hermes profile. A persona configured in `~/.hermes/profiles/coder/config.yaml` is available only to sessions running with `--profile coder`; a default-profile gateway reads `~/.hermes/config.yaml` instead. If you want the same persona in multiple profiles, add it to each profile's `config.yaml`.
+
+Configuration is loaded when a Hermes process/session builds its tool schema. After adding or renaming personas, start a fresh chat session. For long-running surfaces, restart the process that serves that surface:
+
+- CLI/TUI: start a new session (or relaunch Hermes).
+- Desktop: quit and reopen the Desktop app so its local `serve` backend restarts.
+- Messaging gateway: restart the gateway for the profile that serves the chat.
+
+If a delegated call fails with `Unknown delegation persona 'name'. Available personas: (none)`, the process handling that conversation did not load a `delegation.personas` entry for its active profile. Check the active profile and restart the relevant surface after editing config.
+
+:::note
+Persona `description` values are included in the model-facing `delegate_task` tool schema so the active LLM can choose among configured personas. Keep descriptions short and non-sensitive. Full `system_prompt` values and credential fields are used at runtime only and are not advertised in the schema.
+:::
+
 ## Toolset Selection Tips
 
 The `toolsets` parameter controls what tools the subagent has access to. Choose based on the task:
