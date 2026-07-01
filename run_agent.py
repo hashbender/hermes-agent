@@ -1626,12 +1626,25 @@ class AIAgent:
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
+
+        Operates on a *shallow copy* of *messages* so that the persist
+        override (``_apply_persist_user_message_override``) does not mutate
+        the live message list used by the API call.  Without this, the
+        early-crash-resilience persist strips observed group-chat context
+        from the user message *before* ``api_messages`` is built, silently
+        dropping it (#48677).
         """
-        self._drop_trailing_empty_response_scaffolding(messages)
-        self._apply_persist_user_message_override(messages)
-        self._session_messages = messages
-        self._save_session_log(messages)
-        self._flush_messages_to_session_db(messages, conversation_history)
+        # Shallow-copy: each dict is a new dict pointing at the same
+        # inner values.  _apply_persist_user_message_override only
+        # overwrites string-valued ``content`` keys, so a shallow copy
+        # is sufficient — the override's ``msg["content"] = override``
+        # writes to the copy, not the original.
+        persist_messages = [m.copy() for m in messages]
+        self._drop_trailing_empty_response_scaffolding(persist_messages)
+        self._apply_persist_user_message_override(persist_messages)
+        self._session_messages = persist_messages
+        self._save_session_log(persist_messages)
+        self._flush_messages_to_session_db(persist_messages, conversation_history)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
