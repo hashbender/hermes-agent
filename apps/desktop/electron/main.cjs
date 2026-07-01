@@ -5753,6 +5753,7 @@ function createNewSessionWindow() {
 // pushes pet state over IPC (hermes:pet-overlay:state); the overlay just renders
 // it. Control flows back (pop-in, composer submit) via hermes:pet-overlay:control.
 let petOverlayWindow = null
+let closingPetOverlayForAppQuit = false
 
 function petOverlayUrl() {
   if (DEV_SERVER) {
@@ -5842,7 +5843,7 @@ function spawnPetOverlayWindow(bounds) {
     // If the overlay went away on its own (e.g. ⌘W), tell the main renderer to
     // pop the pet back in so it doesn't stay hidden. Harmless echo when we're
     // the ones who closed it (popInPet already cleared the active flag).
-    if (mainWindow && !mainWindow.isDestroyed()) {
+    if (!closingPetOverlayForAppQuit && mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('hermes:pet-overlay:control', { type: 'pop-in' })
     }
   })
@@ -7574,7 +7575,11 @@ function configureSpellChecker() {
 
 app.on('before-quit', () => {
   // The always-on-top overlay isn't a "real" app window; close it so a stray
-  // pet can't keep the process alive or float over a quit app.
+  // pet can't keep the process alive or float over a quit app. Do not echo a
+  // pop-in control back to the renderer during app teardown: the renderer
+  // persists that state, and shutdown would otherwise erase the user's
+  // popped-out preference before the next launch can restore it.
+  closingPetOverlayForAppQuit = true
   closePetOverlay()
 
   // Quitting mid-install should stop the installer, not orphan it.
