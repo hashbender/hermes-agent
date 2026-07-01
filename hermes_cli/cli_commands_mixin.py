@@ -949,14 +949,40 @@ class CLICommandsMixin:
 
     def _handle_personality_command(self, cmd: str):
         """Handle the /personality command to set predefined personalities."""
+        from collections.abc import Mapping
+
+        from agent.personality import (
+            PersonalityConfigError,
+            PersonalityDefinition,
+            PersonalityNotFoundError,
+            is_personality_clear_request,
+            resolve_personality,
+        )
         from cli import save_config_value
+
         parts = cmd.split(maxsplit=1)
         
         if len(parts) > 1:
             # Set personality
-            personality_name = parts[1].strip().lower()
-            
-            if personality_name in {"none", "default", "neutral"}:
+            requested_name = parts[1].strip()
+            if is_personality_clear_request(requested_name):
+                personality_name, new_prompt = "", ""
+            else:
+                try:
+                    personality_name, new_prompt = resolve_personality(
+                        requested_name,
+                        self.personalities,
+                    )
+                except PersonalityNotFoundError as exc:
+                    print(f"(._.) Unknown personality: {exc.normalized_name}")
+                    available = ", ".join(exc.available_names)
+                    print(f"  Available: none, {available}")
+                    return
+                except PersonalityConfigError as exc:
+                    print(f"(._.) {exc}")
+                    return
+
+            if not personality_name:
                 self.system_prompt = ""
                 self.agent = None  # Force re-init
                 if save_config_value("agent.system_prompt", ""):
@@ -964,17 +990,14 @@ class CLICommandsMixin:
                 else:
                     print("(^_^) Personality cleared (session only)")
                 print("  No personality overlay — using base agent behavior.")
-            elif personality_name in self.personalities:
-                self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
+            else:
+                self.system_prompt = new_prompt
                 self.agent = None  # Force re-init
                 if save_config_value("agent.system_prompt", self.system_prompt):
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
                 else:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
-            else:
-                print(f"(._.) Unknown personality: {personality_name}")
-                print(f"  Available: none, {', '.join(self.personalities.keys())}")
         else:
             # Show available personalities
             print()
@@ -984,10 +1007,18 @@ class CLICommandsMixin:
             print()
             print(f"  {'none':<12} - (no personality overlay)")
             for name, prompt in self.personalities.items():
-                if isinstance(prompt, dict):
-                    preview = prompt.get("description") or prompt.get("system_prompt", "")[:50]
+                try:
+                    definition = PersonalityDefinition.parse(str(name), prompt)
+                except PersonalityConfigError as exc:
+                    preview = f"(invalid: {exc.detail})"
                 else:
-                    preview = str(prompt)[:50]
+                    if isinstance(prompt, Mapping):
+                        preview = (
+                            definition.description
+                            or definition.system_prompt[:50]
+                        )
+                    else:
+                        preview = definition.system_prompt[:50]
                 print(f"  {name:<12} - {preview}")
             print()
             print("  Usage: /personality <name>")
@@ -2575,25 +2606,12 @@ class CLICommandsMixin:
         else:
             _cprint(f"  {_ACCENT}✓ {feature_name} set to {label} (session only){_RST}")
 
-    def _handle_debug_command(self, cmd_original: str = ""):
-        """Handle /debug — upload debug report + logs and print share URLs.
-
-        Accepts optional destination words after the command:
-
-        - ``/debug``        → upload to the public paste service (default)
-        - ``/debug nous``   → upload to Nous-internal storage (private, staff-only)
-        - ``/debug local``  → render the report to stdout, no upload
-
-        ``nous`` and ``local`` are mutually exclusive; if both are given,
-        ``local`` wins (it never touches the network).
-        """
+    def _handle_debug_command(self):
+        """Handle /debug — upload debug report + logs and print paste URLs."""
         from hermes_cli.debug import run_debug_share
         from types import SimpleNamespace
 
-        words = {w.lower() for w in cmd_original.split()[1:]}
-        local = "local" in words
-        nous = "nous" in words and not local
-        args = SimpleNamespace(lines=200, expire=7, local=local, nous=nous)
+        args = SimpleNamespace(lines=200, expire=7, local=False)
         run_debug_share(args)
 
     def _handle_update_command(self) -> bool:

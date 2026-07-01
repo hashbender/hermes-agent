@@ -25,12 +25,20 @@ import re
 import shlex
 import sys
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
+from agent.personality import (
+    PersonalityConfigError,
+    PersonalityDefinition,
+    PersonalityNotFoundError,
+    is_personality_clear_request,
+    resolve_personality,
+)
 from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
@@ -1771,25 +1779,35 @@ class GatewaySlashCommandsMixin:
             lines = [t("gateway.personality.header")]
             lines.append(t("gateway.personality.none_option"))
             for name, prompt in personalities.items():
-                if isinstance(prompt, dict):
-                    preview = prompt.get("description") or prompt.get("system_prompt", "")[:50]
-                else:
-                    preview = prompt[:50] + "..." if len(prompt) > 50 else prompt
+                try:
+                    definition = PersonalityDefinition.parse(str(name), prompt)
+                    if isinstance(prompt, Mapping):
+                        preview = (
+                            definition.description
+                            or definition.system_prompt[:50]
+                        )
+                    else:
+                        preview = definition.system_prompt[:50]
+                        if len(definition.system_prompt) > 50:
+                            preview += "..."
+                except PersonalityConfigError as exc:
+                    preview = f"(invalid: {exc.detail})"
                 lines.append(t("gateway.personality.item", name=name, preview=preview))
             lines.append(t("gateway.personality.usage"))
             return "\n".join(lines)
 
-        def _resolve_prompt(value):
-            if isinstance(value, dict):
-                parts = [value.get("system_prompt", "")]
-                if value.get("tone"):
-                    parts.append(f'Tone: {value["tone"]}')
-                if value.get("style"):
-                    parts.append(f'Style: {value["style"]}')
-                return "\n".join(p for p in parts if p)
-            return str(value)
+        if is_personality_clear_request(args):
+            personality_name, new_prompt = "", ""
+        else:
+            try:
+                personality_name, new_prompt = resolve_personality(args, personalities)
+            except PersonalityConfigError as exc:
+                return t("gateway.shared.warn_passthrough", error=exc)
+            except PersonalityNotFoundError:
+                available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
+                return t("gateway.personality.unknown", name=args, available=available)
 
-        if args in {"none", "default", "neutral"}:
+        if not personality_name:
             try:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
@@ -1799,25 +1817,20 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.personality.save_failed", error=str(e))
             self._ephemeral_system_prompt = ""
             return t("gateway.personality.cleared")
-        elif args in personalities:
-            new_prompt = _resolve_prompt(personalities[args])
 
-            # Write to config.yaml, same pattern as CLI save_config_value.
-            try:
-                if "agent" not in config or not isinstance(config.get("agent"), dict):
-                    config["agent"] = {}
-                config["agent"]["system_prompt"] = new_prompt
-                atomic_yaml_write(config_path, config)
-            except Exception as e:
-                return t("gateway.personality.save_failed", error=str(e))
+        # Write to config.yaml, same pattern as CLI save_config_value.
+        try:
+            if "agent" not in config or not isinstance(config.get("agent"), dict):
+                config["agent"] = {}
+            config["agent"]["system_prompt"] = new_prompt
+            atomic_yaml_write(config_path, config)
+        except Exception as e:
+            return t("gateway.personality.save_failed", error=str(e))
 
-            # Update in-memory so it takes effect on the very next message.
-            self._ephemeral_system_prompt = new_prompt
+        # Update in-memory so it takes effect on the very next message.
+        self._ephemeral_system_prompt = new_prompt
 
-            return t("gateway.personality.set_to", name=args)
-
-        available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
-        return t("gateway.personality.unknown", name=args, available=available)
+        return t("gateway.personality.set_to", name=personality_name)
 
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
@@ -3455,47 +3468,6 @@ class GatewaySlashCommandsMixin:
             lines.append("Complete your top-up in the browser — credits will appear in /credits shortly.")
         return "\n".join(lines)
 
-    def _context_breakdown_lines(self, agent, source) -> list[str]:
-        """Render the per-category context breakdown for /usage.
-
-        Estimated (chars/4) — same engine the desktop popover uses. Returns an
-        empty list and never raises on failure so /usage stays robust.
-        """
-        try:
-            from agent.context_breakdown import compute_session_context_breakdown
-
-            history: list[dict] = []
-            try:
-                entry = self.session_store.get_or_create_session(source)
-                history = self.session_store.load_transcript(entry.session_id) or []
-            except Exception:
-                history = []
-
-            payload = compute_session_context_breakdown(agent, history)
-            categories = payload.get("categories") or []
-            if not categories:
-                return []
-
-            total = payload.get("estimated_total") or 0
-            out = [t("gateway.usage.breakdown_header")]
-            for cat in categories:
-                tokens = int(cat.get("tokens") or 0)
-                if tokens <= 0:
-                    continue
-                cat_id = str(cat.get("id") or "")
-                label = t(f"gateway.usage.breakdown_cat_{cat_id}")
-                # Missing key → t() echoes the key back; fall back to the
-                # English label the engine already provides.
-                if label.endswith(f"breakdown_cat_{cat_id}"):
-                    label = str(cat.get("label") or cat_id)
-                pct = round(tokens / total * 100) if total else 0
-                out.append(
-                    t("gateway.usage.breakdown_line", label=label, count=f"{tokens:,}", pct=pct)
-                )
-            return out if len(out) > 1 else []
-        except Exception:
-            return []
-
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
 
@@ -3594,15 +3566,6 @@ class GatewaySlashCommandsMixin:
                 lines.append(t("gateway.usage.label_context", used=f"{ctx.last_prompt_tokens:,}", total=f"{ctx.context_length:,}", pct=f"{pct:.0f}"))
             if ctx.compression_count:
                 lines.append(t("gateway.usage.label_compressions", count=ctx.compression_count))
-
-            # Per-category context breakdown (estimated — chars/4 heuristic).
-            # Same engine the desktop popover uses (PR #54907). The system
-            # prompt / tools / skills / memory slices read off the live agent;
-            # the conversation slice is estimated from the session transcript.
-            breakdown_lines = self._context_breakdown_lines(agent, source)
-            if breakdown_lines:
-                lines.append("")
-                lines.extend(breakdown_lines)
 
             if account_lines:
                 lines.append("")
