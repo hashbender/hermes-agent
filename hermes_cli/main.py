@@ -287,6 +287,7 @@ from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
 from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
 from hermes_cli.subcommands.config import build_config_parser
+from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.version import build_version_parser
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
@@ -11893,6 +11894,13 @@ def cmd_logs(args):
     )
 
 
+def cmd_console(args):
+    """Open the safe Hermes command console."""
+    from hermes_cli.console_engine import run_console_repl
+
+    return run_console_repl()
+
+
 def _build_provider_choices() -> list[str]:
     """Build the --provider choices list from CANONICAL_PROVIDERS + 'auto'."""
     try:
@@ -11922,10 +11930,9 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "cron", "curator", "dashboard", "serve", "debug", "doctor",
+        "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
-        "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
@@ -12746,6 +12753,11 @@ def main():
     build_config_parser(subparsers, cmd_config=cmd_config)
 
     # =========================================================================
+    # console command  (parser built in hermes_cli/subcommands/console.py)
+    # =========================================================================
+    build_console_parser(subparsers, cmd_console=cmd_console)
+
+    # =========================================================================
     # pairing command  (parser built in hermes_cli/subcommands/pairing.py)
     # =========================================================================
     build_pairing_parser(subparsers, cmd_pairing=cmd_pairing)
@@ -12861,27 +12873,6 @@ def main():
         _register_pets_cli(pets_parser)
     except Exception as _exc:
         logging.getLogger(__name__).debug("pets CLI wiring failed: %s", _exc)
-
-    # =========================================================================
-    # journey command — learned skills + memories over time, in the terminal
-    # =========================================================================
-    journey_parser = subparsers.add_parser(
-        "journey",
-        aliases=["learning", "memory-graph"],
-        help="Timeline of learned skills + memories over time",
-        description=(
-            "A terminal rendition of the desktop Star Map / Memory Graph: a "
-            "timeline bar chart of learned skills and memories over time "
-            "(oldest at top, newest at bottom) plus a playable constellation "
-            "scrubber. Mirrors the TUI `/journey` overlay and the desktop panel."
-        ),
-    )
-    try:
-        from hermes_cli.journey import register_cli as _register_journey_cli
-
-        _register_journey_cli(journey_parser)
-    except Exception as _exc:
-        logging.getLogger(__name__).debug("journey CLI wiring failed: %s", _exc)
 
     # =========================================================================
     # memory command  (parser built in hermes_cli/subcommands/memory.py)
