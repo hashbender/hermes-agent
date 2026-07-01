@@ -521,9 +521,7 @@ def init_agent(
         from hermes_cli.config import load_config as _load_pc_cfg
 
         _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        # prompt_caching.enabled=false is honored in _anthropic_prompt_cache_policy
-        # (applied above and on every re-derivation), so no override is needed here.
-        _ttl = _pc_cfg.get("cache_ttl", "5m") if isinstance(_pc_cfg, dict) else "5m"
+        _ttl = _pc_cfg.get("cache_ttl", "5m")
         if _ttl in {"5m", "1h"}:
             agent._cache_ttl = _ttl
     except Exception:
@@ -704,7 +702,7 @@ def init_agent(
             # the third-party identity-injection bug.
             from agent.anthropic_adapter import _is_oauth_token as _is_oat
             agent._is_anthropic_oauth = _is_oat(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
-            agent._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout)
+            agent._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout, provider=agent.provider)
             # No OpenAI client needed for Anthropic mode
             agent.client = None
             agent._client_kwargs = {}

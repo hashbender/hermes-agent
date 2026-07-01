@@ -419,8 +419,68 @@ _OR_HEADERS_BASE = {
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
-def _apply_user_default_headers(headers: dict | None) -> dict | None:
-    """Merge user-configured ``model.default_headers`` onto resolved headers.
+def _resolve_user_default_headers(provider: str | None = None) -> dict:
+    """Collect user-configured request headers from config.yaml.
+
+    Two sources, merged with the more specific winning:
+
+    1. ``model.default_headers`` — global override for the active endpoint
+       (the original #40033 knob).
+    2. ``custom_providers[].default_headers`` for the named ``provider`` — lets
+       a specific custom provider (e.g. Requesty) carry its own cache-control /
+       attribution headers without forcing them onto every other endpoint.
+
+    Provider-level headers are applied first, then ``model.default_headers``
+    layered on top, so a value set in both places resolves to the model-level
+    one. Values are stringified. Returns ``{}`` when nothing is configured.
+    """
+    resolved: dict = {}
+    try:
+        from hermes_cli.config import (
+            cfg_get,
+            get_compatible_custom_providers,
+            load_config,
+        )
+        cfg = load_config()
+    except Exception:
+        return resolved
+
+    # 1) provider-level headers (least specific)
+    if provider:
+        try:
+            target = str(provider).strip().lower()
+            for cp in (get_compatible_custom_providers(cfg) or []):
+                names = {
+                    str(cp.get("name", "")).strip().lower(),
+                    str(cp.get("provider_key", "")).strip().lower(),
+                }
+                if target in names and target:
+                    ph = cp.get("default_headers")
+                    if isinstance(ph, dict):
+                        for k, v in ph.items():
+                            if v is not None:
+                                resolved[str(k)] = str(v)
+                    break
+        except Exception:
+            pass
+
+    # 2) model.default_headers (most specific — wins on collision)
+    try:
+        mh = cfg_get(cfg, "model", "default_headers")
+        if isinstance(mh, dict):
+            for k, v in mh.items():
+                if v is not None:
+                    resolved[str(k)] = str(v)
+    except Exception:
+        pass
+
+    return resolved
+
+
+def _apply_user_default_headers(
+    headers: dict | None, provider: str | None = None
+) -> dict | None:
+    """Merge user-configured headers onto resolved headers.
 
     User values take precedence over provider/SDK defaults, mirroring the main
     agent client (``AIAgent._apply_user_default_headers``). This lets a
@@ -430,21 +490,18 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     main turn would succeed but title/compression/vision calls to the same
     endpoint would still fail. (#40033)
 
+    ``provider`` scopes the per-custom-provider ``default_headers`` lookup;
+    pass the active provider name so a provider-specific header set (e.g.
+    Requesty cache headers) is honored in addition to ``model.default_headers``.
+
     Returns the merged dict, or the original ``headers`` (possibly ``None``)
     when nothing is configured. No allocation when there are no overrides.
     """
-    try:
-        from hermes_cli.config import cfg_get, load_config
-        user_headers = cfg_get(load_config(), "model", "default_headers")
-    except Exception:
-        return headers
-    if not isinstance(user_headers, dict) or not user_headers:
+    user_headers = _resolve_user_default_headers(provider)
+    if not user_headers:
         return headers
     merged = dict(headers or {})
-    for key, value in user_headers.items():
-        if value is None:
-            continue
-        merged[str(key)] = str(value)
+    merged.update(user_headers)
     return merged or headers
 
 
@@ -682,6 +739,14 @@ def _pool_runtime_api_key(entry: Any) -> str:
 def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
     if entry is None:
         return str(fallback or "").strip().rstrip("/")
+    if getattr(entry, "provider", None) == "nous":
+        # Funnel through the canonical auth-layer reader so the env override
+        # shares one normalization path with the rest of the NOUS resolution.
+        from hermes_cli.auth import _nous_inference_env_override
+
+        env_url = _nous_inference_env_override()
+        if env_url:
+            return env_url
     # runtime_base_url handles provider-specific logic (e.g. nous prefers inference_base_url).
     # Fall back through inference_base_url and base_url for non-PooledCredential entries.
     url = (
@@ -5256,6 +5321,16 @@ def _resolve_task_provider_model(
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
         cfg_api_key = str(task_config.get("api_key", "")).strip() or None
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
+
+    # 'auto' is a sentinel meaning "inherit from main runtime / auto-detect", not
+    # a literal model id. Without this, a config of `auxiliary.<task>.model: auto`
+    # propagates the literal string "auto" to the wire, where the provider returns
+    # a 200 OK with an error-text body (e.g. "the model 'auto' does not exist"),
+    # which downstream consumers like ContextCompressor accept as the task output.
+    # The provider-side 'auto' is handled in _resolve_auto() via main_runtime
+    # fallback, so dropping cfg_model to None here lets that path do its job.
+    if cfg_model and cfg_model.lower() == "auto":
+        cfg_model = None
 
     resolved_model = model or cfg_model
     resolved_api_mode = cfg_api_mode

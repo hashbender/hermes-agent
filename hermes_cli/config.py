@@ -2717,23 +2717,6 @@ DEFAULT_CONFIG = {
             "idle_timeout_minutes": 5,
         },
 
-        # Auto-resume restart-loop breaker (#30719, defense-3). When the
-        # gateway is killed mid-turn (SIGTERM) and revived by a supervisor
-        # (launchd KeepAlive / systemd Restart=), it auto-resumes the
-        # restart-interrupted session on the next boot. If the resumed turn
-        # keeps triggering another kill (e.g. the agent runs a raw
-        # `launchctl kickstart ai.hermes.gateway` that defenses 1-2 don't
-        # cover), the result is a tight SIGTERM-respawn loop. This breaker
-        # counts restart-interrupted boots in a rolling window and, once
-        # `max_restarts` boots happen within `window_seconds`, SKIPS
-        # auto-resume for that boot — the gateway still starts and serves
-        # real inbound messages, it just stops replaying the session that
-        # keeps killing it. Set `max_restarts` to 0 to disable the breaker.
-        "restart_loop_guard": {
-            "max_restarts": 3,
-            "window_seconds": 60,
-        },
-
         # Inject a human-readable timestamp prefix (e.g.
         # "[Tue 2026-04-28 13:40:53 CEST]") onto user messages IN THE MODEL'S
         # CONTEXT so the agent has temporal awareness of when each message was
@@ -4447,7 +4430,7 @@ def _normalize_custom_provider_entry(
         "api_mode", "transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
-        "discover_models", "extra_body",
+        "discover_models", "extra_body", "default_headers",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -4553,6 +4536,17 @@ def _normalize_custom_provider_entry(
     extra_body = entry.get("extra_body")
     if isinstance(extra_body, dict):
         normalized["extra_body"] = dict(extra_body)
+
+    # Custom HTTP headers to send on every request to this provider (e.g.
+    # Requesty cache-control / attribution headers). Applied to both the
+    # OpenAI-wire client (via default_headers) and the Anthropic-wire client,
+    # merged over any headers Hermes sets itself. Values are stringified so a
+    # YAML bare `true`/number can't reach the SDK as a non-str header value.
+    default_headers = entry.get("default_headers")
+    if isinstance(default_headers, dict) and default_headers:
+        normalized["default_headers"] = {
+            str(k): str(v) for k, v in default_headers.items()
+        }
 
     return normalized
 
