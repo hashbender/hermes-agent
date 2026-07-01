@@ -55,6 +55,46 @@ def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
 
 
+def test_run_conversation_dict_returns_include_final_response():
+    """Structurally enforce final_response on dict returns from run_conversation().
+
+    This parses source, including nested helpers, so it requires the .py file
+    to be available. It guards key presence and literal None values; runtime
+    tests still cover branch-specific values.
+    """
+    from agent import conversation_loop
+
+    try:
+        source = inspect.getsource(conversation_loop.run_conversation)
+    except OSError as exc:
+        pytest.skip(f"run_conversation source is unavailable: {exc}")
+    tree = ast.parse(source)
+    missing = []
+    literal_none = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Dict):
+            continue
+        keys = [
+            key.value if isinstance(key, ast.Constant) else None
+            for key in node.value.keys
+        ]
+        if "final_response" not in keys:
+            missing.append(node.lineno)
+            continue
+        value = node.value.values[keys.index("final_response")]
+        if isinstance(value, ast.Constant) and value.value is None:
+            literal_none.append(node.lineno)
+
+    assert missing == [], (
+        "run_conversation() dict returns must preserve the final_response "
+        f"contract; missing at source-local lines {missing}"
+    )
+    assert literal_none == [], (
+        "run_conversation() dict returns must expose actionable final_response "
+        f"text instead of literal None; literal None at source-local lines {literal_none}"
+    )
+
+
 @pytest.fixture()
 def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
@@ -5273,6 +5313,50 @@ class TestRunConversation:
             "_record_task_failure should not be called outside kanban mode"
         )
 
+    def test_kanban_text_response_without_terminal_tool_records_failure(
+        self, agent, monkeypatch
+    ):
+        """A kanban worker that returns plain text but leaves the board task
+        running must record a protocol failure before exiting.
+
+        Otherwise the subprocess exits rc=0 and the dispatcher can only
+        discover the missing kanban_complete/kanban_block after the fact as a
+        protocol_violation crash.
+        """
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_text_only_123")
+
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Here is the checklist.", finish_reason="stop",
+        )
+
+        task = SimpleNamespace(status="running")
+        mock_record_failure = MagicMock(return_value=True)
+        mock_conn = MagicMock()
+        mock_connect = MagicMock(return_value=mock_conn)
+
+        with (
+            patch("hermes_cli.kanban_db.connect", mock_connect),
+            patch("hermes_cli.kanban_db.get_task", return_value=task),
+            patch("hermes_cli.kanban_db._record_task_failure",
+                  mock_record_failure),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["completed"] is False
+        mock_record_failure.assert_called_once()
+        call = mock_record_failure.call_args
+        assert call.args[1] == "t_text_only_123"
+        assert call.kwargs.get("outcome") == "protocol_violation"
+        assert call.kwargs.get("failure_limit") == 1
+        assert call.kwargs.get("release_claim") is True
+        assert call.kwargs.get("end_run") is True
+        assert "did not call kanban_complete" in call.kwargs.get("error", "")
+        assert mock_conn.close.call_count >= 1
+
 
 class TestHookPayloadSanitizesSimpleNamespace:
     """Regression: ``_hook_jsonable`` referenced ``SimpleNamespace`` without
@@ -5379,6 +5463,7 @@ class TestRetryExhaustion:
         assert result.get("failed") is True
         assert "error" in result
         assert "Invalid API response" in result["error"]
+        assert result.get("final_response") == result["error"]
 
     def test_content_filter_refusal_surfaced_not_retried(self, agent):
         """A model refusal must be surfaced immediately, NOT laundered into

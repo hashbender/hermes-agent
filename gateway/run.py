@@ -618,20 +618,19 @@ def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
 def _auto_continue_freshness_window() -> float:
     """Return the configured auto-continue freshness window in seconds.
 
-    Reads ``HERMES_AUTO_CONTINUE_FRESHNESS`` (bridged from
-    ``config.yaml`` ``agent.gateway_auto_continue_freshness`` at gateway
-    startup, same pattern as ``HERMES_AGENT_TIMEOUT``).  Falls back to the
-    module default when unset or malformed.  Non-positive values disable
-    the freshness gate (restores the pre-fix "always fresh" behaviour for
-    users who want to opt out).
+    Thin wrapper that delegates to the canonical implementation in
+    ``gateway.session`` (the single source of truth shared with the
+    routing-time zombie gate in ``get_or_create_session``).  Reads
+    ``HERMES_AUTO_CONTINUE_FRESHNESS`` (bridged from ``config.yaml``
+    ``agent.gateway_auto_continue_freshness`` at gateway startup, same
+    pattern as ``HERMES_AGENT_TIMEOUT``).  Falls back to the module default
+    when unset or malformed.  Non-positive values disable the freshness gate
+    (restores the pre-fix "always fresh" behaviour for users who want to opt
+    out).  Kept here so existing call sites and test patches importing it
+    from ``gateway.run`` continue to work.
     """
-    raw = os.environ.get("HERMES_AUTO_CONTINUE_FRESHNESS")
-    if raw is None or raw == "":
-        return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
+    from gateway.session import auto_continue_freshness_window
+    return auto_continue_freshness_window()
 
 
 def _float_env(name: str, default: float) -> float:
@@ -1679,6 +1678,7 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.devrun_mixin import GatewayDevRunMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
@@ -2537,7 +2537,12 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayKanbanWatchersMixin,
+    GatewayDevRunMixin,
+    GatewaySlashCommandsMixin,
+):
     """
     Main gateway controller.
 
@@ -8682,6 +8687,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
                 return await self._handle_agents_command(event)
 
+            # /mcpstatus is read-only and must be safe while an agent is busy.
+            if _cmd_def_inner and _cmd_def_inner.name == "mcpstatus":
+                return await self._handle_mcpstatus_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "mcpdoctor":
+                return await self._handle_mcpdoctor_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "mcpreloadplan":
+                return await self._handle_mcpreloadplan_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "capabilitystatus":
+                return await self._handle_capabilitystatus_command(event)
+
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
             # /btw is an alias of /background and resolves to the same canonical
@@ -8696,6 +8714,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # mid-run is the whole point of the board.
             if _cmd_def_inner and _cmd_def_inner.name == "kanban":
                 return await self._handle_kanban_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name in {
+                "devrun",
+                "devreview",
+                "devflow",
+                "devstatus",
+                "devcancel",
+            }:
+                if _cmd_def_inner.name == "devrun":
+                    return await self._handle_devrun_command(event)
+                if _cmd_def_inner.name == "devreview":
+                    return await self._handle_devreview_command(event)
+                if _cmd_def_inner.name == "devflow":
+                    return await self._handle_devflow_command(event)
+                if _cmd_def_inner.name == "devstatus":
+                    return await self._handle_devstatus_command(event)
+                return await self._handle_devcancel_command(event)
 
             # /goal is safe mid-run for status/pause/clear/wait (inspection
             # and control-plane only — doesn't interrupt the running turn).
@@ -9163,6 +9198,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
+        if canonical == "mcpstatus":
+            return await self._handle_mcpstatus_command(event)
+
+        if canonical == "mcpdoctor":
+            return await self._handle_mcpdoctor_command(event)
+
+        if canonical == "mcpreloadplan":
+            return await self._handle_mcpreloadplan_command(event)
+
+        if canonical == "capabilitystatus":
+            return await self._handle_capabilitystatus_command(event)
+
         if canonical == "reload-mcp":
             return await self._handle_reload_mcp_command(event)
 
@@ -9205,6 +9252,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "background":
             return await self._handle_background_command(event)
 
+        if canonical == "devrun":
+            return await self._handle_devrun_command(event)
+
+        if canonical == "devreview":
+            return await self._handle_devreview_command(event)
+
+        if canonical == "devflow":
+            return await self._handle_devflow_command(event)
+
+        if canonical == "devstatus":
+            return await self._handle_devstatus_command(event)
+
+        if canonical == "devcancel":
+            return await self._handle_devcancel_command(event)
+
         if canonical == "steer":
             # No active agent — /steer has no tool call to inject into.
             # Strip the prefix so downstream treats it as a normal user
@@ -9229,6 +9291,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # MoA preset for the session, pick it from the model picker (MoA
             # presets surface as a virtual "Mixture of Agents" provider).
             from hermes_cli.moa_config import (
+                current_moa_preset_name,
                 moa_usage,
                 normalize_moa_config,
             )
@@ -9242,7 +9305,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_cfg = normalize_moa_config(cfg.get("moa") if isinstance(cfg, dict) else {})
             except Exception:
                 moa_cfg = normalize_moa_config({})
-            preset = moa_cfg["default_preset"]
+            preset = current_moa_preset_name(moa_cfg)
             try:
                 event.text = moa_payload
                 event._moa_restore_override = self._session_model_overrides.get(_quick_key)
@@ -13066,6 +13129,114 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("MCP reload failed: %s", e)
             return t("gateway.reload_mcp.failed", error=e)
+
+    async def _execute_mcp_reload_one(self, event: MessageEvent, server_name: str) -> str:
+        """Connect one configured MCP server without shutting down the rest."""
+        name = str(server_name or "").strip()
+        if not name:
+            return "MCP Reload One\nStatus: blocked\nDetail: missing server name."
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", name):
+            return "MCP Reload One\nStatus: blocked\nDetail: invalid server name."
+
+        loop = asyncio.get_running_loop()
+        try:
+            from tools.mcp_tool import (
+                _load_mcp_config,
+                register_mcp_servers,
+                refresh_agent_mcp_tools,
+                _servers,
+                _server_connect_errors,
+                _lock,
+            )
+
+            servers = await loop.run_in_executor(None, _load_mcp_config)
+            if name not in servers:
+                return (
+                    "MCP Reload One\n"
+                    f"Target: {name}\n"
+                    "Status: blocked\n"
+                    "Detail: server is not configured."
+                )
+
+            with _lock:
+                was_connected = name in _servers
+
+            if was_connected:
+                with _lock:
+                    tools_count = len(getattr(_servers[name], "_registered_tool_names", []))
+                return (
+                    "MCP Reload One\n"
+                    f"Target: {name}\n"
+                    "Status: already connected\n"
+                    f"Tools available from target: {tools_count}\n"
+                    "Scope: one configured MCP server only; no reconnect was performed."
+                )
+
+            tool_names = await loop.run_in_executor(None, register_mcp_servers, {name: servers[name]})
+
+            with _lock:
+                connected = name in _servers
+                connected_count = len(_servers)
+                target_tools = len(getattr(_servers.get(name), "_registered_tool_names", [])) if connected else 0
+                error = _server_connect_errors.get(name)
+
+            lines = [
+                "MCP Reload One",
+                f"Target: {name}",
+            ]
+            if connected:
+                lines.append("Status: connected")
+                lines.append(f"Tools available from target: {target_tools}")
+                lines.append(f"Connected servers: {connected_count}")
+                try:
+                    _cache = getattr(self, "_agent_cache", None)
+                    _cache_lock = getattr(self, "_agent_cache_lock", None)
+                    if _cache_lock is not None and _cache:
+                        with _cache_lock:
+                            for _sess_key, _entry in list(_cache.items()):
+                                try:
+                                    _agent = _entry[0] if isinstance(_entry, tuple) else _entry
+                                except Exception:
+                                    continue
+                                if _agent is not None:
+                                    refresh_agent_mcp_tools(_agent, quiet_mode=True)
+                except Exception as _exc:
+                    logger.debug(
+                        "Failed to update cached agent tools after MCP single reload: %s",
+                        _exc,
+                    )
+                try:
+                    session_entry = self.session_store.get_or_create_session(event.source)
+                    self.session_store.append_to_transcript(
+                        session_entry.session_id,
+                        {
+                            "role": "user",
+                            "content": (
+                                f"[IMPORTANT: MCP server {name} has been reloaded. "
+                                f"{len(tool_names)} MCP tool(s) now available. "
+                                "The tool list for this conversation has been updated accordingly.]"
+                            ),
+                        },
+                    )
+                except Exception:
+                    pass
+            else:
+                lines.append("Status: failed")
+                lines.append("Tools available from target: 0")
+                lines.append("Connected servers unchanged.")
+                if error:
+                    lines.append("Detail: connection failed; raw error hidden. Check trusted terminal logs if needed.")
+            lines.append("Scope: one configured MCP server only; no global MCP shutdown was performed.")
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning("MCP single-server reload failed for %s: %s", name, e)
+            return (
+                "MCP Reload One\n"
+                f"Target: {name}\n"
+                "Status: failed\n"
+                "Detail: connection failed; raw error hidden. Check trusted terminal logs if needed."
+            )
 
 
 
@@ -19298,21 +19469,61 @@ def main():
             data = yaml.safe_load(f) or {}
             config = GatewayConfig.from_dict(data)
     
-    # start_gateway() already performs graceful teardown before returning.
-    # Force-exit afterwards so a wedged non-daemon worker thread cannot block
-    # interpreter finalization and strand the gateway half-shut down.
-    success = asyncio.run(start_gateway(config))
-    _exit_after_graceful_shutdown(success)
+    # start_gateway() performs the full graceful teardown (adapters
+    # disconnected, sessions saved + flushed, SQLite closed, cron/MCP stopped,
+    # PID file + runtime lock released) before it returns OR raises SystemExit
+    # with an explicit code. Force-exit afterwards so a wedged non-daemon worker
+    # thread (e.g. a ThreadPoolExecutor tool/LLM call blocked with no timeout)
+    # cannot block interpreter finalization (Py_FinalizeEx joins all non-daemon
+    # threads, incl. concurrent.futures' _python_exit) and strand the gateway
+    # half-shut down with the supervisor unable to restart it (#53107).
+    #
+    # SystemExit is caught explicitly: start_gateway raises it on the
+    # clean-fatal-config (#51228), planned-restart, and service-restart paths,
+    # all of which complete teardown first. Routing those codes through the
+    # same os._exit backstop means EVERY exit path is wedge-proof, not just the
+    # boolean-return ones.
+    try:
+        success = asyncio.run(start_gateway(config))
+        exit_code = 0 if success else 1
+    except SystemExit as e:
+        # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).
+        if e.code is None:
+            exit_code = 0
+        elif isinstance(e.code, int):
+            exit_code = e.code
+        else:
+            exit_code = 1
+    _exit_after_graceful_shutdown(exit_code)
 
 
-def _exit_after_graceful_shutdown(success: bool) -> None:
-    """Flush stdio and terminate immediately after graceful shutdown."""
+def _exit_after_graceful_shutdown(exit_code: int) -> None:
+    """Flush stdio + logging, then hard-exit with ``exit_code``.
+
+    Graceful teardown is already complete by the time this runs, so there is
+    nothing left that needs a clean interpreter shutdown. We deliberately use
+    ``os._exit`` (not ``sys.exit``): ``sys.exit`` raises ``SystemExit``, which
+    triggers ``Py_FinalizeEx`` → ``wait_for_thread_shutdown`` and joins every
+    non-daemon thread — exactly the hang (#53107) a wedged tool-worker causes.
+
+    ``os._exit`` also bypasses ``atexit`` handlers. That is safe here: the
+    gateway's atexit-registered cleanup (``remove_pid_file``,
+    ``release_gateway_runtime_lock``) is also performed explicitly inside
+    ``start_gateway``'s teardown, so nothing is leaked. Any NEW atexit handler
+    added to this process would be skipped — perform such cleanup in the
+    teardown path, not via atexit.
+
+    Logging is not flushed here: the gateway's handlers are synchronous
+    ``RotatingFileHandler``s that write each record immediately (no
+    ``MemoryHandler``/``QueueHandler`` buffering), so there is nothing pending.
+    Only stdio is buffered, so only stdio is flushed.
+    """
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()
         except Exception:
             pass
-    os._exit(0 if success else 1)
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":
