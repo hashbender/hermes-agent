@@ -189,7 +189,7 @@ def _file_mtime_key(host_path: str) -> tuple[float, int] | None:
 class ProcessHandle(Protocol):
     """Duck type that every backend's _run_bash() must return.
 
-    subprocess.Popen satisfies this natively.  SDK backends (Modal, Daytona, Tenki)
+    subprocess.Popen satisfies this natively.  SDK backends (Modal, Daytona)
     return _ThreadedProcessHandle which adapts their blocking calls.
     """
 
@@ -205,7 +205,7 @@ class ProcessHandle(Protocol):
 
 
 class _ThreadedProcessHandle:
-    """Adapter for SDK backends (Modal, Daytona, Tenki) that have no real subprocess.
+    """Adapter for SDK backends (Modal, Daytona) that have no real subprocess.
 
     Wraps a blocking ``exec_fn() -> (output_str, exit_code)`` in a background
     thread and exposes a ProcessHandle-compatible interface.  An optional
@@ -295,7 +295,7 @@ class BaseEnvironment(ABC):
     interrupt handling, and timeout enforcement.
     """
 
-    # Subclasses that embed stdin as a heredoc (Modal, Daytona, Tenki) set this.
+    # Subclasses that embed stdin as a heredoc (Modal, Daytona) set this.
     _stdin_mode: str = "pipe"  # "pipe" or "heredoc"
 
     # Snapshot creation timeout (override for slow cold-starts).
@@ -361,7 +361,12 @@ class BaseEnvironment(ABC):
         # Restore configured cwd after login shell profile scripts, which may
         # change the working directory (e.g. bashrc `cd ~`).  Without this,
         # pwd -P captures the profile's directory, not terminal.cwd.
-        _quoted_cwd = shlex.quote(self.cwd)
+        # Route through ``_quote_cwd_for_cd`` (not a bare ``shlex.quote``) so
+        # the Windows subclass override converts a native ``C:\Users\x`` cwd to
+        # the Git-Bash ``/c/Users/x`` form the bootstrap ``cd`` can resolve.
+        # Without this the snapshot bootstrap ``cd`` below fails on Windows and
+        # ``pwd -P`` captures the login shell's directory, not ``terminal.cwd``.
+        _quoted_cwd = self._quote_cwd_for_cd(self.cwd)
         # Quote the snapshot / cwd-file paths so Git Bash on Windows handles
         # ``C:/Users/...``-shaped paths without glob-splitting the colon or
         # tripping on drive letters.  On POSIX this is a no-op (no colons /
@@ -413,7 +418,7 @@ class BaseEnvironment(ABC):
             # Publish atomically only if assembly succeeded; otherwise drop the
             # partial temp rather than leave it to be sourced or orphaned.
             f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
-            f"builtin cd {_quoted_cwd} 2>/dev/null || true\n"
+            f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"pwd -P > {_quoted_cwd_file} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
@@ -833,7 +838,7 @@ class BaseEnvironment(ABC):
         """Parse the __HERMES_CWD_{session}__ marker from stdout output.
 
         Updates self.cwd and strips the marker from result["output"].
-        Used by remote backends (Docker, SSH, Modal, Daytona, Tenki, Singularity).
+        Used by remote backends (Docker, SSH, Modal, Daytona, Singularity).
         """
         output = result.get("output", "")
         marker = self._cwd_marker
@@ -870,7 +875,7 @@ class BaseEnvironment(ABC):
     def _before_execute(self) -> None:
         """Hook called before each command execution.
 
-        Remote backends (SSH, Modal, Daytona, Tenki) override this to trigger
+        Remote backends (SSH, Modal, Daytona) override this to trigger
         their FileSyncManager.  Bind-mount backends (Docker, Singularity)
         and Local don't need file sync — the host filesystem is directly
         visible inside the container/process.
