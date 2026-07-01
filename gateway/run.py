@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Union
+from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -1248,6 +1248,48 @@ def _planned_restart_notification_pending() -> bool:
 
 def _clear_planned_restart_notification() -> None:
     _planned_restart_notification_path().unlink(missing_ok=True)
+
+
+def _restart_notification_target_allowed(platform_cfg: Any, chat_id: Any) -> bool:
+    """Return whether restart lifecycle notifications may be sent to chat_id.
+
+    ``gateway_restart_notification`` remains the coarse per-platform kill switch.
+    ``extra.gateway_restart_notification_channels`` optionally narrows delivery
+    to a small allowlist, which is useful when a platform has many active
+    sessions but only one ops channel should receive lifecycle noise.
+    """
+    if platform_cfg is not None and not getattr(platform_cfg, "gateway_restart_notification", True):
+        return False
+
+    extra = getattr(platform_cfg, "extra", None) if platform_cfg is not None else None
+    if not isinstance(extra, dict):
+        return True
+
+    raw_allowed = extra.get("gateway_restart_notification_channels")
+    if raw_allowed in (None, ""):
+        return True
+
+    if isinstance(raw_allowed, str):
+        raw_allowed_text = raw_allowed.strip()
+        if raw_allowed_text.startswith("["):
+            try:
+                parsed_allowed = json.loads(raw_allowed_text)
+            except Exception:
+                parsed_allowed = None
+            if isinstance(parsed_allowed, list):
+                allowed = {str(part).strip() for part in parsed_allowed if str(part).strip()}
+            else:
+                allowed = {part.strip().strip("'\"") for part in raw_allowed_text.split(",") if part.strip()}
+        else:
+            allowed = {part.strip() for part in raw_allowed_text.split(",") if part.strip()}
+    elif isinstance(raw_allowed, (list, tuple, set)):
+        allowed = {str(part).strip() for part in raw_allowed if str(part).strip()}
+    else:
+        allowed = {str(raw_allowed).strip()}
+
+    if not allowed:
+        return True
+    return str(chat_id) in allowed
 
 
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
@@ -5148,10 +5190,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
                 platform_cfg = self.config.platforms.get(platform)
-                if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                if not _restart_notification_target_allowed(platform_cfg, chat_id):
                     logger.info(
-                        "Shutdown notification suppressed for active session: %s has gateway_restart_notification=false",
+                        "Shutdown notification suppressed for active session: %s target %s not allowed",
                         platform_str,
+                        chat_id,
                     )
                     continue
 
@@ -5237,10 +5280,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            if not _restart_notification_target_allowed(platform_cfg, home.chat_id):
                 logger.info(
-                    "Shutdown notification suppressed for home channel: %s has gateway_restart_notification=false",
+                    "Shutdown notification suppressed for home channel: %s target %s not allowed",
                     platform.value,
+                    home.chat_id,
                 )
                 continue
 
@@ -6354,7 +6398,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
@@ -7163,7 +7206,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-                    adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
@@ -7820,7 +7862,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter._busy_text_mode = self._busy_text_mode
 
             try:
@@ -7988,39 +8029,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return YuanbaoAdapter(config)
 
         return None
-
-    def _make_adapter_auth_check(
-        self,
-        platform: Platform,
-    ) -> Callable[[str, Optional[str], Optional[str]], bool]:
-        """Build a platform-bound auth callback for adapter use.
-
-        Adapters that fetch external context (e.g. Slack
-        ``conversations.replies``) call this through
-        ``BasePlatformAdapter._is_sender_authorized`` to mark non-allowlisted
-        senders as unverified in LLM context, mitigating indirect prompt
-        injection from third parties in shared threads/channels.
-
-        The returned callback delegates to :meth:`_is_user_authorized` so the
-        full auth chain — platform allowlists, group allowlists, pairing
-        store, allow-all flags — stays the single source of truth.
-        """
-        def check(
-            user_id: str,
-            chat_type: Optional[str] = None,
-            chat_id: Optional[str] = None,
-        ) -> bool:
-            if not user_id:
-                return False
-            source = SessionSource(
-                platform=platform,
-                chat_id=chat_id or "",
-                chat_type=chat_type or "group",
-                user_id=user_id,
-            )
-            return self._is_user_authorized(source)
-        return check
-
 
 
 
@@ -8472,32 +8480,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # earlier /queue items) finishes.  Messages are NOT merged.
             if event.get_command() in {"queue", "q"}:
                 queued_text = event.get_command_args().strip()
-                # Preserve media/reply payloads: a /queue carrying a photo,
-                # document, or reply context is valid even with no prompt text
-                # (e.g. "/queue" as the caption of an image). Dropping these
-                # fields silently lost the attachment when the queued turn ran.
-                has_media = bool(getattr(event, "media_urls", None))
-                if not queued_text and not has_media:
+                if not queued_text:
                     return "Usage: /queue <prompt>"
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     queued_event = MessageEvent(
                         text=queued_text,
-                        message_type=event.message_type if has_media else MessageType.TEXT,
+                        message_type=MessageType.TEXT,
                         source=event.source,
-                        raw_message=event.raw_message,
                         message_id=event.message_id,
-                        media_urls=list(getattr(event, "media_urls", []) or []),
-                        media_types=list(getattr(event, "media_types", []) or []),
-                        reply_to_message_id=event.reply_to_message_id,
-                        reply_to_text=event.reply_to_text,
-                        reply_to_author_id=event.reply_to_author_id,
-                        reply_to_author_name=event.reply_to_author_name,
-                        reply_to_is_own_message=event.reply_to_is_own_message,
-                        auto_skill=event.auto_skill,
                         channel_prompt=event.channel_prompt,
-                        internal=event.internal,
-                        timestamp=event.timestamp,
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
@@ -13610,10 +13602,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            if not _restart_notification_target_allowed(platform_cfg, chat_id):
                 logger.info(
-                    "Restart notification suppressed: %s has gateway_restart_notification=false",
+                    "Restart notification suppressed: %s target %s not allowed",
                     platform_str,
+                    chat_id,
                 )
                 return None
 
@@ -13676,10 +13669,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            if not _restart_notification_target_allowed(platform_cfg, home.chat_id):
                 logger.info(
-                    "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
+                    "Home-channel startup notification suppressed: %s target %s not allowed",
                     platform.value,
+                    home.chat_id,
                 )
                 continue
 
