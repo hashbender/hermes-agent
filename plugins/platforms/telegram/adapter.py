@@ -1773,16 +1773,24 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         await asyncio.sleep(delay)
 
+        # Capture a stable local reference: self._app can be reassigned to None
+        # by a concurrent disconnect() while we're suspended across the awaits
+        # below, and re-reading self._app after that point would silently swap
+        # in None mid-sequence instead of failing fast in one place.
+        app = self._app
+
         try:
-            if self._app and self._app.updater and self._app.updater.running:
-                await self._app.updater.stop()
+            if app and app.updater and app.updater.running:
+                await app.updater.stop()
         except Exception:
             pass
 
         await self._drain_polling_connections()
 
         try:
-            await self._app.updater.start_polling(
+            if not app:
+                raise RuntimeError("Telegram application was torn down during reconnect")
+            await app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=False,
                 error_callback=self._polling_error_callback_ref,
@@ -1824,6 +1832,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
+                # This chained retry IS the in-flight recovery attempt — it
+                # must replace the reentrancy guard, otherwise the heartbeat
+                # loop, the pending-updates probe, and the PTB error callback
+                # all see _polling_error_task as "done" and can each start a
+                # second, concurrent recovery for the same outage.
+                self._polling_error_task = task
 
     async def _polling_heartbeat_loop(self) -> None:
         """Detect dead Telegram TCP sockets (CLOSE-WAIT) by periodic probing.
@@ -2151,8 +2165,17 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.sleep(RETRY_DELAY)
             await self._drain_polling_connections()
 
+            # Capture a stable local reference: self._app can be reassigned to
+            # None by a concurrent disconnect() while we're suspended across
+            # the awaits above (same race #55992 fixed on the network path).
+            # Re-reading self._app after that point would raise
+            # AttributeError deep inside start_polling instead of failing fast
+            # here, where the except below reschedules or escalates to fatal.
+            app = self._app
             try:
-                await self._app.updater.start_polling(
+                if not app:
+                    raise RuntimeError("Telegram application was torn down during conflict reconnect")
+                await app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=False,
                     error_callback=self._polling_error_callback_ref,
@@ -7707,11 +7730,31 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_topic = created_name
 
         elif chat_type == "group" and thread_id_str:
-            # Group/supergroup forum topic skill binding via config.extra['group_topics']
-            group_topics_config: list = self.config.extra.get("group_topics", [])
-            for chat_entry in group_topics_config:
+            # Group/supergroup forum topic skill binding via config.extra['group_topics'].
+            # Accept both supported shapes:
+            #   [{"chat_id": "-100...", "topics": [...]}]
+            # and legacy/operator-edited mapping shape:
+            #   {"-100...": [{"thread_id": 12, ...}]}
+            group_topics_config = self.config.extra.get("group_topics", [])
+            if isinstance(group_topics_config, dict):
+                group_topics_iter = [
+                    {"chat_id": cfg_chat_id, "topics": topics}
+                    for cfg_chat_id, topics in group_topics_config.items()
+                ]
+            elif isinstance(group_topics_config, list):
+                group_topics_iter = [
+                    entry for entry in group_topics_config if isinstance(entry, dict)
+                ]
+            else:
+                group_topics_iter = []
+            for chat_entry in group_topics_iter:
                 if str(chat_entry.get("chat_id", "")) == str(chat.id):
-                    for topic in chat_entry.get("topics", []):
+                    topics = chat_entry.get("topics", [])
+                    if not isinstance(topics, list):
+                        topics = []
+                    for topic in topics:
+                        if not isinstance(topic, dict):
+                            continue
                         tid = topic.get("thread_id")
                         if tid is not None and str(tid) == thread_id_str:
                             chat_topic = topic.get("name")
