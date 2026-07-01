@@ -102,11 +102,6 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
     # Lua — manual (LuaLS is platform-specific binaries from GitHub
     # releases; complex enough that we punt to the user)
     "lua-language-server": {"strategy": "manual", "pkg": "", "bin": "lua-language-server"},
-    # PowerShell — PowerShellEditorServices ships as a GitHub release
-    # zip driven by a pwsh bootstrap script, not a single binary.  We
-    # require a manual bundle install and probe for the pwsh host so
-    # `hermes lsp status` reports the host's presence.
-    "powershell": {"strategy": "manual", "pkg": "", "bin": "pwsh"},
 }
 
 
@@ -122,9 +117,11 @@ def _is_windows() -> bool:
 
 def hermes_lsp_bin_dir() -> Path:
     """Return the Hermes-owned bin staging dir for LSP servers."""
-    home = os.environ.get("HERMES_HOME")
-    if home is None:
-        home = os.path.join(os.path.expanduser("~"), ".hermes")
+    try:
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())
+    except ImportError:
+        home = os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
     p = Path(home) / "lsp" / "bin"
     p.mkdir(parents=True, exist_ok=True)
     return p
