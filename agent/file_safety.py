@@ -13,7 +13,7 @@ def _hermes_home_path() -> Path:
         from hermes_constants import get_hermes_home  # local import to avoid cycles
         return get_hermes_home()
     except Exception:
-        return Path(os.path.expanduser("~/.hermes"))
+        return Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
 
 
 def _hermes_root_path() -> Path:
@@ -22,7 +22,7 @@ def _hermes_root_path() -> Path:
         from hermes_constants import get_default_hermes_root  # local import to avoid cycles
         return get_default_hermes_root()
     except Exception:
-        return Path(os.path.expanduser("~/.hermes"))
+        return Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
 
 
 def build_write_denied_paths(home: str) -> set[str]:
@@ -77,22 +77,15 @@ def build_write_denied_prefixes(home: str) -> list[str]:
     ]
 
 
-def get_safe_write_roots() -> set[str]:
-    """Return resolved HERMES_WRITE_SAFE_ROOT paths. Supports multiple directories
-    separated by ``os.pathsep`` (``:`` on Unix, ``;`` on Windows).
-    E.g., ``/opt/data:/var/www/html`` on Unix, ``C:\\data;D:\\www`` on Windows."""
-    env = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
-    if not env:
-        return set()
-    roots: set[str] = set()
-    for path in env.split(os.pathsep):
-        if path:
-            try:
-                resolved = os.path.realpath(os.path.expanduser(path))
-                roots.add(resolved)
-            except (OSError, ValueError):
-                continue
-    return roots
+def get_safe_write_root() -> Optional[str]:
+    """Return the resolved HERMES_WRITE_SAFE_ROOT path, or None if unset."""
+    root = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
+    if not root:
+        return None
+    try:
+        return os.path.realpath(os.path.expanduser(root))
+    except Exception:
+        return None
 
 
 def is_write_denied(path: str) -> bool:
@@ -131,15 +124,9 @@ def is_write_denied(path: str) -> bool:
         except Exception:
             pass
 
-    safe_roots = get_safe_write_roots()
-    if safe_roots:
-        allowed = False
-        for safe_root in safe_roots:
-            if resolved == safe_root or resolved.startswith(safe_root + os.sep):
-                allowed = True
-                break
-        if not allowed:
-            return True
+    safe_root = get_safe_write_root()
+    if safe_root and not (resolved == safe_root or resolved.startswith(safe_root + os.sep)):
+        return True
 
     return False
 
