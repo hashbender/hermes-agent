@@ -367,7 +367,18 @@ HARDLINE_PATTERNS = [
     # `${HOME}` brace form and quoted paths (`rm -rf "/"`, `rm -rf "$HOME"`)
     # are handled via _hardline_rm_path so the floor cannot be bypassed with
     # the ordinary quoting/brace shell idioms.
-    (_RM_FLAG_PREFIX + _hardline_rm_path(r'/|/\*|/ \*'), "recursive delete of root filesystem"),
+    #
+    # The path token matches any root-anchored path whose components collapse
+    # back to "/" in the shell: a bare "/", repeated slashes ("//"), and
+    # "."/".." current/parent segments ("/.", "/./", "/..") all resolve to
+    # root, optionally followed by a trailing glob ("/*", "//*"). The earlier
+    # "/|/\*|/ \*" form only caught the literal "/" / "/*" spellings, so
+    # `rm -rf //`, `rm -rf /.`, `rm -rf /./`, `rm -rf /..` and `rm -rf //*`
+    # silently slipped the hardline floor and executed under --yolo /
+    # approvals.mode=off / cron approve-mode. A trailing real segment
+    # (e.g. "/tmp", "/home", "/.ssh") still fails to match here and stays
+    # with the softer DANGEROUS_PATTERNS / system-directory rules.
+    (_RM_FLAG_PREFIX + _hardline_rm_path(r'/[/.]*\**'), "recursive delete of root filesystem"),
     (_RM_FLAG_PREFIX + _hardline_rm_path(_HARDLINE_SYSTEM_DIRS), "recursive delete of system directory"),
     (_RM_FLAG_PREFIX + _hardline_rm_path(r'(?:~|\$\{?HOME\}?)(?:/?|/\*)?'), "recursive delete of home directory"),
     # Filesystem format
@@ -743,18 +754,6 @@ def _normalize_command_for_detection(command: str) -> str:
     command = re.sub(r'\\([^\n])', r'\1', command)
     # Strip empty-string literals that split tokens: r''m → rm, r"\"m → rm.
     command = re.sub(r"''|\"\"", '', command)
-    # Collapse $IFS / ${IFS} word-separator expansions to a literal space.
-    # In any POSIX shell the IFS variable defaults to <space><tab><newline>,
-    # so `rm${IFS}-rf${IFS}/` is executed as `rm -rf /`. Because the dangerous
-    # and hardline patterns anchor on literal whitespace (\s) between a command
-    # and its arguments, leaving the unexpanded `${IFS}` token in place lets an
-    # attacker slip past EVERY pattern — including the unconditional hardline
-    # floor (rm -rf /, mkfs, dd to raw device, shutdown/reboot). Substituting a
-    # space here mirrors the shell's own expansion so the patterns fire. The
-    # brace form also covers bash substring expansions like `${IFS:0:1}` (a
-    # single space). Same de-obfuscation class as the backslash/empty-quote
-    # handling above.
-    command = re.sub(r'\$\{IFS\b[^}]*\}|\$IFS\b', ' ', command)
     return command
 
 
