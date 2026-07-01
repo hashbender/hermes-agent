@@ -521,9 +521,7 @@ def init_agent(
         from hermes_cli.config import load_config as _load_pc_cfg
 
         _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        # prompt_caching.enabled=false is honored in _anthropic_prompt_cache_policy
-        # (applied above and on every re-derivation), so no override is needed here.
-        _ttl = _pc_cfg.get("cache_ttl", "5m") if isinstance(_pc_cfg, dict) else "5m"
+        _ttl = _pc_cfg.get("cache_ttl", "5m")
         if _ttl in {"5m", "1h"}:
             agent._cache_ttl = _ttl
     except Exception:
@@ -1169,6 +1167,11 @@ def init_agent(
     # continuation row that must remain open after the helper is torn down;
     # those callers explicitly set this flag to False.
     agent._end_session_on_close = True
+    # When True, this agent NEVER persists to the canonical session store
+    # (state.db) or the JSON snapshot, regardless of session_id. Set on the
+    # background skill/memory review fork so its harness turn can't leak into
+    # the user's real session and hijack the next live turn. Default False.
+    agent._persist_disabled = False
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
