@@ -1,6 +1,7 @@
 import base64
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,6 +43,36 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["api_key"] == "pool-token"
     assert resolved["credential_pool"] is not None
     assert resolved["source"] == "manual"
+
+
+def test_resolve_runtime_provider_nous_pool_uses_env_base_url_override(monkeypatch):
+    entry = SimpleNamespace(
+        provider="nous",
+        source="device_code",
+        runtime_api_key="pool-token",
+        agent_key="pool-token",
+        agent_key_expires_at="2099-01-01T00:00:00+00:00",
+        scope="inference:invoke",
+        runtime_base_url="https://inference-api.nousresearch.com/v1",
+    )
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return entry
+
+    monkeypatch.setenv("NOUS_INFERENCE_BASE_URL", "https://ai.wildebeest-newton.ts.net/v1")
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
+    monkeypatch.setattr(rp, "_agent_key_is_usable", lambda *a, **k: True)
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    resolved = rp.resolve_runtime_provider(requested="nous")
+
+    assert resolved["provider"] == "nous"
+    assert resolved["api_key"] == "pool-token"
+    assert resolved["base_url"] == "https://ai.wildebeest-newton.ts.net/v1"
 
 
 def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkeypatch):
@@ -227,6 +258,38 @@ def test_resolve_runtime_provider_codex(monkeypatch):
     assert resolved["base_url"] == "https://chatgpt.com/backend-api/codex"
     assert resolved["api_key"] == "codex-token"
     assert resolved["requested_provider"] == "openai-codex"
+
+
+def test_resolve_runtime_provider_codex_app_server_accepts_api_mode_alias(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda provider: type("P", (), {"has_credentials": lambda self: False})(),
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.5",
+            "api_mode": "codex_app_server",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+            "source": "codex-auth-json",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["api_mode"] == "codex_app_server"
 
 
 def test_resolve_runtime_provider_qwen_oauth(monkeypatch):

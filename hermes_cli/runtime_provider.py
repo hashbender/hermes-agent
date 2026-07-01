@@ -368,8 +368,10 @@ def _maybe_apply_codex_app_server_runtime(
     """Optional opt-in: rewrite api_mode → "codex_app_server" for OpenAI/Codex
     providers when the user has explicitly enabled that runtime via
     `model.openai_runtime: codex_app_server` in config.yaml.
+    `model.api_mode: codex_app_server` is accepted as a compatibility alias so
+    users are not silently left on the default Codex Responses transport.
 
-    Default behavior is preserved: when the key is unset, "auto", or empty,
+    Default behavior is preserved: when neither key selects the app server,
     this function is a no-op. Only providers in {"openai", "openai-codex"}
     are eligible — other providers (anthropic, openrouter, etc.) cannot be
     rerouted through codex.
@@ -380,7 +382,8 @@ def _maybe_apply_codex_app_server_runtime(
     if provider not in {"openai", "openai-codex"}:
         return api_mode
     runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
-    if runtime == "codex_app_server":
+    configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
+    if runtime == "codex_app_server" or configured_mode == "codex_app_server":
         return "codex_app_server"
     return api_mode
 
@@ -1373,7 +1376,11 @@ def _resolve_explicit_runtime(
                 base_url = creds.get("base_url", "").rstrip("/") or base_url
         return {
             "provider": "openai-codex",
-            "api_mode": "codex_responses",
+            "api_mode": _maybe_apply_codex_app_server_runtime(
+                provider="openai-codex",
+                api_mode="codex_responses",
+                model_cfg=model_cfg,
+            ),
             "base_url": base_url,
             "api_key": api_key,
             "source": "explicit",
@@ -1705,7 +1712,11 @@ def resolve_runtime_provider(
             creds = resolve_codex_runtime_credentials()
             return {
                 "provider": "openai-codex",
-                "api_mode": "codex_responses",
+                "api_mode": _maybe_apply_codex_app_server_runtime(
+                    provider="openai-codex",
+                    api_mode="codex_responses",
+                    model_cfg=model_cfg,
+                ),
                 "base_url": creds.get("base_url", "").rstrip("/"),
                 "api_key": creds.get("api_key", ""),
                 "source": creds.get("source", "hermes-auth-store"),
