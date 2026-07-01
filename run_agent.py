@@ -1649,17 +1649,9 @@ class AIAgent:
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
-
-        Trailing empty-response scaffolding is dropped from the live list in
-        place (it is ephemeral junk the real transcript should shed). The
-        persist user-message *override* is NOT applied here — it is resolved
-        inside ``_flush_messages_to_session_db`` and written only to the DB row,
-        never mutating the live message list used by the API call (#48677 is
-        thus closed for every persist caller, not just this one).
         """
-        # Scaffolding removal mutates the live list (desired — ephemeral
-        # retry/failure sentinels must not survive into the real transcript).
         self._drop_trailing_empty_response_scaffolding(messages)
+        self._apply_persist_user_message_override(messages)
         self._session_messages = messages
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)
@@ -1750,18 +1742,7 @@ class AIAgent:
             return
         if not self._session_db:
             return
-        # Persist user-message override (#48677 chokepoint): historically this
-        # mutated the live `messages` list in place, which — on the early
-        # crash-resilience persist that runs BEFORE the API call is built —
-        # stripped observed group-chat context off the live user message and
-        # silently dropped it. Instead, resolve the override here and apply it
-        # ONLY to the value written to the DB (see the write loop below); the
-        # live dict is never mutated, so every caller (early persist, mid-loop
-        # flush, /resume, /branch) is protected uniformly. Timestamp override is
-        # metadata and is likewise applied only to the written row.
-        _ov_idx = getattr(self, "_persist_user_message_idx", None)
-        _ov_content = getattr(self, "_persist_user_message_override", None)
-        _ov_timestamp = getattr(self, "_persist_user_message_timestamp", None)
+        self._apply_persist_user_message_override(messages)
         try:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
@@ -1803,7 +1784,7 @@ class AIAgent:
                 if isinstance(item, dict)
             }
 
-            for _msg_idx, msg in enumerate(messages):
+            for msg in messages:
                 if not isinstance(msg, dict):
                     continue
                 # Never write ephemeral recovery scaffolding to the session
@@ -1827,16 +1808,6 @@ class AIAgent:
                     continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
-                _row_timestamp = msg.get("timestamp")
-                # Apply the persist override to THIS row's written values only
-                # (never to the live dict). Match the original guard: text-only
-                # content is replaced; multimodal (list) content is left intact
-                # so image/audio blocks aren't clobbered by the text override.
-                if _ov_idx == _msg_idx and msg.get("role") == "user":
-                    if _ov_content is not None and not isinstance(content, list):
-                        content = _ov_content
-                    if _ov_timestamp is not None:
-                        _row_timestamp = _ov_timestamp
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
                 # for cross-session replay.
@@ -1872,7 +1843,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
-                    timestamp=_row_timestamp,
+                    timestamp=msg.get("timestamp"),
                 )
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
@@ -4250,6 +4221,10 @@ class AIAgent:
         return True
 
     def _try_refresh_anthropic_client_credentials(self) -> bool:
+        # SDK runtime resolves auth via env at call time (build_auth_env);
+        # there is no long-lived anthropic client to rebuild on refresh.
+        if getattr(self, "_claude_agent_sdk_mode", None):
+            return False
         if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
             return False
         # Only refresh credentials for the native Anthropic provider.
@@ -4379,6 +4354,17 @@ class AIAgent:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
 
+        if getattr(self, "_claude_agent_sdk_mode", None):
+            # SDK runtime: update credential state only; auth env is recomputed
+            # per call in build_auth_env, and there is no anthropic client.
+            from agent.anthropic_adapter import _is_oauth_token
+            self._anthropic_api_key = runtime_key
+            self._anthropic_base_url = runtime_base
+            self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
+            self.api_key = runtime_key
+            self.base_url = runtime_base
+            return
+
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
 
@@ -4432,6 +4418,13 @@ class AIAgent:
         return pool.has_available()
 
     def _anthropic_messages_create(self, api_kwargs: dict):
+        # Claude Agent SDK runtime: there is no anthropic.Anthropic client —
+        # the SDK spawns the `claude` CLI. Route the turn to the SDK adapter,
+        # which returns an Anthropic-Message-shaped object that the existing
+        # AnthropicTransport.normalize_response consumes unchanged.
+        if getattr(self, "_claude_agent_sdk_mode", None):
+            from agent.claude_agent_sdk_adapter import create_claude_agent_message
+            return create_claude_agent_message(self, api_kwargs)
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
         # Defensive: strip Responses-only kwargs that can leak in under an
@@ -4457,6 +4450,11 @@ class AIAgent:
         path when an OAuth subscription rejects the 1M-context beta) so the
         rebuilt client carries the reduced beta set.
         """
+        if getattr(self, "_claude_agent_sdk_mode", None):
+            # SDK runtime owns its own transport (the `claude` CLI). Nothing to
+            # rebuild; keep the client slot empty.
+            self._anthropic_client = None
+            return
         _drop_1m = bool(getattr(self, "_oauth_1m_beta_disabled", False))
         if getattr(self, "provider", None) == "bedrock":
             from agent.anthropic_adapter import build_anthropic_bedrock_client
@@ -5581,6 +5579,7 @@ class AIAgent:
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
+            toolsets=function_args.get("toolsets"),
             tasks=function_args.get("tasks"),
             max_iterations=function_args.get("max_iterations"),
             acp_command=function_args.get("acp_command"),
