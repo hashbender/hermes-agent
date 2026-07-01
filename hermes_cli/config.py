@@ -1391,8 +1391,11 @@ DEFAULT_CONFIG = {
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
-    # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
+    # Set enabled: false as an escape hatch for strict providers that reject
+    # cache_control markers; cache_ttl must be "5m" or "1h" (Anthropic-supported
+    # tiers), other values are ignored.
     "prompt_caching": {
+        "enabled": True,
         "cache_ttl": "5m",
     },
 
@@ -2155,14 +2158,6 @@ DEFAULT_CONFIG = {
     "moa": {
         "default_preset": "default",
         "active_preset": "",
-        # When true, every MoA turn that runs the reference fan-out writes the
-        # FULL turn (each reference's exact input messages + output + usage/cost,
-        # and the aggregator's exact input + output) to a JSONL file at
-        # <hermes_home>/moa-traces/<session_id>.jsonl. Off by default — turn it
-        # on to audit / improve MoA behavior from real runs. Set trace_dir to
-        # override the output directory.
-        "save_traces": False,
-        "trace_dir": "",
         "presets": {
             "default": {
                 "reference_models": [
