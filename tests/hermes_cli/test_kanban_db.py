@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -860,6 +861,115 @@ def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
         assert result == _kb.DEFAULT_CRASH_GRACE_SECONDS, (
             f"expected default for {bad_val!r}, got {result}"
         )
+
+
+def test_detect_crashed_workers_protocol_violation_respects_failure_limit_floor(
+    kanban_home, monkeypatch,
+):
+    """Single clean-exit (rc=0) protocol-violation crash must NOT auto-block
+    on the first occurrence — the dispatcher used to hard-code
+    ``failure_limit=1`` for the protocol-violation class, which meant one
+    provider-auth crash permanently blocked the card on a class of error
+    that's actually recoverable (rotate the OpenRouter key, the next
+    respawn succeeds). The fix lets the global ``kanban.failure_limit``
+    (default 2) be the floor for protocol-violation crashes; only
+    ``is_systemic`` (>=3 same-fingerprint NON-protocol-violation
+    crashes) still hard-codes failure_limit=1.
+
+    Regression coverage for the rc=0 crash loop observed on t_06f05fc8
+    and t_de062926 (2026-06-23 -> 2026-06-27) and the t_85354f34
+    reproducer (2026-06-27 10:40).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="protocol-violation", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, "
+            "claim_lock=? WHERE id=?",
+            (77777, f"{host}:w-pv1", tid),
+        )
+        conn.commit()
+
+        # First clean_exit crash: protocol_violation=True, error_text
+        # matches the exact string the dispatcher stamps.
+        _kb._record_worker_exit(77777, _exited_status(0))
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+
+        # After ONE protocol-violation crash, task must stay in ready
+        # so the operator can rotate the key and the next respawn can
+        # succeed. The failure_limit floor (default 2) is now respected.
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"protocol-violation floor fix: task should stay ready after "
+            f"1 crash (failure_limit={kb.DEFAULT_FAILURE_LIMIT}), got {task.status}"
+        )
+        assert task.consecutive_failures == 1
+        assert "protocol violation" in (task.last_failure_error or "").lower()
+
+    # Second clean_exit crash: counter reaches DEFAULT_FAILURE_LIMIT,
+    # breaker trips, task transitions to blocked. This is the same
+    # outcome the OLD hardcoded-failure_limit=1 path produced for the
+    # second crash — but now AFTER giving the operator one retry window.
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, "
+            "claim_lock=? WHERE id=?",
+            (77778, f"{host}:w-pv2", tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(77778, _exited_status(0))
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"breaker should trip on the 2nd protocol-violation crash "
+            f"(== DEFAULT_FAILURE_LIMIT), got {task.status}"
+        )
+        assert task.consecutive_failures >= kb.DEFAULT_FAILURE_LIMIT
+
+
+def test_detect_crashed_workers_systemic_non_protocol_violation_still_fast_blocks(
+    kanban_home, monkeypatch,
+):
+    """The ``is_systemic`` path (>=3 same-fingerprint NON-protocol-violation
+    crashes) must STILL hard-code failure_limit=1 — this is the genuine
+    loop safety net that survives the protocol-violation floor raise.
+    A genuine non-protocol-violation crash loop (e.g. a worker that
+    keeps dying on a permissions error before the tool loop runs but
+    after some bootstrap logging that produces a non-protocol signature)
+    must trip on the first iteration past threshold.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        task_ids = []
+        for i in range(3):  # 3 same-fingerprint non-protocol crashes
+            tid = kb.create_task(conn, title=f"systemic-{i}", assignee="a")
+            host = _kb._claimer_id().split(":", 1)[0]
+            conn.execute(
+                "UPDATE tasks SET status='running', worker_pid=?, "
+                "claim_lock=? WHERE id=?",
+                (70000 + i, f"{host}:w-s{i}", tid),
+            )
+            task_ids.append(tid)
+            _kb._record_worker_exit(70000 + i, _exited_status(1))
+        conn.commit()
+
+        kb.detect_crashed_workers(conn)
+
+        for tid in task_ids:
+            task = kb.get_task(conn, tid)
+            assert task.status == "blocked", (
+                f"systemic fingerprint trip should auto-block immediately "
+                f"regardless of failure_limit floor; task {tid} status={task.status}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1742,6 +1852,196 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
         assert kb.get_task(conn, t).claim_lock is None
 
 
+def test_spawn_preflight_credentials_blocks_exhausted_profile(
+    kanban_home, monkeypatch,
+):
+    """When every credential entry on every provider for the assignee's
+    profile is ``last_status='exhausted'`` or ``'dead'``, the spawn-time
+    preflight must raise ``RuntimeError`` so the dispatcher's existing
+    ``except Exception`` handler routes through ``_record_spawn_failure``
+    with outcome='spawn_failed' — instant blocked with a remediation
+    hint, instead of the 60-second 401-then-protocol-violation dance.
+
+    Regression coverage for the t_85354f34 reproducer (2026-06-27 10:40)
+    where the ``main`` profile had every OpenRouter key stamped
+    ``last_status=exhausted, last_error_code=401`` and the worker died
+    in <1s with rc=0 before any tool loop.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    # Write a fake auth.json into the kanban_home fixture (== the
+    # 'default' profile dir per the resolve_profile_env resolution chain).
+    auth_path = kanban_home / "auth.json"
+    auth_path.write_text(
+        json.dumps({
+            "credential_pool": {
+                "openrouter": [
+                    {"key_id": "or-1", "last_status": "exhausted",
+                     "last_error_code": 401, "last_error_message": "Missing Authentication header"},
+                    {"key_id": "or-2", "last_status": "dead",
+                     "last_error_code": 403, "last_error_message": "token revoked"},
+                ],
+                "anthropic": [
+                    {"key_id": "ant-1", "last_status": "exhausted",
+                     "last_error_code": 429, "last_error_message": "rate limit"},
+                ],
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _kb._spawn_preflight_credentials("default")
+
+    msg = str(exc_info.value)
+    assert "no usable credentials" in msg
+    # Must surface at least one blocking provider so the operator knows
+    # which profile + provider to remediate.
+    assert "openrouter" in msg or "anthropic" in msg
+    # Must include the remediation hint that points at the auth file path.
+    assert "hermes auth" in msg or "auth.json" in msg
+    assert "rotate" in msg.lower() or "auth" in msg.lower()
+
+
+def test_spawn_preflight_credentials_passes_healthy_profile(
+    kanban_home, monkeypatch,
+):
+    """A profile with at least one healthy entry on at least one provider
+    must NOT trip the preflight — the credential pool may still pick a
+    working entry. Belt-and-braces with the protocol-violation floor:
+    even if the spawn does end up clean-exiting, the preflight didn't
+    false-block a profile that COULD have worked.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    auth_path = kanban_home / "auth.json"
+    auth_path.write_text(
+        json.dumps({
+            "credential_pool": {
+                "openrouter": [
+                    {"key_id": "or-1", "last_status": "exhausted",
+                     "last_error_code": 401},
+                    {"key_id": "or-2", "last_status": "ok"},
+                ],
+                "anthropic": [
+                    {"key_id": "ant-1"},  # missing last_status = healthy
+                ],
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    # Must NOT raise — every provider has at least one non-blocking entry.
+    result = _kb._spawn_preflight_credentials("default")
+    assert result is None
+
+
+def test_spawn_preflight_credentials_passes_mixed_pool(
+    kanban_home, monkeypatch,
+):
+    """Regression coverage for kanban task t_e3e0256f (2026-06-29).
+
+    The original ``if blocking_providers:`` check raised whenever ANY
+    provider had every entry blocked, even when OTHER providers in the
+    pool still had healthy entries. The fix: spawn proceeds iff at
+    least one provider in the pool is healthy. This test mirrors the
+    live repro — one provider fully exhausted (``openrouter``,
+    ``last_status='exhausted'``), another healthy
+    (``minimax-oauth``, ``last_status=None``/missing).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    auth_path = kanban_home / "auth.json"
+    auth_path.write_text(
+        json.dumps({
+            "credential_pool": {
+                "openrouter": [
+                    {"key_id": "or-1", "last_status": "exhausted",
+                     "last_error_code": 401,
+                     "last_error_message": "Missing Authentication header"},
+                ],
+                "minimax-oauth": [
+                    # last_status missing → counts as healthy (never failed).
+                    {"key_id": "mmo-1"},
+                ],
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    # Must NOT raise — ``minimax-oauth`` has a healthy entry and the
+    # worker's credential pool can pick it.
+    result = _kb._spawn_preflight_credentials("default")
+    assert result is None
+
+
+def test_spawn_preflight_credentials_blocks_when_only_one_provider_and_blocked(
+    kanban_home, monkeypatch,
+):
+    """Edge case: a single-provider pool that is all-blocked must still
+    raise — sanity check that the fix didn't accidentally weaken the
+    all-dead-pools-still-block behavior. The earlier
+    ``blocks_exhausted_profile`` test covers the multi-provider all-dead
+    case; this one covers single-provider all-dead.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    auth_path = kanban_home / "auth.json"
+    auth_path.write_text(
+        json.dumps({
+            "credential_pool": {
+                "openrouter": [
+                    {"key_id": "or-1", "last_status": "exhausted",
+                     "last_error_code": 401},
+                ],
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _kb._spawn_preflight_credentials("default")
+
+    msg = str(exc_info.value)
+    assert "no usable credentials" in msg
+    assert "openrouter" in msg
+
+
+def test_spawn_preflight_credentials_passes_when_no_auth_json(
+    kanban_home, monkeypatch,
+):
+    """Fail-open semantics: when no auth.json exists on disk, the worker
+    may still pick up env-var auth or interactive flows. Don't block
+    spawn; the credential pool inside the worker will surface any real
+    error.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    # kanban_home is fresh per fixture — no auth.json written.
+    assert not (kanban_home / "auth.json").exists()
+    result = _kb._spawn_preflight_credentials("default")
+    assert result is None
+
+
+def test_spawn_preflight_credentials_fails_open_on_corrupt_auth_json(
+    kanban_home, monkeypatch,
+):
+    """A corrupt or unreadable auth.json must NOT block the spawn. The
+    preflight is fail-open by design — its job is to short-circuit the
+    obvious exhaustion case, not to replace the credential pool's own
+    retry/auth logic. The pool re-reads auth.json on every entry selection,
+    so a real worker would still get a clean error if the file is actually
+    broken.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    auth_path = kanban_home / "auth.json"
+    auth_path.write_text("{this is not valid json", encoding="utf-8")
+
+    result = _kb._spawn_preflight_credentials("default")
+    assert result is None  # fail-open: corrupted file doesn't block spawn
+
+
 def test_dispatch_max_spawn_counts_existing_running_tasks(
     kanban_home, all_assignees_spawnable
 ):
@@ -1854,7 +2154,7 @@ def test_respawn_guard_blocker_auth_on_authentication_error(kanban_home):
 
 
 def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
-    """Full word 'authorization' triggers blocker_auth (regex covers auth\\w*)."""
+    """Full word 'authorization' triggers blocker_auth (regex covers auth\w*)."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="authz-task", assignee="alice")
         conn.execute(
@@ -1863,6 +2163,230 @@ def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "blocker_auth"
+
+
+# ------------------------------------------------------------------
+# Bounded deferral window for blocker_auth (t_7f4b0ff2, 2026-06-29)
+#
+# Without a TTL, the regex-based blocker_auth guard parks a task in
+# ``ready`` indefinitely when the last failure is stale but matches a
+# quota/auth pattern. The deferral path does not bump
+# ``consecutive_failures`` so the auto-block circuit breaker cannot
+# free the task either. The window (default 1800s, env-tunable via
+# ``HERMES_KANBAN_BLOCKER_AUTH_WINDOW_SECONDS``) gives a stale 429
+# room to clear and lets the dispatcher take a fresh probe once the
+# failure is old enough that the regex's verdict is no longer fresh.
+# ------------------------------------------------------------------
+
+
+def test_respawn_guard_blocker_auth_within_window_deferred(kanban_home):
+    """A quota error within the window stays deferred as blocker_auth.
+
+    The fresh-failure path must NOT release the guard: a real ongoing
+    quota wall still warrants deferring the spawn so the dispatcher
+    doesn't thrash on it every tick. Only stale failures (older than
+    the window) release.
+    """
+    now = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fresh-quota", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ?, last_failure_at = ? "
+            "WHERE id = ?",
+            ("quota exceeded", now - 60, t),  # 60s ago, well inside default 1800s
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "blocker_auth"
+
+
+def test_respawn_guard_blocker_auth_outside_window_released(kanban_home):
+    """A quota error older than the window releases the guard.
+
+    Regression test for t_7f4b0ff2: the dispatcher stuck at 0 spawned
+    for 21.9h on two ready tasks whose ``last_failure_error`` still
+    matched the 429 pattern from a credential issue that had already
+    been resolved hours earlier. With the bounded window the guard
+    releases and the dispatcher takes a fresh probe.
+    """
+    now = int(time.time())
+    window = kb.DEFAULT_RESPAWN_BLOCKER_WINDOW_SECONDS  # 1800
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale-quota", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ?, last_failure_at = ? "
+            "WHERE id = ?",
+            ("429 too many requests", now - (window + 60), t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_blocker_auth_exactly_at_window_released(kanban_home):
+    """A failure exactly at the window edge releases the guard.
+
+    The implementation uses ``>=`` (``now - failed_at >= window``) so
+    a failure of EXACTLY the window age should already be released.
+    Lock the boundary so a future flip to strict ``>`` doesn't
+    silently re-introduce the t_7f4b0ff2 stuck condition.
+    """
+    now = int(time.time())
+    window = kb.DEFAULT_RESPAWN_BLOCKER_WINDOW_SECONDS
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="boundary", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ?, last_failure_at = ? "
+            "WHERE id = ?",
+            ("403 forbidden", now - window, t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_blocker_auth_window_env_override(kanban_home, monkeypatch):
+    """HERMES_KANBAN_BLOCKER_AUTH_WINDOW_SECONDS overrides the default window.
+
+    Operators running a tight quota wall (sub-minute resets) want a
+    shorter window so the dispatcher probes again sooner. The helper
+    reads the env var on every call so monkeypatch.setenv works
+    without a process restart.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_BLOCKER_AUTH_WINDOW_SECONDS", "120")
+    now = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="tight-window", assignee="alice")
+        # 90s old — under the 120s env-overridden window → still deferred
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ?, last_failure_at = ? "
+            "WHERE id = ?",
+            ("quota exhausted", now - 90, t),
+        )
+        assert kb.check_respawn_guard(conn, t) == "blocker_auth"
+        # Bump age past the env-overridden window → released
+        conn.execute(
+            "UPDATE tasks SET last_failure_at = ? WHERE id = ?",
+            (now - 240, t),
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_blocker_auth_window_zero_disables_guard(
+    kanban_home, monkeypatch
+):
+    """HERMES_KANBAN_BLOCKER_WINDOW_SECONDS=0 disables the guard entirely.
+
+    Tests and operators who prefer the auto-block circuit breaker as
+    the sole gatekeeper use 0 to disable the deferral. The guard must
+    always return None so the dispatcher attempts a fresh probe.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_BLOCKER_AUTH_WINDOW_SECONDS", "0")
+    now = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="disabled-guard", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ?, last_failure_at = ? "
+            "WHERE id = ?",
+            ("auth failure on every credential", now - 1, t),  # brand-new
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_blocker_auth_legacy_null_failure_at_uses_created_at(
+    kanban_home,
+):
+    """Legacy rows with last_failure_at=NULL fall back to created_at.
+
+    The migration backfills ``last_failure_at`` from the latest failure
+    event for tasks that already had a ``spawn_failed``/``gave_up`` row
+    — but the fallback path still matters for tests and for any future
+    rollback that re-introduces a NULL. The fallback must be
+    conservative: if ``created_at`` is ALSO newer than the window, the
+    guard still releases (the task is just old enough that the legacy
+    data should not trap it).
+    """
+    now = int(time.time())
+    window = kb.DEFAULT_RESPAWN_BLOCKER_WINDOW_SECONDS
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy", assignee="alice")
+        # created_at is old (well past the window), last_failure_at is
+        # NULL to simulate a pre-migration row.
+        old_created = now - (window * 4)
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ?, last_failure_at = NULL, "
+            "created_at = ? WHERE id = ?",
+            ("quota wall", old_created, t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_blocker_auth_legacy_null_failure_at_recent_keeps_deferral(
+    kanban_home,
+):
+    """Recent created_at + NULL last_failure_at still defers.
+
+    Mirror of the test above: if the fallback anchor (``created_at``)
+    is itself inside the window, the guard should NOT release — we
+    have no better signal than ``created_at`` and a freshly-created
+    task with a quota-style error is almost certainly still under
+    the quota wall.
+    """
+    now = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fresh-legacy", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ?, last_failure_at = NULL, "
+            "created_at = ? WHERE id = ?",
+            ("429 rate limit hit", now - 30, t),  # created 30s ago, inside window
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "blocker_auth"
+
+
+def test_respawn_guard_blocker_auth_dispatch_once_integration(
+    kanban_home, monkeypatch
+):
+    """End-to-end: dispatch_once auto-spawns a task once the window elapses.
+
+    Without the bounded window the dispatcher would defer the task
+    forever (regression of t_7f4b0ff2). With the window, a task with a
+    stale failure older than the window appears in the spawned list on
+    the next dispatcher tick.
+    """
+    import hermes_cli.kanban_db as kb_mod
+
+    # Stub spawn_fn so we can drive dispatch_once without spawning a
+    # real subprocess. The stub records every (task_id, assignee,
+    # workspace) triple it would have spawned.
+    spawned_calls: list[tuple[str, str, str]] = []
+
+    def fake_spawn(task, workspace, *, board=None):  # noqa: ARG001
+        spawned_calls.append((task.id, task.assignee or "", workspace))
+        return 12345  # pretend PID
+
+    now = int(time.time())
+    window = kb.DEFAULT_RESPAWN_BLOCKER_WINDOW_SECONDS
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="integration", assignee="alice")
+        # Stamp a 429 error and age it past the window. Without the
+        # fix this task sits in ``ready`` forever; with the fix the
+        # next dispatch_once picks it up.
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ?, last_failure_at = ? "
+            "WHERE id = ?",
+            ("429 too many requests", now - (window + 120), t),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            board=None,
+            max_in_progress_per_profile=None,
+        )
+
+    assert any(call[0] == t for call in spawned_calls), (
+        f"expected task to be auto-spawned after window elapsed; "
+        f"spawned={spawned_calls!r} result={result!r}"
+    )
 
 
 def test_respawn_guard_recent_success(kanban_home):
