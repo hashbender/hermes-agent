@@ -362,10 +362,27 @@ def _is_blocked_device_path(path: str) -> bool:
         ("/fd/0", "/fd/1", "/fd/2")
     ):
         return True
-    # /proc/*/environ, /proc/*/cmdline, /proc/*/maps can leak secrets,
-    # command-line args, and memory layout from the host process (issue #4427)
+    # /proc/*/environ, /proc/*/cmdline, /proc/*/maps (and the maps variants
+    # smaps, smaps_rollup, numa_maps) can leak secrets, command-line args, and
+    # memory layout (ASLR bypass) from the host process (issue #4427).
+    # /proc/*/mem exposes raw process memory; block it as defense-in-depth even
+    # though it requires address knowledge to exploit usefully.
+    # /proc/*/auxv leaks AT_RANDOM (stack canary seed) plus AT_BASE/AT_PHDR
+    # load addresses — an ASLR oracle on par with maps. /proc/*/pagemap exposes
+    # virtual->physical translation. Both are blocked alongside the maps family.
+    # endswith matches both /proc/<pid>/X and /proc/<pid>/task/<tid>/X.
     if normalized.startswith("/proc/") and normalized.endswith(
-        ("/environ", "/cmdline", "/maps")
+        (
+            "/environ",
+            "/cmdline",
+            "/maps",
+            "/smaps",
+            "/smaps_rollup",
+            "/numa_maps",
+            "/mem",
+            "/auxv",
+            "/pagemap",
+        )
     ):
         return True
     return False
@@ -409,6 +426,55 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     if _is_blocked_device_path(resolved):
         return True
     return False
+
+
+def _search_result_read_block_error(path: str, task_id: str = "default") -> str | None:
+    """Return the read-safety error for a search result path.
+
+    Search backends may return paths relative to the task cwd, while
+    ``get_read_block_error`` expects an already-resolved path when the task cwd
+    can differ from the Python process cwd. Mirror ``read_file_tool``'s path
+    resolution before applying the shared read guard.
+    """
+    try:
+        resolved = _resolve_path_for_task(path, task_id)
+    except (OSError, ValueError, RuntimeError):
+        return get_read_block_error(path)
+    return get_read_block_error(str(resolved))
+
+
+def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
+    """Remove credential/cache/env paths from a SearchResult in-place."""
+    omitted = 0
+
+    if hasattr(result, "matches") and result.matches:
+        allowed_matches = []
+        for match in result.matches:
+            if _search_result_read_block_error(match.path, task_id):
+                omitted += 1
+                continue
+            allowed_matches.append(match)
+        result.matches = allowed_matches
+
+    if hasattr(result, "files") and result.files:
+        allowed_files = []
+        for file_path in result.files:
+            if _search_result_read_block_error(file_path, task_id):
+                omitted += 1
+                continue
+            allowed_files.append(file_path)
+        result.files = allowed_files
+
+    if hasattr(result, "counts") and result.counts:
+        allowed_counts = {}
+        for file_path, count in result.counts.items():
+            if _search_result_read_block_error(file_path, task_id):
+                omitted += 1
+                continue
+            allowed_counts[file_path] = count
+        result.counts = allowed_counts
+
+    return omitted
 
 
 # Paths that file tools should refuse to write to without going through the
@@ -891,8 +957,6 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 image = overrides.get("modal_image") or config["modal_image"]
             elif env_type == "daytona":
                 image = overrides.get("daytona_image") or config["daytona_image"]
-            elif env_type == "tenki":
-                image = overrides.get("tenki_image") or config["tenki_image"]
             else:
                 image = ""
 
@@ -920,7 +984,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in _CONTAINER_BACKENDS:
+            if env_type in {"docker", "singularity", "modal", "daytona"}:
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
@@ -930,16 +994,6 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                     "docker_forward_env": config.get("docker_forward_env", []),
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                    "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                    "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                    "tenki_project_id": config.get("tenki_project_id", ""),
-                    "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                    "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                    "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                    "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                    "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                    "tenki_pause_retention": config.get("tenki_pause_retention", 0),
-                    "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
                 }
 
             ssh_config = None
@@ -1744,16 +1798,31 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "already_searched": count,
             }, ensure_ascii=False)
 
+        try:
+            resolved_path = _resolve_path_for_task(path, task_id)
+        except (OSError, ValueError, RuntimeError):
+            resolved_path = None
+        block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
+        if block_error:
+            return json.dumps({"error": block_error}, ensure_ascii=False)
+
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
+        omitted = _filter_read_blocked_search_results(result, task_id)
         if hasattr(result, 'matches'):
             for m in result.matches:
                 if hasattr(m, 'content') and m.content:
                     m.content = redact_sensitive_text(m.content, file_read=True)
         result_dict = result.to_dict(densify=True)
+
+        if omitted:
+            result_dict["_omitted"] = (
+                f"{omitted} result(s) omitted because they target credential, "
+                "token, cache, or secret-bearing environment files."
+            )
 
         if count >= 3:
             result_dict["_warning"] = (
