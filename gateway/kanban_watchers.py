@@ -202,6 +202,24 @@ class GatewayKanbanWatchersMixin:
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
+                    # Widen to every platform any secondary profile has live,
+                    # not just the default profile's. This is only a coarse
+                    # pre-filter to skip claiming events for subs nobody can
+                    # possibly deliver — the precise per-profile check (via
+                    # gateway/authz_mixin.py::_authorization_adapter, which
+                    # forbids default-profile fallback) still runs at delivery
+                    # time below, rewinding the claim if it resolves to None.
+                    # Without this, a subscription owned by a secondary
+                    # profile on a platform the DEFAULT profile never
+                    # connected (e.g. beta owns discord, default doesn't) was
+                    # dropped here before ever being claimed — no rewind
+                    # applies to an unclaimed event, so it silently never
+                    # retries.
+                    for _profile_adapter_map in getattr(self, "_profile_adapters", {}).values():
+                        active_platforms.update(
+                            getattr(platform, "value", str(platform)).lower()
+                            for platform in _profile_adapter_map.keys()
+                        )
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
@@ -311,13 +329,16 @@ class GatewayKanbanWatchersMixin:
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
-                    adapter = None
-                    if sub_profile:
-                        _profile_map = getattr(self, "_profile_adapters", {}).get(sub_profile)
-                        if _profile_map:
-                            adapter = _profile_map.get(plat)
-                    if adapter is None:
-                        adapter = self.adapters.get(plat)
+                    # Route via the SAME chokepoint the authorization path uses
+                    # (gateway/authz_mixin.py::_authorization_adapter): a stamped
+                    # profile with its own adapter-registry entry must be served
+                    # by THAT profile's same-platform adapter and must NOT silently
+                    # fall back to the default profile's adapter — otherwise a
+                    # secondary profile's task notification is delivered by the
+                    # wrong bot (the cross-profile mis-delivery this whole change
+                    # exists to fix). The helper returns None only when the profile
+                    # (or default) genuinely has no adapter for the platform.
+                    adapter = self._authorization_adapter(plat, sub_profile or None)
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
@@ -394,6 +415,13 @@ class GatewayKanbanWatchersMixin:
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
                         else:
+                            # archived / unblocked are claimed by TERMINAL_KINDS
+                            # (so the cursor advances past them and they can't
+                            # wedge a later completed/blocked event behind an
+                            # unclaimed row) but are intentionally SILENT: an
+                            # archive needs no user ping, and unblocked is an
+                            # internal transition. They are also excluded from
+                            # _WAKE_KINDS below, so they never wake the creator.
                             continue
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
@@ -504,6 +532,23 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     from gateway.session import SessionSource
                                     from gateway.platforms.base import MessageEvent, MessageType
+                                    # KNOWN LIMITATION (tracked follow-up): the
+                                    # subscription row does not persist the
+                                    # creator's chat_type, and it is not carried
+                                    # on the session-context bridge, so we cannot
+                                    # faithfully reconstruct the creator's real
+                                    # session key here. build_session_key() keys
+                                    # DMs (":dm:<chat_id>") on a wholly different
+                                    # shape from group/thread, so any hardcoded
+                                    # value mis-routes some creators. "group" is
+                                    # the least-surprising default for the
+                                    # dashboard/group flows this wake primarily
+                                    # serves; DM-originated creators are handled
+                                    # by the follow-up that stamps + persists
+                                    # chat_type end-to-end. handle_message()
+                                    # get_or_create_session's the target, so a
+                                    # mismatch degrades to "wake lands in a fresh
+                                    # group session" — never an exception.
                                     _source = SessionSource(
                                         platform=plat,
                                         chat_id=sub["chat_id"],
@@ -524,9 +569,15 @@ class GatewayKanbanWatchersMixin:
                                         sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                                     )
                             except Exception as _wk_err:
-                                logger.debug(
+                                # Best-effort: the notification itself already
+                                # delivered and the cursor has advanced, so a
+                                # broken wake path must not wedge the tick — but
+                                # log at WARNING with a traceback rather than
+                                # DEBUG so a persistently-failing wake is visible
+                                # in normal logs instead of silently no-op'ing.
+                                logger.warning(
                                     "kanban notifier: wakeup injection failed for %s: %s",
-                                    sub["task_id"], _wk_err,
+                                    sub["task_id"], _wk_err, exc_info=True,
                                 )
                         if task_terminal:
                             await asyncio.to_thread(
