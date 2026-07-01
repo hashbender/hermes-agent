@@ -2383,10 +2383,16 @@ DEFAULT_CONFIG = {
     # cron_mode — what to do when a cron job hits a dangerous command:
     #   deny    — block the command and let the agent find another way (default, safe)
     #   approve — auto-approve all dangerous commands in cron jobs
+    #
+    # kanban_mode — same choice, for kanban-dispatched worker subprocesses
+    # (also unattended — no user present to approve):
+    #   deny    — block the command and let the worker find another way (default, safe)
+    #   approve — auto-approve all dangerous commands in kanban workers
     "approvals": {
         "mode": "manual",
         "timeout": 60,
         "cron_mode": "deny",
+        "kanban_mode": "deny",
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system
