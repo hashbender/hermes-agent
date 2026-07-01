@@ -149,7 +149,7 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                     except json.JSONDecodeError:
                         # This shouldn't happen since we validate and retry during conversation,
                         # but if it does, log warning and use empty dict
-                        logger.warning(f"Unexpected invalid JSON in trajectory conversion: {tool_call['function']['arguments'][:100]}")
+                        logger.warning("Unexpected invalid JSON in trajectory conversion: %s", tool_call['function']['arguments'][:100])
                         arguments = {}
                     
                     tool_call_json = {
@@ -900,7 +900,7 @@ def recover_with_credential_pool(
                         refreshed_id,
                     )
                     return False, has_retried_429
-            _ra().logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
+            _ra().logger.info("Credential auth failure — refreshed pool entry %s", getattr(refreshed, 'id', '?'))
             agent._swap_credential(refreshed)
             return True, has_retried_429
         # Refresh failed — rotate to next credential instead of giving up.
@@ -1400,7 +1400,7 @@ def dump_api_request_debug(
         return dump_file
     except Exception as dump_error:
         if agent.verbose_logging:
-            logger.warning(f"Failed to dump API request debug payload: {dump_error}")
+            logger.warning("Failed to dump API request debug payload: %s", dump_error)
         return None
 
 
@@ -1442,21 +1442,6 @@ def anthropic_prompt_cache_policy(
     eff_base_url = base_url if base_url is not None else (agent.base_url or "")
     eff_api_mode = api_mode if api_mode is not None else (agent.api_mode or "")
     eff_model = (model if model is not None else agent.model) or ""
-
-    # Global kill switch: prompt_caching.enabled=false disables cache_control
-    # markers on every path (init, /model switch, fallback re-derivation).
-    # Escape hatch for strict Anthropic-compatible proxies that inject their
-    # own markers server-side — stacking ours on top exceeds Anthropic's
-    # 4-breakpoint limit and 400s. Gating here (not just at init) keeps the
-    # switch honored after a model switch or fallback re-evaluates the policy.
-    try:
-        from hermes_cli.config import load_config as _load_pc_cfg
-
-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        if isinstance(_pc_cfg, dict) and _pc_cfg.get("enabled") is False:
-            return False, False
-    except Exception:
-        pass
 
     model_lower = eff_model.lower()
     provider_lower = eff_provider.lower()
