@@ -34,6 +34,10 @@ Example config::
         headers:
           Authorization: "Bearer sk-..."
         timeout: 180
+        skip_preflight: true  # bypass the content-type probe for a valid
+                              # Streamable HTTP endpoint that answers HEAD/GET
+                              # with a non-MCP content type (e.g. text/plain)
+                              # but serves real MCP over POST. Default: false.
       searxng:
         url: "http://localhost:8000/sse"
         transport: sse       # use SSE transport instead of Streamable HTTP
@@ -63,6 +67,9 @@ Features:
       sampling/createMessage (text and tool-use responses)
     - Parallel tool call opt-in: per-server ``supports_parallel_tool_calls``
       flag allows concurrent execution of tools from the same server
+    - Preflight opt-out: per-server ``skip_preflight`` flag bypasses the
+      content-type probe for valid Streamable HTTP endpoints whose HEAD/GET
+      advertises a non-MCP content type (real MCP is served over POST)
 
 Architecture:
     A dedicated background event loop (_mcp_loop) runs in a daemon thread.
@@ -2311,8 +2318,17 @@ class MCPServerTask:
             # prior successful connect) — the endpoint was validated once,
             # re-probing is a redundant round-trip. Also skip for OAuth servers:
             # without a cached token the endpoint returns HTML or 401, which
-            # would incorrectly block the OAuth flow before it can run.
-            if config.get("transport") != "sse" and not self._ready.is_set() and self._auth_type != "oauth":
+            # would incorrectly block the OAuth flow before it can run. Finally,
+            # honor an explicit ``skip_preflight`` opt-out for valid Streamable
+            # HTTP servers that answer HEAD/GET with a non-MCP content type
+            # (e.g. text/plain) yet serve real MCP over POST — the heuristic
+            # would otherwise reject them before the handshake gets a chance.
+            if (
+                config.get("transport") != "sse"
+                and not self._ready.is_set()
+                and self._auth_type != "oauth"
+                and not config.get("skip_preflight")
+            ):
                 try:
                     _probe_headers = dict(config.get("headers") or {})
                     await self._preflight_content_type(
@@ -3731,11 +3747,43 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
         return {"type": "object", "properties": {}}
 
     def _rewrite_local_refs(node):
+        """Walk the schema, promoting legacy ``definitions`` to ``$defs``.
+
+        The promotion is contextual: ``definitions`` is renamed only when it
+        appears as a JSON Schema *meta-keyword* (sibling of ``properties`` /
+        ``$ref`` at a schema node), never when it appears as the *name of a
+        property* (i.e., as a key inside a ``properties`` dict).
+
+        Without this gate, MCP servers that legitimately expose a tool
+        parameter named ``definitions`` (e.g. a CI/pipelines tool that uses
+        ``definitions`` for an array of pipeline-definition IDs) would have
+        that user-facing property name silently rewritten to ``$defs``.
+        Anthropic and OpenAI both reject ``$`` in property names
+        (``^[a-zA-Z0-9_.-]{1,64}$``), so the whole tool array gets a 400 and
+        every conversation breaks.
+
+        The gate works by treating ``properties`` and ``patternProperties``
+        specially during descent: we iterate the property-name -> schema map
+        directly, leaving the property names verbatim, then recurse into each
+        property's schema where ordinary JSON Schema semantics resume (so any
+        legitimately-nested ``definitions`` meta-keyword inside a property's
+        schema is still promoted).
+        """
         if isinstance(node, dict):
             normalized = {}
             for key, value in node.items():
-                out_key = "$defs" if key == "definitions" else key
-                normalized[out_key] = _rewrite_local_refs(value)
+                if key in ("properties", "patternProperties") and isinstance(value, dict):
+                    # Keys of this dict are user-facing property names, not
+                    # meta-keywords. Preserve them verbatim; recurse only into
+                    # each property's schema, where ``definitions`` again has
+                    # its JSON Schema meaning.
+                    normalized[key] = {
+                        prop_name: _rewrite_local_refs(prop_schema)
+                        for prop_name, prop_schema in value.items()
+                    }
+                else:
+                    out_key = "$defs" if key == "definitions" else key
+                    normalized[out_key] = _rewrite_local_refs(value)
             ref = normalized.get("$ref")
             if isinstance(ref, str) and ref.startswith("#/definitions/"):
                 normalized["$ref"] = "#/$defs/" + ref[len("#/definitions/"):]
