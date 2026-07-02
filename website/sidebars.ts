@@ -10,7 +10,6 @@ const sidebars: SidebarsConfig = {
       items: [
         'getting-started/quickstart',
         'getting-started/installation',
-        'getting-started/platform-support',
         'getting-started/termux',
         'getting-started/nix-setup',
         'getting-started/updating',
@@ -70,7 +69,6 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/honcho',
             'user-guide/features/context-files',
             'user-guide/features/context-references',
-            'user-guide/features/mixture-of-agents',
             'user-guide/features/personality',
             'user-guide/features/skins',
             'user-guide/features/plugins',
@@ -106,7 +104,6 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/vision',
             'user-guide/features/image-generation',
             'user-guide/features/spotify',
-            'user-guide/features/pets',
             'user-guide/features/tts',
             'user-guide/features/deliverable-mode',
           ],
@@ -143,7 +140,6 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/apple/apple-apple-reminders',
                     'user-guide/skills/bundled/apple/apple-findmy',
                     'user-guide/skills/bundled/apple/apple-imessage',
-                    'user-guide/skills/bundled/apple/apple-macos-computer-use',
                   ],
                 },
                 {
@@ -156,6 +152,15 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex',
                     'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent',
                     'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-opencode',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'computer-use',
+                  key: 'skills-bundled-computer-use',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/computer-use/computer-use-computer-use',
                   ],
                 },
                 {
@@ -271,7 +276,6 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/productivity/productivity-nano-pdf',
                     'user-guide/skills/bundled/productivity/productivity-notion',
                     'user-guide/skills/bundled/productivity/productivity-ocr-and-documents',
-                    'user-guide/skills/bundled/productivity/productivity-petdex',
                     'user-guide/skills/bundled/productivity/productivity-powerpoint',
                     'user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline',
                   ],
@@ -284,6 +288,7 @@ const sidebars: SidebarsConfig = {
                   items: [
                     'user-guide/skills/bundled/research/research-arxiv',
                     'user-guide/skills/bundled/research/research-blogwatcher',
+                    'user-guide/skills/bundled/research/research-cyber-vc-analyst',
                     'user-guide/skills/bundled/research/research-llm-wiki',
                     'user-guide/skills/bundled/research/research-polymarket',
                     'user-guide/skills/bundled/research/research-research-paper-writing',
@@ -589,6 +594,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-optional-web-development',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/optional/web-development/web-development-cloudflare-temporary-deploy',
                     'user-guide/skills/optional/web-development/web-development-page-agent',
                   ],
                 },
@@ -653,7 +659,6 @@ const sidebars: SidebarsConfig = {
             'user-guide/messaging/line',
             'user-guide/messaging/simplex',
             'user-guide/messaging/ntfy',
-            'user-guide/messaging/irc',
             'user-guide/messaging/open-webui',
             'user-guide/messaging/webhooks',
           ],
