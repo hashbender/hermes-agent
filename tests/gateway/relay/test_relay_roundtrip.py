@@ -120,3 +120,40 @@ async def test_get_chat_info_proxied_to_connector(wired):
 async def _async_capture(sink, event):
     sink.append(event)
     return None
+
+
+@pytest.mark.asyncio
+async def test_empty_inbound_event_is_dropped_and_buffer_acknowledged():
+    from gateway.relay.ws_transport import WebSocketRelayTransport
+
+    transport = object.__new__(WebSocketRelayTransport)
+    captured = []
+    sent = []
+    transport._inbound = lambda ev: _async_capture(captured, ev)
+    transport._send = lambda frame: _async_capture(sent, frame)
+
+    await transport._handle_frame(
+        '{"type":"inbound","bufferId":"buf-empty","event":{"text":"   ","message_id":"m-empty","source":{"platform":"discord","chat_id":"chan1","chat_type":"group"}}}'
+    )
+
+    assert captured == []
+    assert sent == [{"type": "inbound_ack", "bufferId": "buf-empty"}]
+
+
+@pytest.mark.asyncio
+async def test_media_only_inbound_event_still_dispatches():
+    from gateway.relay.ws_transport import WebSocketRelayTransport
+
+    transport = object.__new__(WebSocketRelayTransport)
+    captured = []
+    sent = []
+    transport._inbound = lambda ev: _async_capture(captured, ev)
+    transport._send = lambda frame: _async_capture(sent, frame)
+
+    await transport._handle_frame(
+        '{"type":"inbound","bufferId":"buf-media","event":{"text":"","message_id":"m-media","media_urls":["/tmp/image.png"],"source":{"platform":"discord","chat_id":"chan1","chat_type":"group"}}}'
+    )
+
+    assert len(captured) == 1
+    assert captured[0].media_urls == ["/tmp/image.png"]
+    assert sent == [{"type": "inbound_ack", "bufferId": "buf-media"}]

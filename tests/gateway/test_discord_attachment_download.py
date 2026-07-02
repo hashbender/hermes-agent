@@ -400,6 +400,7 @@ class TestHandleMessageUsesAuthenticatedRead:
             await adapter._handle_message(msg)
 
         event = adapter.handle_message.call_args[0][0]
+        assert event.text == ""
         assert event.message_type == MessageType.VOICE
         assert event.media_urls == ["/tmp/voice_from_read.ogg"]
         assert event.media_types == ["audio/ogg"]
@@ -444,6 +445,7 @@ class TestHandleMessageUsesAuthenticatedRead:
             await adapter._handle_message(msg)
 
         event = adapter.handle_message.call_args[0][0]
+        assert event.text == ""
         assert event.message_type == MessageType.AUDIO
         assert event.media_urls == ["/tmp/audio_from_read.ogg"]
         assert event.media_types == ["audio/ogg"]

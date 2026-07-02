@@ -144,6 +144,23 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
     )
 
 
+def _event_has_user_payload(event: MessageEvent) -> bool:
+    """Return True when an inbound relay event has user content to dispatch.
+
+    Some provider connectors can emit lifecycle/placeholder message events with
+    no text and no media. Dispatching those into the agent makes it answer empty
+    messages repeatedly and can keep gateway restart draining from completing.
+    Drop them at the relay boundary; buffered deliveries are still ACKed by the
+    caller after this guard so they do not replay forever.
+    """
+    text = getattr(event, "text", "") or ""
+    if str(text).strip():
+        return True
+    if getattr(event, "media_urls", None):
+        return True
+    return False
+
+
 @dataclass
 class PassthroughForward:
     """A connector-forwarded passthrough-plane request (Phase 5 §5.1).
@@ -659,7 +676,15 @@ class WebSocketRelayTransport:
         elif ftype == "inbound":
             if self._inbound is not None:
                 event = _event_from_wire(frame.get("event", {}))
-                await self._inbound(event)
+                if _event_has_user_payload(event):
+                    await self._inbound(event)
+                else:
+                    logger.info(
+                        "relay: dropping empty inbound event platform=%s chat_id=%s message_id=%s",
+                        getattr(getattr(event, "source", None), "platform", None),
+                        getattr(getattr(event, "source", None), "chat_id", None),
+                        getattr(event, "message_id", None),
+                    )
                 # Phase 5 §5.3: a buffered delivery (replayed on reconnect) carries
                 # a bufferId; ack it after the handler has durably taken it so the
                 # connector advances its delivery-leg buffer cursor (no dup). A live

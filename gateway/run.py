@@ -8394,6 +8394,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
 
+        try:
+            from gateway.response_filters import should_drop_empty_inbound_event
+            _drop_empty_inbound = should_drop_empty_inbound_event(event)
+        except Exception:
+            _drop_empty_inbound = False
+        if _drop_empty_inbound:
+            logger.info(
+                "Dropping empty inbound message before agent dispatch: platform=%s chat=%s message_id=%s",
+                source.platform.value if source and source.platform else "unknown",
+                source.chat_id if source else "unknown",
+                getattr(event, "message_id", None),
+            )
+            return None
+
         if (
             getattr(self, "_startup_restore_in_progress", False)
             and not getattr(event, "internal", False)
@@ -9820,18 +9834,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
 
+        is_internal_event = bool(getattr(event, "internal", False))
         _is_shared_multi_user = is_shared_multi_user_session(
             source,
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
+        if not is_internal_event and _is_shared_multi_user and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
 
         # Prepend channel context from history backfill (if any).  This
         # happens after sender-prefix so the prefix only applies to the
         # trigger message, not the backfill block.
-        if getattr(event, "channel_context", None):
+        if getattr(event, "channel_context", None) and (message_text.strip() or event.media_urls):
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
 
         # Declare at outer scope so the audio-file-paths handling block below
@@ -10133,11 +10148,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
-        logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
-            _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
-        )
+        if bool(getattr(event, "internal", False)) and not (event.text or "").strip():
+            logger.info(
+                "internal startup/resume event: platform=%s chat=%s reason=resume_pending message_id=%s",
+                _platform_name,
+                source.chat_id or "unknown",
+                getattr(event, "message_id", None),
+            )
+        else:
+            logger.info(
+                "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
+                _platform_name, source.user_name or source.user_id or "unknown",
+                source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
+            )
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's

@@ -6162,11 +6162,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 if _backfill_text:
                     _channel_context = _backfill_text
 
-        # Defense-in-depth: prevent empty user messages from entering session
-        # (can happen when user sends @mention-only with no other text).
-        # When channel_context is present, a bare mention means "catch me up"
-        # — the context IS the message, so skip the placeholder.
-        if (not event_text or not event_text.strip()) and not _channel_context:
+        # Defense-in-depth: prevent truly empty user messages from entering the
+        # session (e.g. @mention-only with no other text).  Do NOT inject the
+        # no-text sentinel for attachment-only messages: Discord voice notes and
+        # files legitimately have empty ``message.content`` but carry their
+        # payload in ``media_urls``.  Adding the sentinel there turns a real
+        # media event into a fake text prompt.
+        if (not event_text or not event_text.strip()) and not _channel_context and not media_urls:
             # Bare mention-only ping (e.g. "@Bot" with nothing else, including
             # raw <@!ID> forms) with no media, no injected text, and no backfill
             # context: drop it instead of spawning a fake empty-text turn.
