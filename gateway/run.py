@@ -3744,94 +3744,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         If the error is retryable (e.g. network blip, DNS failure), queue the
         platform for background reconnection instead of giving up permanently.
         """
-        # Snapshot the current owner of this platform slot before doing
-        # anything else. If it's neither this adapter nor empty, a different
-        # adapter has already taken over (e.g. this is a delayed notification
-        # from a background retry chain that raced with, and lost to, a
-        # reconnect that already succeeded). Acting on a stale notification
-        # would overwrite an already-healthy platform's runtime status and
-        # incorrectly re-queue it for reconnection, so bail out before any of
-        # that happens.
-        existing = self.adapters.get(adapter.platform)
-        if existing is not None and existing is not adapter:
-            logger.debug(
-                "Ignoring stale fatal error from a superseded %s adapter instance: %s",
+        try:
+            # Snapshot the current owner of this platform slot before doing
+            # anything else. If it's neither this adapter nor empty, a different
+            # adapter has already taken over (e.g. this is a delayed notification
+            # from a background retry chain that raced with, and lost to, a
+            # reconnect that already succeeded). Acting on a stale notification
+            # would overwrite an already-healthy platform's runtime status and
+            # incorrectly re-queue it for reconnection, so bail out before any of
+            # that happens.
+            existing = self.adapters.get(adapter.platform)
+            if existing is not None and existing is not adapter:
+                logger.debug(
+                    "Ignoring stale fatal error from a superseded %s adapter instance: %s",
+                    adapter.platform.value,
+                    adapter.fatal_error_code or "unknown",
+                )
+                return
+
+            logger.error(
+                "Fatal %s adapter error (%s): %s",
                 adapter.platform.value,
                 adapter.fatal_error_code or "unknown",
+                adapter.fatal_error_message or "unknown error",
             )
-            return
-
-        logger.error(
-            "Fatal %s adapter error (%s): %s",
-            adapter.platform.value,
-            adapter.fatal_error_code or "unknown",
-            adapter.fatal_error_message or "unknown error",
-        )
-        # Phase 7 Unit 7d-B: a relay credential revoked by opt-out is not an
-        # error to retry — render it as a clean "disabled" state, not red
-        # "fatal"/"retrying". (The code is set non-retryable, so it also drops
-        # out of the reconnect queue below.)
-        if adapter.fatal_error_code == "relay_disabled":
-            platform_state = "disabled"
-        elif adapter.fatal_error_retryable:
-            platform_state = "retrying"
-        else:
-            platform_state = "fatal"
-        self._update_platform_runtime_status(
-            adapter.platform.value,
-            platform_state=platform_state,
-            error_code=adapter.fatal_error_code,
-            error_message=adapter.fatal_error_message,
-        )
-
-        if existing is adapter:
-            # Claim this adapter for teardown before awaiting disconnect() —
-            # a second fatal-error notification for the same adapter (e.g.
-            # from a concurrent recovery path) would otherwise still see
-            # itself as "existing" during the await below and disconnect()
-            # the same object twice.
-            self.adapters.pop(adapter.platform, None)
-            self.delivery_router.adapters = self.adapters
-            await adapter.disconnect()
-
-        # Queue retryable failures for background reconnection
-        if adapter.fatal_error_retryable:
-            platform_config = self.config.platforms.get(adapter.platform)
-            if platform_config and adapter.platform not in self._failed_platforms:
-                self._failed_platforms[adapter.platform] = {
-                    "config": platform_config,
-                    "attempts": 0,
-                    "next_retry": time.monotonic(),
-                }
-                logger.info(
-                    "%s queued for background reconnection",
-                    adapter.platform.value,
-                )
-
-        if not self.adapters and not self._failed_platforms:
-            self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
-            if adapter.fatal_error_retryable:
-                self._exit_with_failure = True
-                logger.error("No connected messaging platforms remain. Shutting down gateway for service restart.")
+            # Phase 7 Unit 7d-B: a relay credential revoked by opt-out is not an
+            # error to retry — render it as a clean "disabled" state, not red
+            # "fatal"/"retrying". (The code is set non-retryable, so it also drops
+            # out of the reconnect queue below.)
+            if adapter.fatal_error_code == "relay_disabled":
+                platform_state = "disabled"
+            elif adapter.fatal_error_retryable:
+                platform_state = "retrying"
             else:
-                logger.error("No connected messaging platforms remain. Shutting down gateway cleanly.")
-            await self.stop()
-        elif not self.adapters and self._failed_platforms:
-            # All platforms are down and queued for background reconnection.
-            # Keep the gateway alive so:
-            #   • cron jobs still run
-            #   • the reconnect watcher can recover platforms when the
-            #     underlying problem clears (proxy comes back, user runs
-            #     `hermes whatsapp`, etc.)
-            # We used to exit-with-failure here to trigger systemd restart,
-            # but that converted a transient outage into a restart loop and
-            # killed in-process state every time. The reconnect watcher
-            # already handles long-running recovery — let it do its job.
-            logger.warning(
-                "No connected messaging platforms remain, but %d platform(s) "
-                "queued for reconnection — gateway staying alive, watcher will "
-                "retry in background.",
-                len(self._failed_platforms),
+                platform_state = "fatal"
+            self._update_platform_runtime_status(
+                adapter.platform.value,
+                platform_state=platform_state,
+                error_code=adapter.fatal_error_code,
+                error_message=adapter.fatal_error_message,
+            )
+
+            if existing is adapter:
+                # Claim this adapter for teardown before awaiting disconnect() —
+                # a second fatal-error notification for the same adapter (e.g.
+                # from a concurrent recovery path) would otherwise still see
+                # itself as "existing" during the await below and disconnect()
+                # the same object twice.
+                self.adapters.pop(adapter.platform, None)
+                self.delivery_router.adapters = self.adapters
+                await adapter.disconnect()
+
+            # Queue retryable failures for background reconnection
+            if adapter.fatal_error_retryable:
+                platform_config = self.config.platforms.get(adapter.platform)
+                if platform_config and adapter.platform not in self._failed_platforms:
+                    self._failed_platforms[adapter.platform] = {
+                        "config": platform_config,
+                        "attempts": 0,
+                        "next_retry": time.monotonic(),
+                    }
+                    logger.info(
+                        "%s queued for background reconnection",
+                        adapter.platform.value,
+                    )
+
+            if not self.adapters and not self._failed_platforms:
+                self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
+                if adapter.fatal_error_retryable:
+                    self._exit_with_failure = True
+                    logger.error("No connected messaging platforms remain. Shutting down gateway for service restart.")
+                else:
+                    logger.error("No connected messaging platforms remain. Shutting down gateway cleanly.")
+                await self.stop()
+            elif not self.adapters and self._failed_platforms:
+                # All platforms are down and queued for background reconnection.
+                # Keep the gateway alive so:
+                #   • cron jobs still run
+                #   • the reconnect watcher can recover platforms when the
+                #     underlying problem clears (proxy comes back, user runs
+                #     `hermes whatsapp`, etc.)
+                # We used to exit-with-failure here to trigger systemd restart,
+                # but that converted a transient outage into a restart loop and
+                # killed in-process state every time. The reconnect watcher
+                # already handles long-running recovery — let it do its job.
+                logger.warning(
+                    "No connected messaging platforms remain, but %d platform(s) "
+                    "queued for reconnection — gateway staying alive, watcher will "
+                    "retry in background.",
+                    len(self._failed_platforms),
+                )
+        except Exception as exc:
+            logger.exception(
+                "Unexpected error handling %s adapter fatal error, preventing gateway crash: %s",
+                adapter.platform.value, exc,
             )
 
     def _request_clean_exit(self, reason: str) -> None:
@@ -14134,7 +14140,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
         )
 
