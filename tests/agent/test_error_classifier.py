@@ -375,6 +375,26 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    def test_408_request_timeout_is_retryable_timeout(self):
+        """HTTP 408 Request Timeout is a transient timing failure the server
+        itself flags as safe to retry (RFC 9110 §15.5.9) — commonly emitted by
+        reverse proxies in front of self-hosted backends (llama.cpp / Ollama /
+        vLLM) when a long generation outruns the proxy's request-read window.
+        It must NOT fall into the generic 4xx bucket as a non-retryable
+        format_error, which would abort the turn on a retry-safe error."""
+        e = MockAPIError("Request Timeout", status_code=408)
+        result = classify_api_error(e, provider="vllm")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    def test_400_bad_request_still_non_retryable_format_error(self):
+        """Guard the boundary: a genuine 400 Bad Request must remain a
+        non-retryable format_error and must not be swept up by the 408 branch."""
+        e = MockAPIError("Bad Request", status_code=400)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+
     def test_message_only_overloaded_without_status_is_overloaded(self):
         """Some Anthropic-compatible proxies surface 'overloaded' in the
         message with no 503/529 status_code. It must classify as overloaded
@@ -468,6 +488,44 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.server_error
         assert result.retryable is True
+
+    # ── 5xx that are actually context overflow ──
+    # Some local inference servers (llama.cpp / llama-server, and vLLM/Ollama
+    # behind a Cloudflare/Tailscale hop) report context overflow with a 5xx
+    # status instead of the standard 400/413. These must route into the
+    # compression-and-retry path, not the blind server_error/overloaded retry
+    # that exhausts and drops the turn.
+
+    @pytest.mark.parametrize("status_code", [500, 502, 503, 529])
+    def test_5xx_context_overflow_routes_to_compression(self, status_code):
+        """Explicit context-overflow wording on any of the codes the fix covers
+        (500/502/503/529) must route to context_overflow + compression, not a
+        blind server_error/overloaded retry. Covers all four branches the code
+        touches (the original PR only asserted 500 and 503)."""
+        e = MockAPIError(
+            "Context size has been exceeded.",
+            status_code=status_code,
+            body={"error": {"code": status_code, "message": "Context size has been exceeded.", "type": "server_error"}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+        assert result.retryable is True
+
+    def test_500_plain_server_error_not_compressed(self):
+        """A genuine 500 crash without overflow wording must NOT be swallowed
+        into compression — it stays a retryable server_error."""
+        e = MockAPIError("Internal Server Error", status_code=500)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.server_error
+        assert result.should_compress is False
+
+    def test_503_plain_overloaded_not_compressed(self):
+        """A genuine 503 overload without overflow wording stays overloaded."""
+        e = MockAPIError("Service Unavailable", status_code=503)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.overloaded
+        assert result.should_compress is False
 
     # ── Model not found ──
 
@@ -1294,6 +1352,25 @@ class TestAdversarialEdgeCases:
         )
         result = classify_api_error(e)
         assert result.reason == FailoverReason.billing
+
+    def test_400_anthropic_extra_usage_exhausted(self):
+        """Anthropic returns 400 with 'out of extra usage' when the user's
+        extra-usage allowance is depleted. Must classify as billing so the
+        fallback chain engages (with credential rotation) instead of the
+        generic format_error path, which never rotates. (#11736, #13170)"""
+        e = MockAPIError(
+            "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
+            status_code=400,
+            body={"error": {
+                "type": "invalid_request_error",
+                "message": "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
+            }},
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.billing
+        assert result.should_fallback is True
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
 
     def test_200_with_error_body(self):
         """200 status with error in body — should be unknown, not crash."""
