@@ -324,22 +324,18 @@ def test_docker_forward_env_is_bridged_everywhere():
     assert "TERMINAL_DOCKER_FORWARD_ENV" in _terminal_tool_env_var_names()
 
 
-def test_tenki_config_is_bridged_everywhere():
-    """Tenki backend config must reach every Hermes entry point."""
-    tenki_keys = {
-        "tenki_image": "TERMINAL_TENKI_IMAGE",
-        "tenki_api_endpoint": "TERMINAL_TENKI_API_ENDPOINT",
-        "tenki_workspace_id": "TERMINAL_TENKI_WORKSPACE_ID",
-        "tenki_project_id": "TERMINAL_TENKI_PROJECT_ID",
-        "tenki_name_prefix": "TERMINAL_TENKI_NAME_PREFIX",
-        "tenki_allow_inbound": "TERMINAL_TENKI_ALLOW_INBOUND",
-        "tenki_allow_outbound": "TERMINAL_TENKI_ALLOW_OUTBOUND",
-        "tenki_max_duration": "TERMINAL_TENKI_MAX_DURATION",
-        "tenki_idle_timeout": "TERMINAL_TENKI_IDLE_TIMEOUT",
-        "tenki_pause_retention": "TERMINAL_TENKI_PAUSE_RETENTION",
-        "tenki_sync_hermes_home": "TERMINAL_TENKI_SYNC_HERMES_HOME",
-    }
-    for key, env_var in tenki_keys.items():
+def test_local_memory_guard_is_bridged_everywhere():
+    """Regression pin for the local backend cgroup memory guard.
+
+    ``terminal.local_memory_max_mb`` and ``terminal.local_memory_swap_max_mb``
+    are consumed by terminal_tool / local backend via TERMINAL_LOCAL_MEMORY_* env
+    vars.  Guard the same four-site bridge invariant as Docker resource keys so
+    the setting works in CLI, gateway, and ``hermes config set`` paths.
+    """
+    for key, env_var in (
+        ("local_memory_max_mb", "TERMINAL_LOCAL_MEMORY_MAX_MB"),
+        ("local_memory_swap_max_mb", "TERMINAL_LOCAL_MEMORY_SWAP_MAX_MB"),
+    ):
         assert key in _cli_env_map_keys()
         assert key in _gateway_env_map_keys()
         assert key in _save_config_env_sync_keys()

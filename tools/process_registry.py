@@ -41,7 +41,12 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import (
+    _find_shell,
+    _maybe_wrap_with_systemd_memory_guard,
+    _resolve_safe_cwd,
+    _sanitize_subprocess_env,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -108,6 +113,7 @@ class ProcessSession:
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+    systemd_unit: str = ""                       # transient unit for memory-guarded local processes
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -761,10 +767,24 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
-            text=True,
+        popen_args = [user_shell, "-lic", f"set +m; {command}"]
+        popen_cwd = session.cwd
+        guard_args, guard_env, guard_cwd, guard_unit = _maybe_wrap_with_systemd_memory_guard(
+            cmd_string=f"set +m; {command}",
+            login=True,
+            run_env=bg_env,
             cwd=session.cwd,
+        )
+        if guard_args is not None:
+            popen_args = guard_args
+            bg_env = guard_env or os.environ.copy()
+            popen_cwd = guard_cwd or "/"
+            session.systemd_unit = guard_unit or ""
+
+        proc = subprocess.Popen(
+            popen_args,
+            text=True,
+            cwd=popen_cwd,
             env=bg_env,
             encoding="utf-8",
             errors="replace",
@@ -1433,7 +1453,21 @@ class ProcessRegistry:
                     if session.pid:
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
-                # Local process -- kill the process tree. On Windows this
+                # Local process -- kill the process tree. If the process was
+                # launched under a transient systemd memory-guard unit, stop
+                # that unit first so systemd tears down the guarded cgroup.
+                if session.systemd_unit and not _IS_WINDOWS:
+                    try:
+                        subprocess.run(
+                            ["systemctl", "--user", "stop", session.systemd_unit],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=2,
+                            check=False,
+                        )
+                    except Exception:
+                        pass
+                # Then use the host PID-reuse-safe terminator. On Windows this
                 # must be taskkill /T /F; Popen.terminate() only kills the
                 # shell wrapper and leaves Git Bash descendants behind.
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
@@ -1782,6 +1816,7 @@ class ProcessRegistry:
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
+                            "systemd_unit": s.systemd_unit,
                         })
             
             # Atomic write to avoid corruption on crash
@@ -1848,6 +1883,7 @@ class ProcessRegistry:
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
+                systemd_unit=entry.get("systemd_unit", ""),
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
                 detached=True,  # Can't read output, but can report status + kill
