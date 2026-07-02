@@ -1597,6 +1597,20 @@ class GatewaySlashCommandsMixin:
                             "api_mode": result.api_mode,
                         }
 
+                        # Write-through the non-secret parts to the session
+                        # store so the picked model survives a gateway restart
+                        # (api_key is never persisted).
+                        try:
+                            _self.session_store.set_model_override(
+                                _session_key,
+                                _self._session_model_overrides[_session_key],
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist session model override",
+                                exc_info=True,
+                            )
+
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
                         # stale cache signature to trigger a rebuild.
@@ -1830,6 +1844,19 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+
+            # Write-through the non-secret parts (model/provider/base_url) to
+            # the session store so the override survives a gateway restart.
+            # api_key/api_mode are never persisted — they are re-resolved via
+            # runtime provider resolution on rehydration.
+            try:
+                self.session_store.set_model_override(
+                    session_key, self._session_model_overrides[session_key]
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to persist session model override", exc_info=True
+                )
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
@@ -2899,12 +2926,13 @@ class GatewaySlashCommandsMixin:
             return t("gateway.verbose.not_enabled")
 
         # --- cycle mode (per-platform) ----------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "new", "all", "verbose", "log"]
         descriptions = {
             "off": t("gateway.verbose.mode_off"),
             "new": t("gateway.verbose.mode_new"),
             "all": t("gateway.verbose.mode_all"),
             "verbose": t("gateway.verbose.mode_verbose"),
+            "log": t("gateway.verbose.mode_log"),
         }
 
         # Read current effective mode for this platform via the resolver
