@@ -94,12 +94,16 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("o3-pro", 600),
     ("o3-mini", 300),
     ("o4-mini", 300),
-    # Anthropic Claude 4.x thinking variants.  Anchored at
-    # ``claude-opus-4`` so non-thinking Claude 3.x or future
-    # non-reasoning Claude variants don't match.
+    # Anthropic Claude 4.x thinking variants.  Anchored at the bare
+    # family prefix so non-thinking Claude 3.x or future non-reasoning
+    # Claude variants don't match.  Canonical Sonnet 4.x IDs are
+    # HYPHENATED (``claude-sonnet-4-5``/``-4-6``); ``re.escape`` on a
+    # dotted key makes the ``.`` a literal dot, so it would miss the
+    # hyphenated form entirely.  The bare ``claude-sonnet-4`` prefix
+    # matches every 4.x thinking variant via the ``[\-._]`` separator
+    # (``-4-5``, ``-4-6``, ``-4-7``, and the legacy dotted ``4.5``/``4.6``).
     ("claude-opus-4", 240),
-    ("claude-sonnet-4.5", 180),
-    ("claude-sonnet-4.6", 180),
+    ("claude-sonnet-4", 180),
     # xAI Grok reasoning variants.  Explicit reasoning-only keys
     # plus one for the ``non-reasoning`` variant so users picking
     # the fast variant don't get the 300s floor.  Bare ``grok-3``,
