@@ -93,6 +93,11 @@ _DEFAULT_PROVIDER_MODELS = {
         "gemini-3.1-pro-preview", "gemini-3-pro-preview",
         "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview",
     ],
+    "vertex": [
+        "google/gemini-3.1-pro-preview", "google/gemini-3-pro-preview",
+        "google/gemini-3-flash-preview", "google/gemini-3.1-flash-lite-preview",
+        "google/gemini-2.5-pro", "google/gemini-2.5-flash",
+    ],
     "zai": ["glm-5.2", "glm-5.1", "glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
     "kimi-coding": ["kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
     "kimi-coding-cn": ["kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
@@ -668,7 +673,7 @@ def _print_setup_summary(config: dict, hermes_home):
 
 
 def _prompt_container_resources(config: dict):
-    """Prompt for container resource settings (Docker, Singularity, Modal, Daytona, Tenki)."""
+    """Prompt for container resource settings (Docker, Singularity, Modal, Daytona)."""
     terminal = config.setdefault("terminal", {})
 
     print()
@@ -1178,12 +1183,11 @@ def setup_terminal_backend(config: dict):
         "Modal - serverless cloud sandbox",
         "SSH - run on a remote machine",
         "Daytona - persistent cloud development environment",
-        "Tenki Agent - Tenki cloud sandbox",
     ]
-    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona", 5: "tenki"}
-    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4, "tenki": 5}
+    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona"}
+    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4}
 
-    next_idx = 6
+    next_idx = 5
     if is_linux:
         terminal_choices.append("Singularity/Apptainer - HPC-friendly container")
         idx_to_backend[next_idx] = "singularity"
@@ -1400,78 +1404,6 @@ def setup_terminal_backend(config: dict):
             "daytona_image", "nikolaik/python-nodejs:python3.11-nodejs20"
         )
 
-    elif selected_backend == "tenki":
-        print_success("Terminal backend: Tenki Agent")
-        print_info("Cloud sandboxes are created on demand and terminated by default.")
-        print_info("Requires Tenki CLI login or TENKI_AUTH_TOKEN/TENKI_API_KEY.")
-
-        try:
-            __import__("tenki_sandbox")
-        except ImportError:
-            print_info("Installing Tenki SDK...")
-            import subprocess
-
-            uv_bin = shutil.which("uv")
-            package = "tenki-sandbox==0.1.1"
-            if uv_bin:
-                result = subprocess.run(
-                    [uv_bin, "pip", "install", "--python", sys.executable, package],
-                    capture_output=True,
-                    text=True,
-                )
-            else:
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", package],
-                    capture_output=True,
-                    text=True,
-                )
-            if result.returncode == 0:
-                print_success("Tenki SDK installed")
-            else:
-                print_warning("Install failed — run manually: pip install tenki-sandbox==0.1.1")
-                if result.stderr:
-                    print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
-
-        from tools.tenki_config import (
-            has_tenki_auth,
-            resolve_tenki_api_endpoint,
-            resolve_tenki_project_id,
-            resolve_tenki_workspace_id,
-        )
-
-        terminal = config.setdefault("terminal", {})
-        endpoint = resolve_tenki_api_endpoint(terminal.get("tenki_api_endpoint", ""))
-        workspace_id = resolve_tenki_workspace_id(terminal.get("tenki_workspace_id", ""))
-        project_id = resolve_tenki_project_id(terminal.get("tenki_project_id", ""))
-
-        terminal["tenki_api_endpoint"] = endpoint
-        if workspace_id:
-            terminal["tenki_workspace_id"] = workspace_id
-        if project_id:
-            terminal["tenki_project_id"] = project_id
-        terminal.setdefault("tenki_image", "")
-        terminal.setdefault("tenki_name_prefix", "hermes")
-        terminal["tenki_allow_inbound"] = False
-        terminal["tenki_allow_outbound"] = True
-        terminal.setdefault("tenki_max_duration", 3600)
-        terminal.setdefault("tenki_idle_timeout", 0)
-        terminal.setdefault("tenki_pause_retention", 0)
-        terminal.setdefault("tenki_sync_hermes_home", False)
-        terminal["container_persistent"] = False
-        terminal["cwd"] = "/home/tenki"
-
-        print_info(f"  Endpoint:  {endpoint}")
-        print_info(f"  Workspace: {workspace_id or '(not found; run tenki login)'}")
-        print_info(f"  Project:   {project_id or '(not found; run tenki login)'}")
-        if has_tenki_auth():
-            print_info("  Tenki auth: already configured")
-        else:
-            print_warning("  Tenki auth not found")
-            token = prompt("    Tenki token/API key (optional; leave blank to run tenki login)", password=True)
-            if token:
-                save_env_value("TENKI_API_KEY", token)
-                print_success("    Configured")
-
     elif selected_backend == "ssh":
         print_success("Terminal backend: SSH")
         print_info("Run commands on a remote machine via SSH.")
@@ -1604,10 +1536,11 @@ def setup_agent_settings(config: dict):
     print_info("  new     — Show tool name only when it changes (less noise)")
     print_info("  all     — Show every tool call with a short preview")
     print_info("  verbose — Full args, results, and debug logs")
+    print_info("  log     — Silent in chat; write every tool call to ~/.hermes/logs/tool_calls.log (gateway only)")
 
     current_mode = cfg_get(config, "display", "tool_progress", default="all")
     mode = prompt("Tool progress mode", current_mode)
-    if mode.lower() in {"off", "new", "all", "verbose"}:
+    if mode.lower() in {"off", "new", "all", "verbose", "log"}:
         if "display" not in config:
             config["display"] = {}
         config["display"]["tool_progress"] = mode.lower()
