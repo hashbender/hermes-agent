@@ -249,6 +249,20 @@ class TestModeAwareSchema(unittest.TestCase):
                 self.assertNotIn(forbidden, desc,
                                  f"mode={mode}: '{forbidden}' leaked into description")
 
+    def test_file_helpers_warn_before_destructive_terminal_commands(self):
+        """write_file/patch failures must not be hidden before terminal deletes.
+
+        File helpers and terminal() can have different path-safety behavior:
+        a file helper may return an error for a path that terminal() could still
+        modify. Keep that risk visible in the tool description so generated
+        scripts check the helper result before destructive shell commands.
+        """
+        for mode in EXECUTION_MODES:
+            desc = build_execute_code_schema(mode=mode)["description"]
+            self.assertIn("Check for an \"error\" key", desc)
+            self.assertIn("destructive terminal() commands", desc)
+            self.assertIn("path safety rules may reject writes", desc)
+
     def test_descriptions_are_similar_length(self):
         """Both modes should have roughly the same-size description."""
         strict = len(build_execute_code_schema(mode="strict")["description"])
