@@ -3,17 +3,16 @@
 Terminal Tool Module
 
 A terminal tool that executes commands in local, Docker, Modal, SSH,
-Singularity, Daytona, and Tenki environments. Supports local execution,
+Singularity, and Daytona environments. Supports local execution,
 containerized backends, and cloud sandboxes, including managed Modal mode.
 
 Supported environments:
 - "local": Execute directly on the host machine (default, fastest)
 - "docker": Execute in Docker containers (isolated, requires Docker)
 - "modal": Execute in Modal cloud sandboxes (direct Modal or managed gateway)
-- "tenki": Execute in Tenki cloud sandboxes
 
 Features:
-- Multiple execution backends (local, docker, modal, tenki, etc.)
+- Multiple execution backends (local, docker, modal)
 - Background task support
 - VM/container lifecycle management
 - Automatic cleanup after inactivity
@@ -893,7 +892,7 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     should prepend sudo_stdin to their stdin_data and pass the merged bytes to
     Popen's stdin pipe.
 
-    Callers that cannot pipe subprocess stdin (modal, daytona, tenki) must embed
+    Callers that cannot pipe subprocess stdin (modal, daytona) must embed
     the password in the command string themselves; see their execute()
     methods for how they handle the non-None sudo_stdin case.
 
@@ -949,6 +948,7 @@ from tools.environments.local import LocalEnvironment as _LocalEnvironment
 from tools.environments.singularity import SingularityEnvironment as _SingularityEnvironment
 from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 from tools.environments.docker import DockerEnvironment as _DockerEnvironment
+from tools.environments.coder import CoderEnvironment as _CoderEnvironment
 from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
 from tools.managed_tool_gateway import is_managed_tool_gateway_ready
@@ -1061,7 +1061,7 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 
 
 # Per-task environment overrides registry.
-# Allows environments (e.g., TerminalBench2Env) to specify a custom Docker/Modal/Tenki
+# Allows environments (e.g., TerminalBench2Env) to specify a custom Docker/Modal
 # image for a specific task_id BEFORE the agent loop starts. When the terminal or
 # file tools create a new sandbox for that task_id, they check this registry first
 # and fall back to the TERMINAL_MODAL_IMAGE (etc.) env var if no override is set.
@@ -1080,7 +1080,6 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
 
     Supported override keys:
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
-        - tenki_image: str -- Tenki sandbox image/template identifier
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
 
@@ -1148,7 +1147,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
-        "daytona_image", "tenki_image", "env_type",
+        "daytona_image", "env_type",
     })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
@@ -1215,7 +1214,7 @@ def _safe_getcwd() -> str:
 # cwd looks when it leaks toward a Linux container's ``-w`` flag.
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
-_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "tenki"})
+_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "coder"})
 
 
 def _is_unusable_container_cwd(cwd: str) -> bool:
@@ -1246,7 +1245,7 @@ def _get_env_config() -> Dict[str, Any]:
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
-    container_backend = env_type in _CONTAINER_BACKENDS
+    container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
     docker_backend = env_type == "docker"
 
     # Docker/container-only env vars may be bridged from config.yaml even when
@@ -1278,10 +1277,8 @@ def _get_env_config() -> Dict[str, Any]:
     # root-like cwd.
     if env_type == "local":
         default_cwd = _safe_getcwd()
-    elif env_type == "ssh":
+    elif env_type in ("ssh", "coder"):
         default_cwd = "~"
-    elif env_type == "tenki":
-        default_cwd = "/home/tenki"
     else:
         default_cwd = "/root"
 
@@ -1292,6 +1289,10 @@ def _get_env_config() -> Dict[str, Any]:
     cwd = os.getenv("TERMINAL_CWD", default_cwd)
     if cwd:
         cwd = os.path.expanduser(cwd)
+    coder_url = os.getenv("CODER_URL", "")
+    coder_api_key = os.getenv("CODER_API_KEY", "")
+    coder_organization = os.getenv("CODER_ORGANIZATION", "")
+    coder_workspace = os.getenv("CODER_WORKSPACE", "")
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
@@ -1315,20 +1316,11 @@ def _get_env_config() -> Dict[str, Any]:
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
         "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
         "docker_forward_env": docker_forward_env,
+        "coder_forward_env": _parse_env_var("TERMINAL_CODER_FORWARD_ENV", "[]", json.loads, "valid JSON"),
+        "coder_workspace_startup_timeout": _parse_env_var("TERMINAL_CODER_WORKSPACE_STARTUP_TIMEOUT", "180"),
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
-        "tenki_image": os.getenv("TERMINAL_TENKI_IMAGE", ""),
-        "tenki_api_endpoint": os.getenv("TERMINAL_TENKI_API_ENDPOINT", ""),
-        "tenki_workspace_id": os.getenv("TERMINAL_TENKI_WORKSPACE_ID", ""),
-        "tenki_project_id": os.getenv("TERMINAL_TENKI_PROJECT_ID", ""),
-        "tenki_name_prefix": os.getenv("TERMINAL_TENKI_NAME_PREFIX", "hermes"),
-        "tenki_allow_inbound": os.getenv("TERMINAL_TENKI_ALLOW_INBOUND", "false").lower() in {"true", "1", "yes"},
-        "tenki_allow_outbound": os.getenv("TERMINAL_TENKI_ALLOW_OUTBOUND", "true").lower() in {"true", "1", "yes"},
-        "tenki_max_duration": _parse_env_var("TERMINAL_TENKI_MAX_DURATION", "3600"),
-        "tenki_idle_timeout": _parse_env_var("TERMINAL_TENKI_IDLE_TIMEOUT", "0"),
-        "tenki_pause_retention": _parse_env_var("TERMINAL_TENKI_PAUSE_RETENTION", "0"),
-        "tenki_sync_hermes_home": os.getenv("TERMINAL_TENKI_SYNC_HERMES_HOME", "false").lower() in {"true", "1", "yes"},
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1339,6 +1331,11 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
         "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        # Coder-specific config
+        "coder_url": coder_url,
+        "coder_api_key": coder_api_key,
+        "coder_organization": coder_organization,
+        "coder_workspace": coder_workspace,
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
@@ -1348,14 +1345,11 @@ def _get_env_config() -> Dict[str, Any]:
         ).lower() in {"true", "1", "yes"},
         "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
         # Container resource config (applies to docker, singularity, modal,
-        # daytona, tenki -- ignored for local/ssh)
+        # daytona -- ignored for local/ssh)
         "container_cpu": container_cpu,
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
-        "container_persistent": os.getenv(
-            "TERMINAL_CONTAINER_PERSISTENT",
-            "false" if env_type == "tenki" else "true",
-        ).lower() in {"true", "1", "yes"},
+        "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
@@ -1398,7 +1392,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "tenki", "ssh"
+            "daytona", "ssh"
         image: Docker/Singularity/Modal image name (ignored for local/ssh)
         cwd: Working directory
         timeout: Default command timeout
@@ -1519,30 +1513,6 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
 
-    elif env_type == "tenki":
-        from tools.environments.tenki import TenkiEnvironment as _TenkiEnvironment
-
-        return _TenkiEnvironment(
-            image=image,
-            cwd=cwd,
-            timeout=timeout,
-            cpu=cpu,
-            memory=memory,
-            disk=disk,
-            persistent_filesystem=persistent,
-            task_id=task_id,
-            api_endpoint=cc.get("tenki_api_endpoint", ""),
-            workspace_id=cc.get("tenki_workspace_id", ""),
-            project_id=cc.get("tenki_project_id", ""),
-            name_prefix=cc.get("tenki_name_prefix", "hermes"),
-            allow_inbound=cc.get("tenki_allow_inbound", False),
-            allow_outbound=cc.get("tenki_allow_outbound", True),
-            max_duration=cc.get("tenki_max_duration", 3600),
-            idle_timeout=cc.get("tenki_idle_timeout", 0),
-            pause_retention=cc.get("tenki_pause_retention", 0),
-            sync_hermes_home=cc.get("tenki_sync_hermes_home", False),
-        )
-
     elif env_type == "ssh":
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
             raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
@@ -1555,10 +1525,24 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             timeout=timeout,
         )
 
+    elif env_type == "coder":
+        if not cc.get("coder_url") or not cc.get("coder_api_key") or not cc.get("coder_workspace"):
+            raise ValueError("Coder environment requires CODER_URL, CODER_API_KEY, and CODER_WORKSPACE")
+        return _CoderEnvironment(
+            base_url=cc["coder_url"],
+            task_id=task_id,
+            api_key=cc["coder_api_key"],
+            workspace_name=cc["coder_workspace"],
+            cwd=cwd,
+            timeout=timeout,
+            forward_env=cc.get("coder_forward_env", []),
+            workspace_startup_timeout=cc.get("coder_workspace_startup_timeout"),
+        )
+
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'tenki', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'ssh', or 'coder'"
         )
 
 
@@ -2113,8 +2097,6 @@ def terminal_tool(
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
-        elif env_type == "tenki":
-            image = overrides.get("tenki_image") or config["tenki_image"]
         else:
             image = ""
 
@@ -2223,7 +2205,7 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in _CONTAINER_BACKENDS:
+                        if env_type in {"docker", "singularity", "modal", "daytona", "coder"}:
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
@@ -2238,16 +2220,12 @@ def terminal_tool(
                                 "docker_extra_args": config.get("docker_extra_args", []),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                                "tenki_project_id": config.get("tenki_project_id", ""),
-                                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                                "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
-                                "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
+                                "coder_url": config.get("coder_url", ""),
+                                "coder_api_key": config.get("coder_api_key", ""),
+                                "coder_organization": config.get("coder_organization", ""),
+                                "coder_workspace": config.get("coder_workspace", ""),
+                                "coder_forward_env": config.get("coder_forward_env", []),
+                                "coder_workspace_startup_timeout": config.get("coder_workspace_startup_timeout", 180),
                             }
 
                         local_config = None
@@ -2635,7 +2613,7 @@ def terminal_tool(
             retry_count = 0
             result = None
             command_cwd = None
-            
+
             while retry_count <= max_retries:
                 try:
                     command_cwd = _resolve_command_cwd(
@@ -2717,7 +2695,7 @@ def terminal_tool(
                         break
             except Exception:
                 pass
-            
+
             # Truncate output if too long, keeping both head and tail
             from tools.tool_output_limits import get_max_bytes
             MAX_OUTPUT_CHARS = get_max_bytes()
@@ -2898,34 +2876,10 @@ def check_terminal_requirements() -> bool:
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
-        elif env_type == "tenki":
-            if importlib.util.find_spec("tenki_sandbox") is None:
-                try:
-                    from tools.lazy_deps import ensure as _lazy_ensure
-
-                    _lazy_ensure("terminal.tenki", prompt=False)
-                    importlib.invalidate_caches()
-                except Exception as exc:
-                    logger.error(
-                        "tenki-sandbox is required for Tenki terminal backend: "
-                        "pip install tenki-sandbox==0.1.1 (%s)",
-                        exc,
-                    )
-                    return False
-                if importlib.util.find_spec("tenki_sandbox") is None:
-                    logger.error(
-                        "tenki-sandbox is required for Tenki terminal backend: "
-                        "pip install tenki-sandbox==0.1.1"
-                    )
-                    return False
-            try:
-                from tools.tenki_config import has_tenki_auth
-            except Exception:
-                has_tenki_auth = lambda: False  # noqa: E731
-            if not has_tenki_auth():
+        elif env_type == "coder":
+            if not config.get("coder_url") or not config.get("coder_api_key") or not config.get("coder_workspace"):
                 logger.error(
-                    "Tenki backend selected but no Tenki auth was found. Run `tenki login` "
-                    "or set TENKI_AUTH_TOKEN/TENKI_API_KEY."
+                    "Coder backend selected but CODER_URL, CODER_API_KEY, and CODER_WORKSPACE must all be set."
                 )
                 return False
             return True
@@ -2933,7 +2887,7 @@ def check_terminal_requirements() -> bool:
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, tenki, ssh.",
+                "modal, daytona, ssh, coder.",
                 env_type,
             )
             return False
@@ -2952,7 +2906,6 @@ if __name__ == "__main__":
     print(f"  Environment type: {config['env_type']}")
     print(f"  Docker image: {config['docker_image']}")
     print(f"  Modal image: {config['modal_image']}")
-    print(f"  Tenki image: {config['tenki_image'] or '(Tenki default)'}")
     print(f"  Working directory: {config['cwd']}")
     print(f"  Default timeout: {config['timeout']}s")
     print(f"  Lifetime: {config['lifetime_seconds']}s")
@@ -2977,13 +2930,12 @@ if __name__ == "__main__":
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
-        "(local/docker/singularity/modal/daytona/tenki/ssh)"
+        "(local/docker/singularity/modal/daytona/ssh)"
     )
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
     print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
     print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
-    print(f"  TERMINAL_TENKI_IMAGE: {os.getenv('TERMINAL_TENKI_IMAGE', '(Tenki default)')}")
     print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', _safe_getcwd())}")
     from hermes_constants import display_hermes_home as _dhh
     print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
