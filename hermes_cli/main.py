@@ -616,6 +616,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_stepfun,
     _model_flow_bedrock_api_key,
     _model_flow_bedrock,
+    _model_flow_vertex,
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
@@ -3109,6 +3110,8 @@ def select_provider_and_model(args=None):
         _model_flow_stepfun(config, current_model)
     elif selected_provider == "bedrock":
         _model_flow_bedrock(config, current_model)
+    elif selected_provider == "vertex":
+        _model_flow_vertex(config, current_model)
     elif selected_provider == "azure-foundry":
         _model_flow_azure_foundry(config, current_model)
     elif selected_provider in {
@@ -5860,8 +5863,16 @@ def _find_stale_dashboard_pids(
                     current_cmd = line[len("CommandLine=") :]
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId=") :]
+                    # Normalise away ``--profile <name>`` / ``-p <name>``
+                    # — same rationale as the POSIX branch below.
+                    import re as _re
+                    _cmd_norm = _re.sub(
+                        r"\s{2,}",
+                        " ",
+                        _re.sub(r"(?:--profile|-p)\s+\S+", "", current_cmd),
+                    )
                     if (
-                        any(p in current_cmd for p in patterns)
+                        any(p in _cmd_norm for p in patterns)
                         and int(pid_str) != self_pid
                     ):
                         try:
@@ -5894,7 +5905,18 @@ def _find_stale_dashboard_pids(
                     except ValueError:
                         continue
                     command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
+                    # Normalise away ``--profile <name>`` / ``-p <name>``
+                    # so that ``hermes --profile bruce dashboard`` still
+                    # matches the ``"hermes dashboard"`` pattern.  Without
+                    # this, non-default-profile dashboard processes are
+                    # invisible to the stale-dashboard sweep (issue #56717).
+                    import re as _re
+                    _cmd_norm = _re.sub(
+                        r"\s{2,}",
+                        " ",
+                        _re.sub(r"(?:--profile|-p)\s+\S+", "", command),
+                    )
+                    if any(p in _cmd_norm for p in patterns) and pid != self_pid:
                         dashboard_pids.append(pid)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -11902,7 +11924,7 @@ def _build_provider_choices() -> list[str]:
         # Fallback: static list guarantees the CLI always works
         return [
             "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
-            "anthropic", "gemini", "xai", "bedrock", "azure-foundry",
+            "anthropic", "gemini", "vertex", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
             "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
