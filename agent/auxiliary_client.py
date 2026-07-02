@@ -5738,6 +5738,13 @@ def _build_call_kwargs(
         # max_tokens is a MANDATORY field — omitting it is a hard 400. Keep it only
         # there.
         #
+        # OpenRouter is another exception: omitting max_tokens makes OpenRouter
+        # apply its own route/output default (observed as 65536 on some routes),
+        # so small auxiliary calls such as title generation can trip free-tier
+        # output limits even though the caller explicitly requested a tiny cap.
+        # OpenRouter accepts the standard OpenAI-compatible max_tokens field, so
+        # preserve explicit auxiliary caps there.
+        #
         # NVIDIA NIM (integrate.api.nvidia.com and local NIM endpoints) is a
         # second exception: some models—notably minimaxai/minimax-m3—return HTTP
         # 200 with an empty choices[] payload when max_tokens is omitted. The main
@@ -5751,8 +5758,13 @@ def _build_call_kwargs(
             _provider_norm in {"nvidia", "nvidia-nim", "nim", "build-nvidia", "nemotron"}
             or base_url_host_matches(_effective_base, "integrate.api.nvidia.com")
         )
+        _is_openrouter = (
+            _provider_norm == "openrouter"
+            or base_url_host_matches(_effective_base, "openrouter.ai")
+        )
         if (
             _is_anthropic_compat_endpoint(provider, _effective_base)
+            or _is_openrouter
             or _is_nvidia_nim
         ):
             kwargs["max_tokens"] = max_tokens
