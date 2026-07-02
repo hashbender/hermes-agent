@@ -99,6 +99,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "provider.anthropic": ("anthropic==0.87.0",),  # CVE-2026-34450, CVE-2026-34452
     # AWS Bedrock provider
     "provider.bedrock": ("boto3==1.42.89",),
+    # Google Vertex AI provider — OAuth2 token minting for the Gemini
+    # OpenAI-compatible endpoint. Only loaded when provider=vertex is selected;
+    # google-auth is NOT in [all] so plain installs don't carry it.
+    "provider.vertex": ("google-auth==2.55.1",),
     # Microsoft Foundry — Entra ID auth (managed identity, workload identity,
     # service principal, az login, VS Code, azd, PowerShell). Only loaded
     # when model.auth_mode=entra_id is selected; key-based azure-foundry
@@ -677,10 +681,17 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                                       f"pip not available and ensurepip failed: {e}")
 
         try:
+            # Scrub Hermes-managed credentials from the pip subprocess too, so
+            # the fallback tier matches the uv tier above. Without this, on any
+            # host without ``uv`` the pip child (and any package build hook it
+            # runs) inherits the operator's full environment — provider API
+            # keys, gateway tokens, GitHub auth — which #53937 set out to strip
+            # by default across the whole spawn surface.
             r = subprocess.run(
                 pip_cmd + ["install", *target_args, *constraint_args, *specs],
                 capture_output=True, text=True, timeout=timeout,
                 stdin=subprocess.DEVNULL,
+                env=uv_env,
             )
             if r.returncode == 0 and target is not None:
                 _activate_target_on_syspath(target)
