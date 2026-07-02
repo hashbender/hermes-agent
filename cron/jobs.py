@@ -562,6 +562,27 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
     return None
 
 
+def _schedule_run_identity(schedule: Any) -> Tuple[Any, ...]:
+    """Return the run-affecting identity of a parsed schedule."""
+    if isinstance(schedule, str):
+        schedule = parse_schedule(schedule)
+
+    if not isinstance(schedule, dict):
+        return ("raw", json.dumps(schedule, sort_keys=True, default=str))
+
+    kind = schedule.get("kind")
+    if kind == "interval":
+        return ("interval", schedule.get("minutes"))
+    if kind == "cron":
+        return ("cron", schedule.get("expr"))
+    if kind == "once":
+        return ("once", schedule.get("run_at"))
+    return (
+        "unknown",
+        json.dumps(schedule, sort_keys=True, separators=(",", ":"), default=str),
+    )
+
+
 # =============================================================================
 # Ticker heartbeat (liveness signal for `hermes cron status`)
 # =============================================================================
@@ -1113,6 +1134,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = _normalize_workdir(_wd)
 
             previous_inference_axes = _normalized_inference_axes(job)
+            previous_schedule_identity = (
+                _schedule_run_identity(job.get("schedule"))
+                if "schedule" in updates
+                else None
+            )
             updated = _apply_skill_fields({**job, **updates})
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
@@ -1136,7 +1162,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     "schedule_display",
                     updated_schedule.get("display", updated.get("schedule_display")),
                 )
-                if updated.get("state") != "paused":
+                run_schedule_changed = (
+                    _schedule_run_identity(updated_schedule)
+                    != previous_schedule_identity
+                )
+                if run_schedule_changed and updated.get("state") != "paused":
                     updated["next_run_at"] = compute_next_run(updated_schedule)
 
             if inference_fields_changed:
