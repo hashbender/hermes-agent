@@ -128,45 +128,13 @@ _LOGGED_UNSUPPORTED_EXTPROC_KEYS: set = set()
 _LOGGED_UNSUPPORTED_OAUTH_KEYS: set = set()
 
 
-def _resolve_aux_verify(base_url: Optional[str]) -> Any:
-    """Resolve httpx ``verify`` for an auxiliary-client base_url.
-
-    Mirrors the main client's TLS resolution so auxiliary calls (compression,
-    vision, web_extract, title generation, etc.) honor per-provider
-    ``ssl_ca_cert`` / ``ssl_verify`` config and the ``HERMES_CA_BUNDLE`` /
-    ``SSL_CERT_FILE`` env conventions. Best-effort: any failure falls back to
-    the httpx/certifi default (``True``).
-    """
-    try:
-        from agent.ssl_verify import resolve_httpx_verify
-        from hermes_cli.config import (
-            get_custom_provider_tls_settings,
-            load_config_readonly,
-        )
-
-        tls = get_custom_provider_tls_settings(
-            str(base_url or ""), config=load_config_readonly()
-        )
-        return resolve_httpx_verify(
-            ca_bundle=tls.get("ssl_ca_cert"),
-            ssl_verify=tls.get("ssl_verify"),
-            base_url=str(base_url or ""),
-        )
-    except Exception:
-        return True
-
-
 def _openai_http_client_kwargs(
     base_url: Optional[str],
     *,
     async_mode: bool = False,
 ) -> Dict[str, Any]:
     """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
-    client = build_keepalive_http_client(
-        str(base_url or ""),
-        async_mode=async_mode,
-        verify=_resolve_aux_verify(base_url),
-    )
+    client = build_keepalive_http_client(str(base_url or ""), async_mode=async_mode)
     if client is None:
         return {}
     return {"http_client": client}
@@ -5361,8 +5329,8 @@ def _resolve_task_provider_model(
     task: str = None,
     provider: str = None,
     model: str = None,
-    base_url: str = None,
-    api_key: str = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine provider + model for a call.
 
@@ -5403,6 +5371,51 @@ def _resolve_task_provider_model(
 
     resolved_model = model or cfg_model
     resolved_api_mode = cfg_api_mode
+
+    # MoA virtual provider: an *explicit* `provider: moa` override (either the
+    # caller-passed `provider` arg or `auxiliary.<task>.provider` in
+    # config.yaml) reaches this function directly — it never goes through
+    # _resolve_auto(), which only unwraps the *implicit* "main provider is
+    # moa" case (#53827). Left as-is, "moa" is returned verbatim and
+    # resolve_provider_client() looks it up in PROVIDER_REGISTRY (which has
+    # no "moa" entry — it's not a real HTTP provider), falls to the
+    # unknown-provider dead end, and call_llm surfaces a nonsensical
+    # "MOA_API_KEY environment variable" error for a provider that was never
+    # meant to be reached over the wire. Auxiliary tasks don't need the
+    # reference fan-out — resolve to the preset's aggregator slot instead,
+    # exactly like the implicit path does.
+    def _unwrap_moa_provider(prov: str, mdl: Optional[str]) -> Tuple[str, Optional[str]]:
+        if prov.strip().lower() != "moa":
+            return prov, mdl
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.moa_config import resolve_moa_preset
+
+            preset = resolve_moa_preset(load_config().get("moa") or {}, mdl)
+            agg = preset.get("aggregator") or {}
+            agg_provider = str(agg.get("provider") or "").strip()
+            agg_model = str(agg.get("model") or "").strip()
+            if agg_provider and agg_model and agg_provider.lower() != "moa":
+                return agg_provider, agg_model
+        except Exception:
+            logger.debug("MoA aux resolution (explicit provider override) to aggregator failed", exc_info=True)
+        return prov, mdl
+
+    if provider and str(provider).strip().lower() == "moa":
+        provider, resolved_model = _unwrap_moa_provider(provider, resolved_model)
+        # The moa:// virtual endpoint (if any explicit base_url/api_key was
+        # passed alongside provider="moa") belongs to the facade, not the
+        # aggregator's real provider — drop it so the aggregator resolves
+        # through its own provider credentials, mirroring _resolve_auto().
+        if provider and provider.lower() != "moa":
+            base_url = None
+            api_key = None
+    elif cfg_provider and str(cfg_provider).strip().lower() == "moa":
+        cfg_provider, cfg_model = _unwrap_moa_provider(cfg_provider, resolved_model)
+        if cfg_provider and cfg_provider.lower() != "moa":
+            resolved_model = cfg_model
+            cfg_base_url = None
+            cfg_api_key = None
 
     # Convenience aliases for direct API-key endpoints that aren't first-class
     # providers (e.g. ``provider: openai`` → custom + api.openai.com/v1).
