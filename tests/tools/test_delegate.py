@@ -10,6 +10,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 """
 
 import json
+import logging
 import os
 import threading
 import time
@@ -33,6 +34,7 @@ from tools.delegate_tool import (
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
     _inherit_parent_base_url,
+    _resolve_model_provider_override,
 )
 
 
@@ -69,16 +71,27 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
-        # toolsets is intentionally NOT exposed to the model — subagents always
-        # inherit the parent's toolsets. Letting the model name toolsets was a
-        # capability-selection surface the model should not control.
-        self.assertNotIn("toolsets", props)
-        self.assertNotIn("toolsets", props["tasks"]["items"]["properties"])
+        self.assertIn("toolsets", props)
+        self.assertIn("model", props)
+        self.assertIn("provider", props)
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("model", task_props)
+        self.assertIn("provider", task_props)
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
         self.assertNotIn("max_iterations", props)
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+
+    def test_schema_documents_model_provider_syntax(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        top_model_desc = props["model"]["description"]
+        task_model_desc = props["tasks"]["items"]["properties"]["model"]["description"]
+
+        self.assertIn("--provider", top_model_desc)
+        self.assertIn("--provider", task_model_desc)
+        self.assertIn("Do NOT use provider:model", top_model_desc)
+        self.assertIn("Do NOT use provider:model", task_model_desc)
 
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
@@ -1425,8 +1438,18 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             }
             MockAgent.return_value = mock_child
 
-            delegate_task(goal="Test provider routing", parent_agent=parent)
+            with self.assertLogs("tools.delegate_tool", level=logging.INFO) as cm:
+                delegate_task(goal="Test provider routing", parent_agent=parent)
 
+            self.assertTrue(
+                any(
+                    "Subagent 0 resolved runtime" in msg
+                    and "provider=openrouter" in msg
+                    and "model=google/gemini-3-flash-preview" in msg
+                    for msg in cm.output
+                ),
+                cm.output,
+            )
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["model"], "google/gemini-3-flash-preview")
             self.assertEqual(kwargs["provider"], "openrouter")
@@ -1744,6 +1767,304 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             # But provider/base_url/api_key should inherit from parent
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["base_url"], parent.base_url)
+
+
+class TestResolveModelProviderOverride(unittest.TestCase):
+    """Tests for resolving explicit delegate_task model/provider overrides."""
+
+    def _fake_switch_result(self, **overrides):
+        result = MagicMock()
+        defaults = {
+            "success": True,
+            "new_model": "claude-sonnet-4-6",
+            "target_provider": "anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "api_key": "ant-test-key",
+            "api_mode": "anthropic_messages",
+            "error_message": "",
+        }
+        defaults.update(overrides)
+        for key, value in defaults.items():
+            setattr(result, key, value)
+        return result
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    @patch("hermes_cli.model_switch.switch_model")
+    def test_resolves_model_with_structured_provider(self, mock_switch, mock_runtime):
+        mock_switch.return_value = self._fake_switch_result(
+            new_model="llama-3.3-70b:free",
+            target_provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            api_key="sk-or-test",
+            api_mode="chat_completions",
+        )
+        mock_runtime.return_value = {"command": None, "args": []}
+        parent = _make_mock_parent(depth=0)
+
+        creds = _resolve_model_provider_override(
+            model_input="llama-3.3-70b:free",
+            provider_input="openrouter",
+            parent_agent=parent,
+        )
+
+        self.assertEqual(creds["model"], "llama-3.3-70b:free")
+        self.assertEqual(creds["provider"], "openrouter")
+        self.assertEqual(creds["api_key"], "sk-or-test")
+        _, kwargs = mock_switch.call_args
+        self.assertEqual(kwargs["raw_input"], "llama-3.3-70b:free")
+        self.assertEqual(kwargs["explicit_provider"], "openrouter")
+        self.assertFalse(kwargs["is_global"])
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    @patch("hermes_cli.model_switch.switch_model")
+    def test_resolves_inline_provider_flag(self, mock_switch, mock_runtime):
+        mock_switch.return_value = self._fake_switch_result(
+            new_model="stepfun/step-3.5-flash",
+            target_provider="openrouter",
+        )
+        mock_runtime.return_value = {"command": None, "args": []}
+        parent = _make_mock_parent(depth=0)
+
+        _resolve_model_provider_override(
+            model_input="stepfun/step-3.5-flash --provider openrouter",
+            provider_input=None,
+            parent_agent=parent,
+        )
+
+        _, kwargs = mock_switch.call_args
+        self.assertEqual(kwargs["raw_input"], "stepfun/step-3.5-flash")
+        self.assertEqual(kwargs["explicit_provider"], "openrouter")
+
+    def test_conflicting_structured_and_inline_provider_fails(self):
+        parent = _make_mock_parent(depth=0)
+
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_model_provider_override(
+                model_input="sonnet --provider anthropic",
+                provider_input="openrouter",
+                parent_agent=parent,
+            )
+
+        self.assertIn("Conflicting provider overrides", str(ctx.exception))
+
+    @patch("hermes_cli.model_switch.switch_model")
+    def test_resolution_failure_raises_value_error(self, mock_switch):
+        mock_switch.return_value = self._fake_switch_result(
+            success=False,
+            error_message="Unknown model 'banana'",
+        )
+        parent = _make_mock_parent(depth=0)
+
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_model_provider_override(
+                model_input="banana",
+                provider_input=None,
+                parent_agent=parent,
+            )
+
+        self.assertIn("banana", str(ctx.exception))
+        self.assertIn("Unknown model", str(ctx.exception))
+
+
+class TestDelegateTaskModelProviderOverride(unittest.TestCase):
+    """Tests for delegate_task model/provider override plumbing."""
+
+    def _default_creds(self):
+        return {
+            "model": "default-model",
+            "provider": "default-provider",
+            "base_url": "https://default.example/v1",
+            "api_key": "default-key",
+            "api_mode": "chat_completions",
+            "command": None,
+            "args": [],
+        }
+
+    def _override_creds(self, model_input, provider_input):
+        return {
+            "model": f"resolved:{model_input or 'default'}",
+            "provider": provider_input or "resolved-provider",
+            "base_url": "https://resolved.example/v1",
+            "api_key": "resolved-key",
+            "api_mode": "chat_completions",
+            "command": None,
+            "args": [],
+        }
+
+    def _run_single_result(self, task_index, goal, child, parent_agent):
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "done",
+            "duration_seconds": 0.0,
+        }
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_model_provider_override")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_top_level_model_provider_reaches_single_goal(
+        self, mock_run, mock_build, mock_override, mock_creds, mock_cfg
+    ):
+        mock_creds.return_value = self._default_creds()
+        mock_override.side_effect = (
+            lambda *, model_input, provider_input, parent_agent:
+            self._override_creds(model_input, provider_input)
+        )
+        mock_build.return_value = MagicMock()
+        mock_run.side_effect = self._run_single_result
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            goal="single",
+            model="sonnet",
+            provider="anthropic",
+            parent_agent=parent,
+        )
+
+        mock_override.assert_called_once_with(
+            model_input="sonnet",
+            provider_input="anthropic",
+            parent_agent=parent,
+        )
+        _, kwargs = mock_build.call_args
+        self.assertEqual(kwargs["model"], "resolved:sonnet")
+        self.assertEqual(kwargs["override_provider"], "anthropic")
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_model_provider_override")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_per_task_model_beats_top_level_model(
+        self, mock_run, mock_build, mock_override, mock_creds, mock_cfg
+    ):
+        mock_creds.return_value = self._default_creds()
+        mock_override.side_effect = (
+            lambda *, model_input, provider_input, parent_agent:
+            self._override_creds(model_input, provider_input)
+        )
+        mock_build.return_value = MagicMock()
+        mock_run.side_effect = self._run_single_result
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            model="sonnet",
+            tasks=[
+                {"goal": "Task A", "model": "haiku"},
+                {"goal": "Task B"},
+            ],
+            parent_agent=parent,
+        )
+
+        override_models = [
+            call.kwargs["model_input"]
+            for call in mock_override.call_args_list
+        ]
+        built_models = [
+            call.kwargs["model"]
+            for call in mock_build.call_args_list
+        ]
+        self.assertEqual(override_models, ["haiku", "sonnet"])
+        self.assertEqual(built_models, ["resolved:haiku", "resolved:sonnet"])
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_model_provider_override")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_model_only_override_on_same_provider_is_resolved(
+        self, mock_run, mock_build, mock_override, mock_creds, mock_cfg
+    ):
+        mock_creds.return_value = self._default_creds()
+        mock_override.side_effect = (
+            lambda *, model_input, provider_input, parent_agent:
+            self._override_creds(model_input, provider_input)
+        )
+        mock_build.return_value = MagicMock()
+        mock_run.side_effect = self._run_single_result
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            tasks=[{"goal": "Task A", "model": "haiku"}],
+            parent_agent=parent,
+        )
+
+        mock_override.assert_called_once()
+        self.assertEqual(mock_build.call_args.kwargs["model"], "resolved:haiku")
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_model_provider_override")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_no_override_uses_delegation_credentials(
+        self, mock_run, mock_build, mock_override, mock_creds, mock_cfg
+    ):
+        mock_creds.return_value = self._default_creds()
+        mock_build.return_value = MagicMock()
+        mock_run.side_effect = self._run_single_result
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(goal="default", parent_agent=parent)
+
+        mock_override.assert_not_called()
+        _, kwargs = mock_build.call_args
+        self.assertEqual(kwargs["model"], "default-model")
+        self.assertEqual(kwargs["override_provider"], "default-provider")
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_model_provider_override")
+    def test_override_failure_returns_tool_error(
+        self, mock_override, mock_creds, mock_cfg
+    ):
+        mock_creds.return_value = self._default_creds()
+        mock_override.side_effect = ValueError("Cannot resolve model 'banana'")
+        parent = _make_mock_parent(depth=0)
+
+        result = json.loads(
+            delegate_task(goal="bad", model="banana", parent_agent=parent)
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("banana", result["error"])
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._resolve_model_provider_override")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_registry_handler_forwards_model_and_provider(
+        self, mock_run, mock_build, mock_override, mock_creds, mock_cfg
+    ):
+        from tools.registry import registry
+
+        mock_creds.return_value = self._default_creds()
+        mock_override.side_effect = (
+            lambda *, model_input, provider_input, parent_agent:
+            self._override_creds(model_input, provider_input)
+        )
+        mock_build.return_value = MagicMock()
+        mock_run.side_effect = self._run_single_result
+        parent = _make_mock_parent(depth=0)
+
+        registry.dispatch(
+            "delegate_task",
+            {
+                "goal": "registry",
+                "model": "qwen3.6-plus",
+                "provider": "opencode-go",
+            },
+            parent_agent=parent,
+        )
+
+        mock_override.assert_called_once_with(
+            model_input="qwen3.6-plus",
+            provider_input="opencode-go",
+            parent_agent=parent,
+        )
 
 
 class TestChildCredentialPoolResolution(unittest.TestCase):
@@ -3070,6 +3391,139 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+class TestDelegateCredentialLeakGuard(unittest.TestCase):
+    """Regression tests for the 2026-06-28 OpenRouter credential leak.
+
+    When delegate_task() targets a subagent with override_provider pointing
+    to a different provider than the parent, the child agent must NOT inherit
+    the parent's base_url or api_key — otherwise a parent holding an openrouter
+    credential could silently forward it to a subagent whose model override
+    targets a different provider, billing the user for models never authorised
+    through that route.
+
+    Confirmed leak: 2026-06-28 00:11 session 20260628_000238_58dc95 billed
+    11.82$ on openrouter.ai for anthropic/claude-sonnet-4.6.
+
+    These tests pin the post-fix behaviour:
+    - Same provider: inherit (existing behaviour preserved)
+    - Different provider: drop base_url + api_key unless explicitly overridden
+    - Explicit override: respect the user's intent
+    """
+
+    def _build_with_override(self, parent, override_provider, override_base_url=None, override_api_key=None):
+        """Helper: build a child agent with provider override, return MockAgent kwargs."""
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="test credential leak guard",
+                context=None,
+                toolsets=None,
+                model="anthropic/claude-sonnet-4.6",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider=override_provider,
+                override_base_url=override_base_url,
+                override_api_key=override_api_key,
+            )
+
+        _, kwargs = MockAgent.call_args
+        return kwargs
+
+    def test_child_does_not_inherit_parent_base_url_on_provider_switch(self):
+        """When override_provider differs from parent.provider, child.base_url
+        must NOT be the parent's base_url — it must be None so init_agent
+        re-resolves from the target provider's own config."""
+        parent = _make_mock_parent(depth=0)
+        # parent.base_url = "https://openrouter.ai/api/v1" (set by _make_mock_parent)
+
+        kwargs = self._build_with_override(
+            parent,
+            override_provider="anthropic",
+        )
+
+        self.assertNotEqual(
+            kwargs["base_url"], parent.base_url,
+            "Child must NOT inherit parent's base_url when override_provider "
+            "targets a different provider — this is the 2026-06-28 OpenRouter leak.",
+        )
+        self.assertIsNone(
+            kwargs["base_url"],
+            "Child.base_url should be None so init_agent() re-resolves from "
+            "the target provider's own config/credential pool.",
+        )
+
+    def test_child_does_not_inherit_parent_api_key_on_provider_switch(self):
+        """When override_provider differs from parent.provider, child.api_key
+        must NOT be the parent's api_key — it must be None."""
+        parent = _make_mock_parent(depth=0)
+
+        kwargs = self._build_with_override(
+            parent,
+            override_provider="anthropic",
+        )
+
+        self.assertNotEqual(
+            kwargs["api_key"], parent.api_key,
+            "Child must NOT inherit parent's api_key when override_provider "
+            "targets a different provider — this is the leak vector that "
+            "billed 11.82$ to OpenRouter on 2026-06-28.",
+        )
+        self.assertIsNone(
+            kwargs["api_key"],
+            "Child.api_key should be None so init_agent() re-resolves from "
+            "the target provider's own credential pool.",
+        )
+
+    def test_child_inherits_parent_creds_when_same_provider(self):
+        """When override_provider matches parent.provider (or no override is
+        set), the child should still inherit base_url and api_key — this is
+        the existing legitimate behaviour the patch must not regress."""
+        parent = _make_mock_parent(depth=0)
+
+        kwargs = self._build_with_override(
+            parent,
+            override_provider="openrouter",  # same as parent.provider
+        )
+
+        self.assertEqual(
+            kwargs["base_url"], parent.base_url,
+            "Same-provider delegation must still inherit base_url (regression guard).",
+        )
+        self.assertEqual(
+            kwargs["api_key"], parent.api_key,
+            "Same-provider delegation must still inherit api_key (regression guard).",
+        )
+
+    def test_child_respects_explicit_override_base_url_and_key(self):
+        """When the caller explicitly provides override_base_url and/or
+        override_api_key via delegate_task(...), the child must respect them
+        even when override_provider differs from parent.provider. The guard
+        must only nullify when no explicit override was supplied."""
+        parent = _make_mock_parent(depth=0)
+        explicit_url = "https://api.minimax.io/anthropic"
+        explicit_key = "sk-explicit-override-key"
+
+        kwargs = self._build_with_override(
+            parent,
+            override_provider="anthropic",
+            override_base_url=explicit_url,
+            override_api_key=explicit_key,
+        )
+
+        self.assertEqual(
+            kwargs["base_url"], explicit_url,
+            "Explicit override_base_url must be respected even on provider switch.",
+        )
+        self.assertEqual(
+            kwargs["api_key"], explicit_key,
+            "Explicit override_api_key must be respected even on provider switch.",
+        )
 
 
 if __name__ == "__main__":
