@@ -74,10 +74,6 @@ from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
 from acp_adapter.tools import build_tool_complete, build_tool_start
-from tools.approval import (
-    reset_hermes_interactive_context,
-    set_hermes_interactive_context,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +182,70 @@ def _path_from_file_uri(uri: str) -> Path | None:
     return Path(path_text)
 
 
+def _parse_line_range_from_uri(uri: str) -> tuple[int | None, int | None]:
+    """Parse line range from a URI fragment like ``#L100:200`` or ``#L100-L200``.
+
+    Returns ``(start_line, end_line)`` both 0-based (or ``None`` when absent).
+    Understands these fragment formats:
+    - ``#L100:200`` — range from line 100 to 200
+    - ``#L100-L200`` — range with hyphen separator
+    - ``#100:200`` — without the L prefix
+    - ``#L1872`` — single line
+    """
+    try:
+        parsed = urlparse(uri)
+    except Exception:
+        return (None, None)
+    fragment = (parsed.fragment or "").strip()
+    if not fragment:
+        return (None, None)
+    # Strip leading 'L' for the whole fragment, then split
+    raw = fragment.lstrip("L")
+    if ":" in raw:
+        parts = raw.split(":", 1)
+    elif "-" in raw:
+        parts = raw.split("-", 1)
+    else:
+        # single line number like L1872
+        try:
+            val = int(raw)
+            return (max(0, val - 1), max(0, val - 1))
+        except ValueError:
+            return (None, None)
+    if len(parts) != 2:
+        return (None, None)
+    try:
+        # Each part may still carry a stray 'L' (e.g. L100-L200)
+        start = int(parts[0].lstrip("L"))
+        end = int(parts[1].lstrip("L"))
+        # ACP line numbers are 1-based; convert to 0-based
+        return (max(0, start - 1), max(0, end - 1))
+    except ValueError:
+        return (None, None)
+
+
+def _apply_line_range(text: str, uri: str) -> tuple[str, list[str]]:
+    """Clip *text* to the line range specified in *uri*'s fragment (e.g. ``#L14:21``).
+
+    Returns ``(clipped_text, notes)`` where *notes* is a list of annotation
+    strings (empty when no range was specified or the range covers the whole
+    content).
+    """
+    notes: list[str] = []
+    start_line, end_line = _parse_line_range_from_uri(uri)
+    if start_line is not None and end_line is not None:
+        lines = text.splitlines(keepends=True)
+        if not lines:
+            return (text, notes)
+        start_line = max(0, min(start_line, len(lines) - 1))
+        end_line = max(start_line, min(end_line, len(lines) - 1))
+        clipped = "".join(lines[start_line:end_line + 1])
+        if clipped != text:
+            notes.append(f"lines {start_line + 1}-{end_line + 1} of {len(lines)}")
+            text = clipped
+    return (text, notes)
+
+
 def _decode_text_bytes(data: bytes, mime_type: str | None) -> str | None:
     """Decode resource bytes if they are probably text; return None for binary."""
     if b"\x00" in data and not _is_text_resource(mime_type):
@@ -292,9 +352,16 @@ def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]
                     body=f"[Binary file omitted: {size} bytes, mime={mime_type or 'unknown'}]",
                 ),
             }]
-        note = None
+        notes = []
         if size > _MAX_ACP_RESOURCE_BYTES:
-            note = f"truncated to {_MAX_ACP_RESOURCE_BYTES} of {size} bytes"
+            notes.append(f"truncated to {_MAX_ACP_RESOURCE_BYTES} of {size} bytes")
+
+        # Extract line range from URI fragment and clip content
+        clipped_text, range_notes = _apply_line_range(text, uri)
+        notes.extend(range_notes)
+        text = clipped_text
+
+        note = "; ".join(notes) if notes else None
         return [{
             "type": "text",
             "text": _format_resource_text(uri=uri, name=name, title=title, body=text, note=note),
@@ -321,7 +388,10 @@ def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dic
     mime_type = str(getattr(resource, "mime_type", "") or "").strip() or None
 
     if isinstance(resource, TextResourceContents):
-        return [{"type": "text", "text": _format_resource_text(uri=uri, body=resource.text)}]
+        body = resource.text
+        body, range_notes = _apply_line_range(body, uri)
+        note = "; ".join(range_notes) if range_notes else None
+        return [{"type": "text", "text": _format_resource_text(uri=uri, body=body, note=note)}]
 
     if isinstance(resource, BlobResourceContents):
         blob = resource.blob or ""
@@ -351,13 +421,22 @@ def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dic
             body = f"[Binary embedded file omitted: {len(data)} bytes, mime={mime_type or 'unknown'}]"
         else:
             body = text
+            notes = []
             if len(data) > _MAX_ACP_RESOURCE_BYTES:
-                body += f"\n\n[Truncated to {_MAX_ACP_RESOURCE_BYTES} of {len(data)} bytes]"
+                notes.append(f"truncated to {_MAX_ACP_RESOURCE_BYTES} of {len(data)} bytes")
+            clipped_body, range_notes = _apply_line_range(body, uri)
+            notes.extend(range_notes)
+            body = clipped_body
+            if notes:
+                body += f"\n\n[{' - '.join(notes)}]"
         return [{"type": "text", "text": _format_resource_text(uri=uri, body=body)}]
 
     text = getattr(resource, "text", None)
     if text:
-        return [{"type": "text", "text": _format_resource_text(uri=uri, body=str(text))}]
+        body = str(text)
+        body, range_notes = _apply_line_range(body, uri)
+        note = "; ".join(range_notes) if range_notes else None
+        return [{"type": "text", "text": _format_resource_text(uri=uri, body=body, note=note)}]
     return []
 
 
@@ -886,7 +965,7 @@ class HermesACPAgent(acp.Agent):
             agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
-                prompt_capabilities=PromptCapabilities(image=True),
+                prompt_capabilities=PromptCapabilities(image=True, embedded_context=True),
                 session_capabilities=SessionCapabilities(
                     fork=SessionForkCapabilities(),
                     list=SessionListCapabilities(),
@@ -1314,9 +1393,7 @@ class HermesACPAgent(acp.Agent):
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
-        has_content = bool(user_text) or (
-            isinstance(user_content, list) and bool(user_content)
-        )
+        has_content = bool(user_content) if isinstance(user_content, str) else bool(user_text) or bool(user_content)
         if not has_content:
             return PromptResponse(stop_reason="end_turn")
 
@@ -1450,23 +1527,20 @@ class HermesACPAgent(acp.Agent):
         # Approval callback is per-thread (thread-local, GHSA-qg5c-hvr5-hjgr).
         # Set it INSIDE _run_agent so the TLS write happens in the executor
         # thread — setting it here would write to the event-loop thread's TLS,
-        # not the executor's. Interactive routing uses a contextvar in
-        # tools.approval (set_hermes_interactive_context) rather than
-        # os.environ["HERMES_INTERACTIVE"], so concurrent executor workers can't
-        # race on a process-global flag — one session's restore can't drop
-        # another onto the non-interactive auto-approve path mid-run
-        # (GHSA-96vc-wcxf-jjff). The contextvar write is isolated by the
-        # contextvars.copy_context() wrapper around the executor call below.
+        # not the executor's. Also set HERMES_INTERACTIVE so approval.py
+        # takes the CLI-interactive path (which calls the registered
+        # callback via prompt_dangerous_approval) instead of the
+        # non-interactive auto-approve branch (GHSA-96vc-wcxf-jjff).
         # ACP's conn.request_permission maps cleanly to the interactive
         # callback shape — not the gateway-queue HERMES_EXEC_ASK path,
         # which requires a notify_cb registered in _gateway_notify_cbs.
         previous_approval_cb = None
-        interactive_token = None
+        previous_interactive = None
         edit_approval_token = None
         previous_session_id = None
 
         def _run_agent() -> dict:
-            nonlocal previous_approval_cb, interactive_token, edit_approval_token, previous_session_id
+            nonlocal previous_approval_cb, previous_interactive, edit_approval_token, previous_session_id
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -1498,10 +1572,9 @@ class HermesACPAgent(acp.Agent):
                 except Exception:
                     logger.debug("Could not set ACP edit approval requester", exc_info=True)
             # Signal to tools.approval that we have an interactive callback
-            # and the non-interactive auto-approve path must not fire. Uses a
-            # contextvar (not os.environ) so concurrent executor workers don't
-            # race on the flag (GHSA-96vc-wcxf-jjff).
-            interactive_token = set_hermes_interactive_context(True)
+            # and the non-interactive auto-approve path must not fire.
+            previous_interactive = os.environ.get("HERMES_INTERACTIVE")
+            os.environ["HERMES_INTERACTIVE"] = "1"
             # Propagate the originating ACP session id to tools that want to
             # tag side-effects with it (e.g. ``kanban_create`` stamps it on
             # the new task so clients can render a per-session board). Save
@@ -1514,16 +1587,18 @@ class HermesACPAgent(acp.Agent):
                     user_message=user_content,
                     conversation_history=state.history,
                     task_id=session_id,
-                    persist_user_message=user_text or "[Image attachment]",
+                    persist_user_message=user_text or str(user_content)[:200] if isinstance(user_content, str) else "[File reference]",
                 )
                 return result
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
-                # Restore the interactive contextvar for this context.
-                if interactive_token is not None:
-                    reset_hermes_interactive_context(interactive_token)
+                # Restore HERMES_INTERACTIVE.
+                if previous_interactive is None:
+                    os.environ.pop("HERMES_INTERACTIVE", None)
+                else:
+                    os.environ["HERMES_INTERACTIVE"] = previous_interactive
                 # Restore HERMES_SESSION_ID symmetrically.
                 if previous_session_id is None:
                     os.environ.pop("HERMES_SESSION_ID", None)
