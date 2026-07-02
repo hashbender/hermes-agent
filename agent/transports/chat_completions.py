@@ -446,6 +446,16 @@ class ChatCompletionsTransport(ProviderTransport):
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
+        # Prompt cache routing hint for remote OpenAI-compatible providers
+        # (Venice, OpenAI, etc.). Mirrors the Codex transport's
+        # prompt_cache_key = session_id pattern.  Improves cache hit rates
+        # by routing to the same backend infrastructure across turns.
+        session_id = params.get("session_id")
+        if session_id:
+            _base = str(params.get("base_url") or "")
+            if not any(h in _base for h in ("127.0.0.1", "localhost", "0.0.0.0")):
+                api_kwargs.setdefault("prompt_cache_key", session_id)
+
         # Request overrides last (service_tier etc.)
         overrides = params.get("request_overrides")
         if overrides:
@@ -559,6 +569,14 @@ class ChatCompletionsTransport(ProviderTransport):
         additions = params.get("extra_body_additions")
         if additions:
             extra_body.update(additions)
+
+        # Prompt cache routing hint for remote OpenAI-compatible providers
+        # (Venice, OpenAI, etc.). Mirrors the Codex transport pattern.
+        session_id = params.get("session_id")
+        if session_id:
+            _base = str(params.get("base_url") or "")
+            if not any(h in _base for h in ("127.0.0.1", "localhost", "0.0.0.0")):
+                api_kwargs.setdefault("prompt_cache_key", session_id)
 
         # Request overrides (user config)
         overrides = params.get("request_overrides")
