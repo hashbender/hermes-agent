@@ -97,7 +97,7 @@ from tools.tool_backend_helpers import (  # noqa: F401
     nous_tool_gateway_unavailable_message,
     prefers_gateway,
 )
-from tools.url_safety import async_is_safe_url, normalize_url_for_request
+from tools.url_safety import async_is_safe_url, normalize_url_for_request, sensitive_query_param_name
 import sys
 
 logger = logging.getLogger(__name__)
@@ -659,6 +659,17 @@ async def web_extract_tool(
                 "error": "Blocked: URL contains what appears to be an API key or token. "
                          "Secrets must not be sent in URLs.",
             })
+        sensitive_query_key = sensitive_query_param_name(normalized_url)
+        if sensitive_query_key:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Blocked: URL contains a credential-like query parameter "
+                    f"({sensitive_query_key}). Web extract backends are third-party "
+                    "readers; remove the sensitive query parameter or use a local "
+                    "browser session when this access is explicitly required."
+                ),
+            })
         normalized_urls.append(normalized_url)
 
     debug_call_data = {
@@ -764,6 +775,38 @@ async def web_extract_tool(
         # Merge any SSRF-blocked results back in
         if ssrf_blocked:
             results = ssrf_blocked + results
+
+        # Provider-level extractors may report a final/result URL that differs
+        # from the URL we preflighted (for example after redirects or canonical
+        # URL normalization). Firecrawl has its own redirect re-check; keep the
+        # same invariant centrally so Exa/Tavily/Parallel cannot return and
+        # store content for a private/internal final URL.
+        safe_results: List[Dict[str, Any]] = []
+        for result in results:
+            if result.get("error"):
+                safe_results.append(result)
+                continue
+            result_url = result.get("url") or result.get("metadata", {}).get("sourceURL") or ""
+            if result_url and not await async_is_safe_url(result_url):
+                logger.info(
+                    "Blocked web_extract result for unsafe final URL: %s",
+                    result_url,
+                )
+                safe_results.append(
+                    {
+                        "url": result_url,
+                        "title": result.get("title", ""),
+                        "content": "",
+                        "raw_content": "",
+                        "error": (
+                            "Blocked: URL targets a private or internal "
+                            "network address"
+                        ),
+                    }
+                )
+                continue
+            safe_results.append(result)
+        results = safe_results
 
         response = {"results": results}
         
