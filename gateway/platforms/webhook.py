@@ -48,11 +48,14 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.session import SessionSource
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     SendResult,
+    cache_audio_from_bytes,
+    cache_image_from_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -191,7 +194,7 @@ class WebhookAdapter(BasePlatformAdapter):
                         f"real target (telegram, discord, slack, github_comment, etc.)."
                     )
 
-        app = web.Application()
+        app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
@@ -682,27 +685,82 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
 
-        # Build source and event
-        source = self.build_source(
-            chat_id=session_chat_id,
-            chat_name=f"webhook/{route_name}",
-            chat_type="webhook",
-            user_id=f"webhook:{route_name}",
-            user_name=route_name,
-        )
+        # Build source and event. Some local routes (for example shortcuts or
+        # mobile clients) intentionally synthesize a native chat source so STT,
+        # vision, memory, and reply routing behave exactly like a platform
+        # message.
+        source_platform_name = route_config.get("source_platform")
+        source_platform = None
+        if source_platform_name:
+            try:
+                source_platform = Platform(str(source_platform_name))
+            except ValueError:
+                logger.warning("[webhook] Unknown source_platform=%r on route=%s", source_platform_name, route_name)
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        message_type = MessageType.TEXT
+
+        audio_b64 = payload.get("audio_base64") or payload.get("voice_base64")
+        if audio_b64:
+            try:
+                audio_bytes = base64.b64decode(str(audio_b64), validate=True)
+                audio_mime = str(payload.get("audio_mime_type") or payload.get("voice_mime_type") or "audio/ogg")
+                audio_name = str(payload.get("audio_filename") or "")
+                audio_ext = ".m4a" if "mp4" in audio_mime or audio_name.lower().endswith(".m4a") else ".ogg"
+                media_urls.append(cache_audio_from_bytes(audio_bytes, ext=audio_ext))
+                media_types.append(audio_mime)
+                message_type = MessageType.VOICE
+            except (binascii.Error, ValueError) as exc:
+                logger.warning("[webhook] Failed to cache audio payload route=%s: %s", route_name, exc)
+
+        image_b64 = payload.get("screenshot_base64") or payload.get("image_base64")
+        if image_b64:
+            try:
+                image_bytes = base64.b64decode(str(image_b64), validate=True)
+                image_mime = str(payload.get("screenshot_mime_type") or payload.get("image_mime_type") or "image/jpeg")
+                image_name = str(payload.get("screenshot_filename") or payload.get("image_filename") or "")
+                image_ext = ".png" if "png" in image_mime or image_name.lower().endswith(".png") else ".jpg"
+                media_urls.append(cache_image_from_bytes(image_bytes, ext=image_ext))
+                media_types.append(image_mime)
+                message_type = MessageType.PHOTO
+            except (binascii.Error, ValueError) as exc:
+                logger.warning("[webhook] Failed to cache image payload route=%s: %s", route_name, exc)
+
+        if source_platform is not None:
+            source = SessionSource(
+                platform=source_platform,
+                chat_id=str(route_config.get("source_chat_id") or session_chat_id),
+                chat_name=route_config.get("source_chat_name") or f"webhook/{route_name}",
+                chat_type=str(route_config.get("source_chat_type") or "dm"),
+                user_id=str(route_config.get("source_user_id") or route_name),
+                user_name=str(route_config.get("source_user_name") or route_name),
+                thread_id=str(route_config.get("source_thread_id")) if route_config.get("source_thread_id") else None,
+            )
+            event_message_id = None
+        else:
+            source = self.build_source(
+                chat_id=session_chat_id,
+                chat_name=f"webhook/{route_name}",
+                chat_type="webhook",
+                user_id=f"webhook:{route_name}",
+                user_name=route_name,
+            )
+            event_message_id = delivery_id
         if profile and isinstance(profile, str):
             source.profile = profile
         event = MessageEvent(
             text=prompt,
-            message_type=MessageType.TEXT,
+            message_type=message_type,
             source=source,
             raw_message=payload,
-            message_id=delivery_id,
+            message_id=event_message_id,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
         logger.info(
             "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s",
-            request.method,
+            getattr(request, "method", "POST"),
             event_type,
             route_name,
             len(prompt),
@@ -710,7 +768,12 @@ class WebhookAdapter(BasePlatformAdapter):
         )
 
         # Non-blocking — return 202 Accepted immediately
-        task = asyncio.create_task(self.handle_message(event))
+        handler = self.handle_message
+        if source_platform is not None and self.gateway_runner is not None:
+            target_adapter = getattr(self.gateway_runner, "adapters", {}).get(source_platform)
+            if target_adapter is not None and hasattr(target_adapter, "handle_message"):
+                handler = target_adapter.handle_message
+        task = asyncio.create_task(handler(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
