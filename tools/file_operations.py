@@ -3,7 +3,7 @@
 File Operations Module
 
 Provides file manipulation capabilities (read, write, patch, search) that work
-across all terminal backends (local, docker, ssh, singularity, modal, daytona, tenki).
+across all terminal backends (local, docker, ssh, singularity, modal, daytona).
 
 The key insight is that all file operations can be expressed as shell commands,
 so we wrap the terminal backend's execute() interface to provide a unified file API.
@@ -766,7 +766,7 @@ class ShellFileOperations(FileOperations):
     File operations implemented via shell commands.
     
     Works with ANY terminal backend that has execute(command, cwd) method.
-    This includes local, docker, singularity, ssh, modal, daytona, and tenki environments.
+    This includes local, docker, singularity, ssh, modal, and daytona environments.
     """
     
     def __init__(self, terminal_env, cwd: str = None):
@@ -1793,7 +1793,7 @@ class ShellFileOperations(FileOperations):
 
         LSP servers run on the host process — they need access to the
         files they're linting.  Remote/sandboxed backends (Docker,
-        Modal, SSH, Daytona, Tenki) keep files inside the sandbox where the
+        Modal, SSH, Daytona) keep files inside the sandbox where the
         host-side LSP server can't reach them, so we skip the LSP
         path for those entirely.
         """
@@ -2061,7 +2061,8 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+        type_expr = r"\( -type f -o -type d \)"
+        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} {type_expr} -name {self._escape_shell_arg(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
@@ -2069,7 +2070,7 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} {type_expr} -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2145,12 +2146,59 @@ class ShellFileOperations(FileOperations):
             stdout, limit_reason = _search_stdout_and_limit(result)
             all_files = [f for f in stdout.strip().split('\n') if f]
 
-        page = all_files[offset:offset + limit]
+        all_paths = list(all_files)
+        if self._has_command('find'):
+            search_root = Path(path)
+            has_hidden_path_ancestor = any(
+                part not in {".", ".."} and part.startswith(".")
+                for part in search_root.parts
+            )
+            hidden_exclude = "-not -path '*/.*'" if not has_hidden_path_ancestor else ""
+            hidden_filter_expr = f" {hidden_exclude}" if hidden_exclude else ""
+            dir_cmd = (
+                f"find {self._escape_shell_arg(path)}{hidden_filter_expr} "
+                f"-type d -name {self._escape_shell_arg(pattern)} "
+                f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -n {fetch_limit}"
+            )
+            dir_result = self._exec(dir_cmd, timeout=60)
+            dir_stdout, dir_limit_reason = _search_stdout_and_limit(dir_result)
+            if not dir_stdout.strip() and not dir_limit_reason:
+                dir_cmd_simple = (
+                    f"find {self._escape_shell_arg(path)}{hidden_filter_expr} "
+                    f"-type d -name {self._escape_shell_arg(pattern)} "
+                    f"2>/dev/null | sort -rn | head -n {fetch_limit}"
+                )
+                dir_result = self._exec(dir_cmd_simple, timeout=60)
+                dir_stdout, dir_limit_reason = _search_stdout_and_limit(dir_result)
+            for line in dir_stdout.strip().split('\n'):
+                if not line:
+                    continue
+                parts = line.split(' ', 1)
+                if len(parts) == 2 and parts[0].replace('.', '').isdigit():
+                    all_paths.append(parts[1])
+                else:
+                    all_paths.append(line)
+            limit_reason = limit_reason or dir_limit_reason
+
+        deduped_paths = list(dict.fromkeys(all_paths))
+        if self._has_command('find') and has_hidden_path_ancestor:
+            normalized_root = Path(path).resolve()
+            filtered_paths = []
+            for found_path in deduped_paths:
+                try:
+                    rel_parts = Path(found_path).resolve().relative_to(normalized_root).parts
+                except ValueError:
+                    rel_parts = Path(found_path).parts
+                if any(part not in {".", ".."} and part.startswith(".") for part in rel_parts):
+                    continue
+                filtered_paths.append(found_path)
+            deduped_paths = filtered_paths
+        page = deduped_paths[offset:offset + limit]
 
         return SearchResult(
             files=page,
-            total_count=len(all_files),
-            truncated=len(all_files) >= fetch_limit or bool(limit_reason),
+            total_count=len(deduped_paths),
+            truncated=len(deduped_paths) >= fetch_limit or bool(limit_reason),
             limit_reason=limit_reason,
         )
     
