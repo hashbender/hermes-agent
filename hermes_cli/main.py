@@ -616,6 +616,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_stepfun,
     _model_flow_bedrock_api_key,
     _model_flow_bedrock,
+    _model_flow_vertex,
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
@@ -1694,6 +1695,12 @@ def _ensure_tui_workspace(tui_dir: Path) -> None:
     directory do we abort with concrete manual-recovery steps.
     """
     if tui_dir.is_dir():
+        return
+
+    # Managed installs (Homebrew, NixOS) ship the TUI prebuilt in
+    # ``hermes_cli/tui_dist/`` — there is no ``ui-tui/`` source tree to
+    # restore.  Let the caller fall through to ``_find_bundled_tui()``.
+    if os.environ.get("HERMES_MANAGED", "").strip():
         return
 
     if _restore_tui_workspace(tui_dir):
@@ -3109,6 +3116,8 @@ def select_provider_and_model(args=None):
         _model_flow_stepfun(config, current_model)
     elif selected_provider == "bedrock":
         _model_flow_bedrock(config, current_model)
+    elif selected_provider == "vertex":
+        _model_flow_vertex(config, current_model)
     elif selected_provider == "azure-foundry":
         _model_flow_azure_foundry(config, current_model)
     elif selected_provider in {
@@ -11902,7 +11911,7 @@ def _build_provider_choices() -> list[str]:
         # Fallback: static list guarantees the CLI always works
         return [
             "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
-            "anthropic", "gemini", "xai", "bedrock", "azure-foundry",
+            "anthropic", "gemini", "vertex", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
             "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
