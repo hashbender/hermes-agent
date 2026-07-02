@@ -864,16 +864,13 @@ class MattermostAdapter(BasePlatformAdapter):
         sender_id = post.get("user_id", "")
         sender_name = data.get("sender_name", "").lstrip("@") or sender_id
 
-        # Thread support: if the post is in a thread, use root_id. In
-        # thread mode, top-level channel posts are valid roots for progress.
-        thread_id = post.get("root_id") or None
-        if (
-            not thread_id
-            and self._reply_mode == "thread"
-            and channel_type_raw != "D"
-            and post_id
-        ):
-            thread_id = post_id
+        # Thread support: use root_id for thread replies, or post_id for
+        # top-level channel posts so subsequent thread replies continue the same
+        # session. DMs keep a single session (no per-thread isolation).
+        if channel_type_raw == "D":
+            thread_id = None
+        else:
+            thread_id = post.get("root_id") or post_id or None
 
         # Determine message type.
         file_ids = post.get("file_ids") or []
