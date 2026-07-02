@@ -1950,6 +1950,13 @@ DEFAULT_CONFIG = {
             "model": "gpt-4o-mini-tts",
             "voice": "alloy",
             # Voices: alloy, echo, fable, onyx, nova, shimmer
+            # response_format: only needed for OpenAI-*compatible* backends
+            # that cannot encode opus (e.g. self-hosted Speaches/Kokoro, which
+            # support only mp3/flac/wav/pcm). Set to one of those formats and
+            # Hermes synthesizes in it, then transcodes to OGG/Opus locally via
+            # ffmpeg for Telegram/Matrix voice bubbles. Leave unset for the
+            # real OpenAI API, which encodes opus natively (issue #54589).
+            # "response_format": "mp3",
         },
         "gemini": {
             "model": "gemini-2.5-flash-preview-tts",
@@ -2297,6 +2304,7 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
+        "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
