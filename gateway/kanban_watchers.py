@@ -231,7 +231,12 @@ class GatewayKanbanWatchersMixin:
                             continue
                         seen_db_paths.add(resolved_db_path)
                         try:
-                            conn = _kb.connect(board=slug)
+                            # create=False: this tick's board list can be
+                            # stale — if the board was archived/removed
+                            # between list_boards() and here, a default
+                            # connect() would resurrect it as an empty
+                            # ghost directory. Skip it instead.
+                            conn = _kb.connect(board=slug, create=False)
                         except Exception as exc:
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
@@ -311,13 +316,16 @@ class GatewayKanbanWatchersMixin:
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
-                    adapter = None
-                    if sub_profile:
-                        _profile_map = getattr(self, "_profile_adapters", {}).get(sub_profile)
-                        if _profile_map:
-                            adapter = _profile_map.get(plat)
-                    if adapter is None:
-                        adapter = self.adapters.get(plat)
+                    # Route via the SAME chokepoint the authorization path uses
+                    # (gateway/authz_mixin.py::_authorization_adapter): a stamped
+                    # profile with its own adapter-registry entry must be served
+                    # by THAT profile's same-platform adapter and must NOT silently
+                    # fall back to the default profile's adapter — otherwise a
+                    # secondary profile's task notification is delivered by the
+                    # wrong bot (the cross-profile mis-delivery this whole change
+                    # exists to fix). The helper returns None only when the profile
+                    # (or default) genuinely has no adapter for the platform.
+                    adapter = self._authorization_adapter(plat, sub_profile or None)
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
@@ -394,6 +402,13 @@ class GatewayKanbanWatchersMixin:
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
                         else:
+                            # archived / unblocked are claimed by TERMINAL_KINDS
+                            # (so the cursor advances past them and they can't
+                            # wedge a later completed/blocked event behind an
+                            # unclaimed row) but are intentionally SILENT: an
+                            # archive needs no user ping, and unblocked is an
+                            # internal transition. They are also excluded from
+                            # _WAKE_KINDS below, so they never wake the creator.
                             continue
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
@@ -504,6 +519,23 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     from gateway.session import SessionSource
                                     from gateway.platforms.base import MessageEvent, MessageType
+                                    # KNOWN LIMITATION (tracked follow-up): the
+                                    # subscription row does not persist the
+                                    # creator's chat_type, and it is not carried
+                                    # on the session-context bridge, so we cannot
+                                    # faithfully reconstruct the creator's real
+                                    # session key here. build_session_key() keys
+                                    # DMs (":dm:<chat_id>") on a wholly different
+                                    # shape from group/thread, so any hardcoded
+                                    # value mis-routes some creators. "group" is
+                                    # the least-surprising default for the
+                                    # dashboard/group flows this wake primarily
+                                    # serves; DM-originated creators are handled
+                                    # by the follow-up that stamps + persists
+                                    # chat_type end-to-end. handle_message()
+                                    # get_or_create_session's the target, so a
+                                    # mismatch degrades to "wake lands in a fresh
+                                    # group session" — never an exception.
                                     _source = SessionSource(
                                         platform=plat,
                                         chat_id=sub["chat_id"],
@@ -524,9 +556,15 @@ class GatewayKanbanWatchersMixin:
                                         sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                                     )
                             except Exception as _wk_err:
-                                logger.debug(
+                                # Best-effort: the notification itself already
+                                # delivered and the cursor has advanced, so a
+                                # broken wake path must not wedge the tick — but
+                                # log at WARNING with a traceback rather than
+                                # DEBUG so a persistently-failing wake is visible
+                                # in normal logs instead of silently no-op'ing.
+                                logger.warning(
                                     "kanban notifier: wakeup injection failed for %s: %s",
-                                    sub["task_id"], _wk_err,
+                                    sub["task_id"], _wk_err, exc_info=True,
                                 )
                         if task_terminal:
                             await asyncio.to_thread(
@@ -973,7 +1011,19 @@ class GatewayKanbanWatchersMixin:
                     )
                 disabled_corrupt_boards.pop(slug, None)
             try:
-                conn = _kb.connect(board=slug)
+                try:
+                    # create=False: the slug came from list_boards() at the
+                    # top of this tick; if the board was archived/removed in
+                    # the meantime, a default connect() would recreate its
+                    # directory + an empty kanban.db (ghost board). Skip.
+                    conn = _kb.connect(board=slug, create=False)
+                except ValueError as exc:
+                    logger.debug(
+                        "kanban dispatcher: board %s vanished before tick "
+                        "(archived/removed?); skipping: %s",
+                        slug, exc,
+                    )
+                    return None
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
@@ -1064,7 +1114,9 @@ class GatewayKanbanWatchersMixin:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
-                    conn = _kb.connect(board=slug)
+                    # create=False so a probe racing remove_board() cannot
+                    # resurrect a just-archived board (ghost recreation).
+                    conn = _kb.connect(board=slug, create=False)
                     if _kb.has_spawnable_ready(conn):
                         return True
                     if _kb.has_spawnable_review(conn):
