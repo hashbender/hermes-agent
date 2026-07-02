@@ -19,7 +19,7 @@ import { dispatchNativeNotification } from '@/store/native-notifications'
 import { notify } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
-import { followActiveSessionCwd } from '@/store/projects'
+import { followActiveSessionCwd, refreshProjects, refreshProjectTree } from '@/store/projects'
 import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import {
   $currentCwd,
@@ -378,6 +378,20 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           // background processes — sync the composer status stack right after.
           if (!sessionInterrupted(sessionId) && (payload?.name === 'terminal' || payload?.name === 'process')) {
             void refreshBackgroundProcesses(sessionId)
+          }
+
+          // Project tools mutate the backend projects.db from inside an agent
+          // turn, bypassing the desktop store actions that normally update the
+          // cached project list/tree. Refresh as soon as the tool completes so
+          // a project created by `project_create` appears without a manual
+          // sidebar refresh or app reload.
+          if (
+            payload?.name === 'project_create' ||
+            payload?.name === 'project_switch' ||
+            payload?.name === 'project_list'
+          ) {
+            void refreshProjects()
+            void refreshProjectTree()
           }
         }
 
