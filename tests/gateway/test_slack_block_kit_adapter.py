@@ -53,6 +53,24 @@ class TestSendMessageBlocks:
         assert "divider" in types
 
     @pytest.mark.asyncio
+    async def test_invalid_blocks_retries_once_without_blocks(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        client.chat_postMessage.side_effect = [
+            RuntimeError("invalid_blocks: must provide an object"),
+            {"ts": "111.333"},
+        ]
+
+        result = await adapter.send("C1", RICH_MD)
+
+        assert result.success
+        assert client.chat_postMessage.await_count == 2
+        first = client.chat_postMessage.await_args_list[0].kwargs
+        second = client.chat_postMessage.await_args_list[1].kwargs
+        assert "blocks" in first
+        assert "blocks" not in second
+        assert second["text"]
+
+    @pytest.mark.asyncio
     async def test_enabled_but_unrenderable_falls_back_to_text(self):
         # 60 dividers -> renderer returns None -> no blocks kwarg, text stands
         adapter, client = _make_adapter({"rich_blocks": True})
