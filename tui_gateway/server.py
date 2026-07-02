@@ -284,6 +284,14 @@ class _SlashWorker:
         self._closed = False
         from hermes_cli._subprocess_compat import windows_hide_flags
 
+        # start_new_session=True detaches the slash worker into its own
+        # process group / session. Without this, the worker inherits the
+        # gateway's pgid (= TUI parent PID). When mcp_tool's
+        # _kill_orphaned_mcp_children races with slash_worker spawn and sweeps
+        # the gateway's child set, it captures the worker PID, records the
+        # inherited pgid, and killpg() then kills the TUI parent itself.
+        # See agent/lsp/client.py for the symmetric LSP server fix and
+        # tools/mcp_tool.py _filter_mcp_children for defense-in-depth.
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -296,6 +304,7 @@ class _SlashWorker:
             # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
             env=hermes_subprocess_env(inherit_credentials=True),
             creationflags=windows_hide_flags(),
+            start_new_session=True,
         )
         threading.Thread(target=self._drain_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -2964,12 +2973,31 @@ def _get_usage(agent) -> dict:
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:
-        ctx_used = getattr(comp, "last_prompt_tokens", 0) or usage["total"] or 0
+        # context_used is the *current-window* occupancy. Do NOT fall back to
+        # usage["total"] (cumulative lifetime session_total_tokens): for an
+        # external context engine that doesn't report last_prompt_tokens that
+        # substitution showed lifetime totals as the live context fill, yielding
+        # impossible readings such as 1.9m/120k clamped to 100% (#50421).
+        #
+        # Per the issue, populate context_used/percent only from a *real*
+        # current-occupancy value and "leave it unknown otherwise" — so a falsy
+        # last_prompt_tokens (0 or missing, i.e. an engine that doesn't track
+        # per-window occupancy) intentionally emits no gauge rather than a
+        # fabricated 0% or the old cumulative reading. The built-in compressor
+        # always reports a real last_prompt_tokens once a turn runs, so it is
+        # unaffected.
+        # Clamp the -1 "compression just ran, awaiting real usage" sentinel
+        # (conversation_compression.py) to 0 so the transitional turn reads as
+        # unknown (no gauge) instead of leaking context_used=-1. Matches the
+        # CLI status-bar path (cli.py _get_status_bar_snapshot).
+        last_prompt = getattr(comp, "last_prompt_tokens", 0) or 0
+        if last_prompt < 0:
+            last_prompt = 0
         ctx_max = getattr(comp, "context_length", 0) or 0
-        if ctx_max:
-            usage["context_used"] = ctx_used
+        if ctx_max and last_prompt:
+            usage["context_used"] = last_prompt
             usage["context_max"] = ctx_max
-            usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
+            usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
@@ -4175,6 +4203,66 @@ def _resolve_runtime_with_fallback(
         raise
 
 
+def _repair_aggregator_model_id(model: str, provider: str | None) -> str:
+    """Repair a native-dialect model id shipped to an aggregator provider.
+
+    The desktop composer persists its model pick as sticky UI state and ships
+    it verbatim on every ``session.create``. A pick made while the profile ran
+    a direct provider (e.g. anthropic's ``claude-opus-4-8``) survives a later
+    switch to an aggregator (nous/openrouter), whose catalogs serve
+    vendor-slugged dot-form ids (``anthropic/claude-opus-4.8``) — the raw
+    request then 404s on every turn. Generic normalization cannot restore the
+    dots, so repair by canonical-form matching against known catalog ids and
+    the configured default. Unknown ids pass through untouched; any failure
+    falls back to the original value (never raises).
+    """
+    try:
+        if not model or not provider:
+            return model
+        from hermes_cli.model_normalize import _AGGREGATOR_PROVIDERS
+
+        if provider not in _AGGREGATOR_PROVIDERS:
+            return model
+
+        def _canon(mid: str) -> str:
+            bare = mid.split("/", 1)[-1] if "/" in mid else mid
+            return bare.strip().lower().replace(".", "-")
+
+        candidates: list[str] = []
+        try:
+            cfg_model = ((_load_cfg().get("model") or {}).get("default") or "").strip()
+            if cfg_model:
+                candidates.append(cfg_model)
+        except Exception:
+            pass
+        if provider == "nous":
+            try:
+                from hermes_cli.models import get_curated_nous_model_ids
+
+                candidates.extend(get_curated_nous_model_ids() or [])
+            except Exception:
+                pass
+
+        # Already a known catalog id — nothing to repair.
+        if model in candidates:
+            return model
+        target = _canon(model)
+        for cand in candidates:
+            if "/" in cand and _canon(cand) == target:
+                logger.info(
+                    "session model %r repaired to %r for aggregator provider %s",
+                    model, cand, provider,
+                )
+                return cand
+        return model
+    except Exception:
+        # "Never raises" contract: a repair failure must not break agent
+        # builds — but leave a trace, otherwise a broken import silently
+        # keeps the unrepaired (404-prone) id.
+        logger.exception("aggregator model-id repair failed; keeping %r", model)
+        return model
+
+
 def _make_agent(
     sid: str,
     key: str,
@@ -4289,6 +4377,10 @@ def _make_agent(
             "requested": requested_provider,
             "target_model": model or None,
         })
+    # Repair sticky/persisted model ids that don't match the resolved
+    # aggregator provider's dialect (composer picks from a direct-provider
+    # era, pre-switch DB rows) — see _repair_aggregator_model_id.
+    model = _repair_aggregator_model_id(model, runtime.get("provider"))
     _pr = _load_provider_routing()
     return AIAgent(
         model=model,
@@ -8121,7 +8213,12 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
             user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
-            if ordinal >= len(user_indices):
+            # Reject out-of-range ordinals on BOTH ends. A negative value would
+            # otherwise sail past the upper-bound check and hit Python's negative
+            # indexing below (user_indices[-1] -> the LAST user turn), silently
+            # truncating history to everything before it and persisting that loss
+            # via replace_messages — an unrecoverable overwrite of the session DB.
+            if ordinal < 0 or ordinal >= len(user_indices):
                 return _err(rid, 4018, "target user message is no longer in session history")
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
@@ -11310,6 +11407,11 @@ def _(rid, params: dict) -> dict:
     if name in qcmds:
         qc = qcmds[name]
         if qc.get("type") == "exec":
+            # Sanitize env to prevent credential leakage —
+            # quick commands run in the TUI server process which
+            # has all API keys in os.environ.
+            from tools.environments.local import _sanitize_subprocess_env
+            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
             r = subprocess.run(
                 qc.get("command", ""),
                 shell=True,
@@ -11317,12 +11419,16 @@ def _(rid, params: dict) -> dict:
                 text=True,
                 timeout=30,
                 stdin=subprocess.DEVNULL,
+                env=sanitized_env,
             )
             output = (
                 (r.stdout or "")
                 + ("\n" if r.stdout and r.stderr else "")
                 + (r.stderr or "")
             ).strip()[:4000]
+            if output:
+                from agent.redact import redact_sensitive_text
+                output = redact_sensitive_text(output)
             if r.returncode != 0:
                 return _err(
                     rid,
