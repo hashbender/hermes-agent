@@ -97,10 +97,17 @@ from tools.tool_backend_helpers import (  # noqa: F401
     nous_tool_gateway_unavailable_message,
     prefers_gateway,
 )
-from tools.url_safety import async_is_safe_url, normalize_url_for_request
+from tools.url_safety import async_is_safe_url, normalize_url_for_request, sensitive_query_param_name
 import sys
 
 logger = logging.getLogger(__name__)
+
+# Maximum seconds to wait for a single web_extract provider call.  When a
+# provider (parallel, exa, tavily) hangs on a slow page, the event loop is
+# blocked — preventing WebSocket heartbeats and crashing the desktop GUI.
+# Firecrawl already applies its own 60 s per-URL timeout; this wraps the
+# other providers so *every* backend has an upper bound.
+_DEFAULT_EXTRACT_TIMEOUT_S = 120.0
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -659,6 +666,17 @@ async def web_extract_tool(
                 "error": "Blocked: URL contains what appears to be an API key or token. "
                          "Secrets must not be sent in URLs.",
             })
+        sensitive_query_key = sensitive_query_param_name(normalized_url)
+        if sensitive_query_key:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Blocked: URL contains a credential-like query parameter "
+                    f"({sensitive_query_key}). Web extract backends are third-party "
+                    "readers; remove the sensitive query parameter or use a local "
+                    "browser session when this access is explicitly required."
+                ),
+            })
         normalized_urls.append(normalized_url)
 
     debug_call_data = {
@@ -752,14 +770,38 @@ async def web_extract_tool(
             # Async-or-sync dispatch: parallel + firecrawl have async
             # extract(); exa + tavily are sync.
             import inspect
-            if inspect.iscoroutinefunction(provider.extract):
-                results = await provider.extract(safe_urls, format=format)
-            else:
-                # Run sync extract() in a thread so we don't block the
-                # event loop on network I/O.
-                results = await asyncio.to_thread(
-                    provider.extract, safe_urls, format=format
+            extract_timeout = _DEFAULT_EXTRACT_TIMEOUT_S
+            try:
+                if inspect.iscoroutinefunction(provider.extract):
+                    results = await asyncio.wait_for(
+                        provider.extract(safe_urls, format=format),
+                        timeout=extract_timeout,
+                    )
+                else:
+                    # Run sync extract() in a thread so we don't block the
+                    # event loop on network I/O.
+                    results = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            provider.extract, safe_urls, format=format
+                        ),
+                        timeout=extract_timeout,
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Web extract timed out after %.0fs for %s via %s",
+                    extract_timeout,
+                    safe_urls,
+                    provider.name,
                 )
+                results = [
+                    {
+                        "url": url,
+                        "title": "",
+                        "content": "",
+                        "error": f"Extract timed out after {extract_timeout:.0f}s",
+                    }
+                    for url in safe_urls
+                ]
 
         # Merge any SSRF-blocked results back in
         if ssrf_blocked:
