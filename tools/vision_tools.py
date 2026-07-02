@@ -295,13 +295,12 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
 
         Must be async because httpx.AsyncClient awaits event hooks.
         """
-        if response.is_redirect and response.next_request:
-            redirect_url = str(response.next_request.url)
-            from tools.url_safety import async_is_safe_url
-            if not await async_is_safe_url(redirect_url):
-                raise ValueError(
-                    f"Blocked redirect to private/internal address: {redirect_url}"
-                )
+        from tools.url_safety import async_is_safe_url, redirect_target_from_response
+        redirect_url = redirect_target_from_response(response)
+        if redirect_url and not await async_is_safe_url(redirect_url):
+            raise ValueError(
+                f"Blocked redirect to private/internal address: {redirect_url}"
+            )
 
     last_error = None
     for attempt in range(max_retries):
@@ -1412,13 +1411,12 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     async def _ssrf_redirect_guard(response):
-        if response.is_redirect and response.next_request:
-            redirect_url = str(response.next_request.url)
-            from tools.url_safety import async_is_safe_url
-            if not await async_is_safe_url(redirect_url):
-                raise ValueError(
-                    f"Blocked redirect to private/internal address: {redirect_url}"
-                )
+        from tools.url_safety import async_is_safe_url, redirect_target_from_response
+        redirect_url = redirect_target_from_response(response)
+        if redirect_url and not await async_is_safe_url(redirect_url):
+            raise ValueError(
+                f"Blocked redirect to private/internal address: {redirect_url}"
+            )
 
     last_error = None
     for attempt in range(max_retries):
@@ -1733,3 +1731,10 @@ registry.register(
     is_async=True,
     emoji="🎬",
 )
+# NOTE (reverted 2026-06-19): same accidental change as the browser tools
+# (commit 2bd047e23) — vision_analyze was deregistered "moved to vision-agent
+# sub-agent" which doesn't exist here. Re-enabled; check_vision_requirements()
+# gates it, so it only advertises when a vision provider is configured (e.g.
+# the visual-analysis specialist on local-vision), staying off for profiles
+# with no vision provider.
+# registry.deregister("vision_analyze")

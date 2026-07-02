@@ -1825,7 +1825,7 @@ AUTHOR_MAP = {
     "SJWATTS89@OUTLOOK.COM": "lEWFkRAD",  # PR #45610 (Windows scheduled task reboot survival)
     "andhika.prakasiwi@gmail.com": "p-andhika",  # PR #53312 co-author (setup guide button)
     "annguyen@nousresearch.com": "annguyenNous",  # PR #52844 co-author
-    "carlitosdiazplaza@gmail.com": "talmax1124",  # direct email match
+    "carlitosdiazplaza@gmail.com": "talmax1124",  # PR #55931 (TUI drag-resize reflow + resize-burst heal coverage; #18449)
     "christianpersico98@gmail.com": "chrispersico",  # commit 135f2351 PR author
     "daniel.laforce@argobox.com": "KeyArgo",  # co-author
     "joeykerp@gmail.com": "spjoes",  # direct email match
@@ -1834,7 +1834,6 @@ AUTHOR_MAP = {
     "max.petrusenko.agent@gmail.com": "maxpetrusenko",  # PR #54128 co-author
     "poli.koltsova@gmail.com": "wnuuee1",  # commit 9fd2b2cb PR author
     "yosapol@jitrak.dev": "Eji4h",  # direct email match
-    "kiljadn@gmail.com": "designnotdrum",  # PR #56480 salvage (toolset static-inference fix)
 }
 
 
