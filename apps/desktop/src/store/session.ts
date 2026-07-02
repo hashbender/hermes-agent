@@ -228,6 +228,7 @@ export const $messagingTruncated = atom<boolean>(false)
 export const $sessionProfileTotals = atom<Record<string, number>>({})
 export const $sessionsLoading = atom(true)
 export const $workingSessionIds = atom<string[]>([])
+export const $runtimeIdByStoredSessionId = atom<Record<string, string>>({})
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
 export const $messages = atom<ChatMessage[]>([])
@@ -300,6 +301,7 @@ export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =
   updateAtom($sessionProfileTotals, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setWorkingSessionIds = (next: Updater<string[]>) => updateAtom($workingSessionIds, next)
+export const setRuntimeIdByStoredSessionId = (next: Updater<Record<string, string>>) => updateAtom($runtimeIdByStoredSessionId, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setSelectedStoredSessionId = (next: Updater<string | null>) => updateAtom($selectedStoredSessionId, next)
 export const setMessages = (next: Updater<ChatMessage[]>) => updateAtom($messages, next)
@@ -522,4 +524,41 @@ export function setSessionWorking(sessionId: string | null | undefined, working:
       markSessionSettled(sessionId)
     }
   }
+}
+
+export function setRuntimeSessionMapping(storedSessionId: null | string | undefined, runtimeSessionId: null | string | undefined) {
+  if (!storedSessionId || !runtimeSessionId) {
+    return
+  }
+
+  setRuntimeIdByStoredSessionId(current => {
+    if (current[storedSessionId] === runtimeSessionId) {
+      return current
+    }
+
+    return { ...current, [storedSessionId]: runtimeSessionId }
+  })
+}
+
+export function clearRuntimeSessionMapping(
+  storedSessionId: null | string | undefined,
+  runtimeSessionId?: null | string | undefined
+) {
+  if (!storedSessionId) {
+    return
+  }
+
+  setRuntimeIdByStoredSessionId(current => {
+    if (!(storedSessionId in current)) {
+      return current
+    }
+
+    if (runtimeSessionId && current[storedSessionId] !== runtimeSessionId) {
+      return current
+    }
+
+    const { [storedSessionId]: _drop, ...rest } = current
+
+    return rest
+  })
 }

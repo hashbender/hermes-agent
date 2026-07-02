@@ -8,6 +8,7 @@ import { setMutableRef } from '@/lib/mutable-ref'
 import {
   $busy,
   $messages,
+  clearRuntimeSessionMapping,
   noteSessionActivity,
   onSessionWatchdogClear,
   setCurrentFastMode,
@@ -16,6 +17,7 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setRuntimeSessionMapping,
   setSessionAttention,
   setSessionWorking,
   setTurnStartedAt,
@@ -106,6 +108,7 @@ export function useSessionStateCache({
 
         if (storedSessionId) {
           runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+          setRuntimeSessionMapping(storedSessionId, sessionId)
 
           if (existing.busy) {
             setSessionWorking(storedSessionId, true)
@@ -113,6 +116,8 @@ export function useSessionStateCache({
         }
 
         if (previousStoredSessionId && previousStoredSessionId !== storedSessionId) {
+          runtimeIdByStoredSessionIdRef.current.delete(previousStoredSessionId)
+          clearRuntimeSessionMapping(previousStoredSessionId, sessionId)
           setSessionWorking(previousStoredSessionId, false)
         }
       }
@@ -125,6 +130,7 @@ export function useSessionStateCache({
 
     if (storedSessionId) {
       runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+      setRuntimeSessionMapping(storedSessionId, sessionId)
     }
 
     return created

@@ -1305,6 +1305,7 @@ export const en: Translations = {
     nav: {
       'new-session': 'New session',
       skills: 'Skills & Tools',
+      tasks: 'Live tasks',
       messaging: 'Messaging',
       artifacts: 'Artifacts'
     },
