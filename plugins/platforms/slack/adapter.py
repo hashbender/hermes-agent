@@ -84,6 +84,14 @@ class _ThreadContextCache:
     parent_text: str = ""  # Raw text of the thread parent (for reply_to_text injection)
 
 
+@dataclass
+class _MentionOnlyThreadState:
+    """In-memory state for Slack threads muted until an explicit @mention."""
+
+    enabled_at: float = field(default_factory=time.monotonic)
+    updated_at: float = field(default_factory=time.monotonic)
+
+
 def check_slack_requirements() -> bool:
     """Check if Slack dependencies are available.
 
@@ -427,6 +435,14 @@ class SlackAdapter(BasePlatformAdapter):
     # the prefix that works everywhere — instruction text must show it.
     typed_command_prefix = "!"
 
+    # Slack has both halves the ``in_channel`` continuable-cron surface needs:
+    # a flat-reply outbound gate (``reply_in_thread: false`` → ``_resolve_thread_ts``
+    # returns None for top-level channel messages) AND a whole-channel inbound
+    # session bucket keyed ``(platform, channel_id, None)`` (the same
+    # ``reply_in_thread: false`` path in ``_handle_slack_message``).  So a
+    # continuable cron delivered flat here continues in-context on a plain reply.
+    supports_inchannel_continuable = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
         self._app: Optional[Any] = None
@@ -452,6 +468,11 @@ class SlackAdapter(BasePlatformAdapter):
         # respond to ALL subsequent messages in that thread automatically.
         self._mentioned_threads: set = set()
         self._MENTIONED_THREADS_MAX = 5000
+        # Track threads where users explicitly asked the bot to stay silent
+        # until @mentioned. Keyed by (channel_id, thread_ts) and pruned by TTL
+        # so long-running gateway processes don't accumulate stale thread flags.
+        self._mention_only_threads: Dict[Tuple[str, str], _MentionOnlyThreadState] = {}
+        self._MENTION_ONLY_THREADS_MAX = 5000
         # Assistant thread metadata keyed by (channel_id, thread_ts). Slack's
         # AI Assistant lifecycle events can arrive before/alongside message
         # events, and they carry the user/thread identity needed for stable
@@ -1073,6 +1094,7 @@ class SlackAdapter(BasePlatformAdapter):
 
                 self._warn_if_missing_group_dm_scopes(auth_response, team_name)
                 self._warn_if_not_bot_token(auth_response, team_name)
+                self._warn_if_inchannel_without_flat_reply(team_name)
 
             # Register message event handler
             @self._app.event("message")
@@ -1561,6 +1583,62 @@ class SlackAdapter(BasePlatformAdapter):
         if raw is None:
             return True  # default: each DM thread is its own session
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _cron_continuable_surface(self) -> str:
+        """Resolve the continuable-cron delivery surface for this platform.
+
+        Values: ``"thread"`` (default — today's behaviour: a continuable cron
+        job opens a dedicated hidden thread and seeds it) or ``"in_channel"``
+        (deliver FLAT into the channel timeline; the shared-channel session
+        ``(slack, channel_id, None)`` is the continuation surface).  Set
+        ``platforms.slack.extra.cron_continuable_surface: in_channel`` in
+        config.yaml.  Pair with ``reply_in_thread: false`` so the user's reply
+        is answered flat in the channel and keyed to the same shared session —
+        see ``_warn_if_inchannel_without_flat_reply``.  Any unrecognised value
+        coerces to ``"thread"`` (fail safe).
+        """
+        raw = self.config.extra.get("cron_continuable_surface")
+        if raw is None:
+            return "thread"
+        val = str(raw).strip().lower()
+        return "in_channel" if val == "in_channel" else "thread"
+
+    def _warn_if_inchannel_without_flat_reply(self, team_name: str) -> None:
+        """Warn when ``in_channel`` is set without the required ``reply_in_thread: false`` pairing.
+
+        The two knobs are orthogonal (D4/D5): ``cron_continuable_surface:
+        in_channel`` skips thread creation on delivery, and ``reply_in_thread:
+        false`` makes the bot answer inbound channel messages flat and key them
+        to the whole-channel session ``(slack, channel_id, None)``.  For a
+        continuable in-channel cron to actually continue on a plain reply, BOTH
+        must hold: the seed lands in the shared-channel session, and the reply
+        must resolve to (and be answered in) that same flat session.
+
+        Enforcement is WARN, not hard-require (D5): the misconfiguration fails
+        SAFE — ``in_channel`` without ``reply_in_thread: false`` yields a
+        threaded continuation (≈ today's behaviour), never a dropped/orphaned
+        session — so a config-load rejection would be heavier than warranted
+        and would make the two knobs non-orthogonal.  Mirrors the existing
+        connect-time warning pattern (``_warn_if_missing_group_dm_scopes``,
+        ``_warn_if_not_bot_token``).
+        """
+        try:
+            if self._cron_continuable_surface() != "in_channel":
+                return
+            # reply_in_thread defaults True (legacy: reply in a thread).
+            if self.config.extra.get("reply_in_thread", True):
+                logger.warning(
+                    "[Slack] %s: cron_continuable_surface=in_channel is set "
+                    "WITHOUT reply_in_thread=false. A continuable in-channel "
+                    "cron job will deliver flat, but the bot will still reply "
+                    "to your continuation in a thread — so it falls back to a "
+                    "threaded continuation (\u2248 default behaviour), not the "
+                    "flat channel session you asked for. Set "
+                    "platforms.slack.extra.reply_in_thread: false to pair them.",
+                    team_name,
+                )
+        except Exception:
+            pass
 
     def _resolve_thread_ts(
         self,
@@ -2751,14 +2829,63 @@ class SlackAdapter(BasePlatformAdapter):
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
+        is_slack_mentioned = bool(bot_uid and f"<@{bot_uid}>" in routing_text)
         is_mentioned = bool(
-            (bot_uid and f"<@{bot_uid}>" in routing_text)
+            is_slack_mentioned
             or self._slack_message_matches_mention_patterns(routing_text)
         )
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+        # Thread-level mention-only flags are keyed by the real Slack thread
+        # root. For a top-level root message, use its own ts so follow-up
+        # replies in that Slack thread inherit the flag.
+        mention_only_thread_ts = (
+            event_thread_ts if is_thread_reply else (event_thread_ts or ts)
+        )
 
         if not is_dm and bot_uid:
+            mention_only_control = self._slack_thread_mention_only_control(routing_text)
+            if mention_only_control == "enable":
+                self._set_slack_thread_mention_only(
+                    channel_id,
+                    mention_only_thread_ts,
+                    enabled=True,
+                )
+                logger.debug(
+                    "[Slack] Enabled mention-only mode for thread %s/%s",
+                    channel_id,
+                    mention_only_thread_ts,
+                )
+                return
+            if mention_only_control == "disable":
+                self._set_slack_thread_mention_only(
+                    channel_id,
+                    mention_only_thread_ts,
+                    enabled=False,
+                )
+                logger.debug(
+                    "[Slack] Disabled mention-only mode for thread %s/%s",
+                    channel_id,
+                    mention_only_thread_ts,
+                )
+                if not is_mentioned:
+                    return
+
+            if (
+                self._slack_thread_is_mention_only(
+                    channel_id,
+                    mention_only_thread_ts,
+                    refresh=is_slack_mentioned,
+                )
+                and not is_slack_mentioned
+            ):
+                logger.debug(
+                    "[Slack] Ignoring unmentioned message in mention-only thread %s/%s",
+                    channel_id,
+                    mention_only_thread_ts,
+                )
+                return
+
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
             if allowed_channels and channel_id not in allowed_channels:
@@ -2800,7 +2927,11 @@ class SlackAdapter(BasePlatformAdapter):
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
             # defeat the feature (and re-enable agent-to-agent ack loops).
-            if event_thread_ts and not self._slack_strict_mention():
+            if (
+                event_thread_ts
+                and not self._slack_strict_mention()
+                and not self._slack_thread_is_mention_only(channel_id, event_thread_ts)
+            ):
                 self._mentioned_threads.add(event_thread_ts)
                 if len(self._mentioned_threads) > self._MENTIONED_THREADS_MAX:
                     to_remove = list(self._mentioned_threads)[
@@ -4077,6 +4208,150 @@ class SlackAdapter(BasePlatformAdapter):
                     raise
 
     # ── Channel mention gating ─────────────────────────────────────────────
+
+    def _slack_mention_only_thread_ttl_seconds(self) -> float:
+        """Return TTL for per-thread mention-only flags.
+
+        Defaults to the gateway Slack/group idle reset window when available,
+        otherwise 24h. Operators can override with
+        ``platforms.slack.extra.mention_only_thread_ttl_minutes`` or
+        ``SLACK_MENTION_ONLY_THREAD_TTL_MINUTES``.
+        """
+        raw = self.config.extra.get("mention_only_thread_ttl_minutes")
+        if raw is None:
+            raw = os.getenv("SLACK_MENTION_ONLY_THREAD_TTL_MINUTES", "")
+        if raw not in (None, ""):
+            try:
+                minutes = float(raw)
+                if minutes > 0:
+                    return minutes * 60.0
+            except (TypeError, ValueError):
+                logger.debug("[Slack] Invalid mention-only thread TTL: %r", raw)
+
+        session_store = getattr(self, "_session_store", None)
+        gateway_config = getattr(session_store, "config", None)
+        if gateway_config is not None:
+            try:
+                policy = gateway_config.get_reset_policy(
+                    platform=Platform.SLACK,
+                    session_type="group",
+                )
+                if policy.mode in {"idle", "both"} and policy.idle_minutes > 0:
+                    return float(policy.idle_minutes) * 60.0
+            except Exception:
+                logger.debug(
+                    "[Slack] Could not derive mention-only TTL from reset policy",
+                    exc_info=True,
+                )
+        return 24.0 * 60.0 * 60.0
+
+    def _cleanup_slack_mention_only_threads(
+        self,
+        now: Optional[float] = None,
+    ) -> None:
+        """Prune stale/overflow per-thread mention-only flags."""
+        states = getattr(self, "_mention_only_threads", None)
+        if not states:
+            return
+        now = time.monotonic() if now is None else now
+        ttl = self._slack_mention_only_thread_ttl_seconds()
+        stale = [key for key, state in states.items() if now - state.updated_at > ttl]
+        for key in stale:
+            states.pop(key, None)
+
+        max_entries = getattr(self, "_MENTION_ONLY_THREADS_MAX", 5000)
+        if len(states) > max_entries:
+            excess = len(states) - max_entries // 2
+            oldest = sorted(states.items(), key=lambda item: item[1].updated_at)
+            for key, _state in oldest[:excess]:
+                states.pop(key, None)
+
+    def _slack_thread_key(
+        self,
+        channel_id: str,
+        thread_ts: Optional[str],
+    ) -> Optional[Tuple[str, str]]:
+        """Return the stable key for a Slack channel thread flag."""
+        if not channel_id or not thread_ts:
+            return None
+        return (str(channel_id), str(thread_ts))
+
+    def _set_slack_thread_mention_only(
+        self,
+        channel_id: str,
+        thread_ts: Optional[str],
+        *,
+        enabled: bool,
+    ) -> None:
+        """Enable/disable mention-only mode for one Slack thread."""
+        if not hasattr(self, "_mention_only_threads"):
+            self._mention_only_threads = {}
+        now = time.monotonic()
+        self._cleanup_slack_mention_only_threads(now=now)
+        key = self._slack_thread_key(channel_id, thread_ts)
+        if not key:
+            return
+        if enabled:
+            existing = self._mention_only_threads.get(key)
+            self._mention_only_threads[key] = _MentionOnlyThreadState(
+                enabled_at=existing.enabled_at if existing else now,
+                updated_at=now,
+            )
+        else:
+            self._mention_only_threads.pop(key, None)
+
+    def _slack_thread_is_mention_only(
+        self,
+        channel_id: str,
+        thread_ts: Optional[str],
+        *,
+        refresh: bool = False,
+    ) -> bool:
+        """Return True if this Slack thread is muted until explicit @mention."""
+        if not hasattr(self, "_mention_only_threads"):
+            self._mention_only_threads = {}
+        now = time.monotonic()
+        self._cleanup_slack_mention_only_threads(now=now)
+        key = self._slack_thread_key(channel_id, thread_ts)
+        if not key:
+            return False
+        state = self._mention_only_threads.get(key)
+        if not state:
+            return False
+        if refresh:
+            state.updated_at = now
+        return True
+
+    def _slack_thread_mention_only_control(self, text: str) -> Optional[str]:
+        """Detect natural-language on/off controls for thread mention-only mode."""
+        normalized = str(text or "").casefold()
+        normalized = re.sub(r"<[@!][^>]+>", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if not normalized:
+            return None
+
+        disable_patterns = [
+            r"(?:침묵|뮤트|mute|mention[-_ ]?only|mention only).{0,16}(?:해제|끄|꺼|풀|off|disable|false)",
+            r"(?:이제|다시).{0,16}(?:나와|답|응답|말|얘기).{0,16}(?:돼|해도|괜찮)",
+            r"(?:멘션|태그|호출|부르).{0,16}(?:안\s*해도|없이도|없어도).{0,20}(?:답|응답|말|나와|얘기).{0,12}(?:돼|해도|괜찮|해)",
+            r"(?:mention|tag).{0,20}(?:not required|no longer required|without).{0,20}(?:reply|respond|answer)",
+        ]
+        if any(re.search(pattern, normalized) for pattern in disable_patterns):
+            return "disable"
+
+        enable_patterns = [
+            r"(?:멘션|태그|호출|부르).{0,16}(?:할\s*때|될\s*때|일\s*때|전까지|하기\s*전|하기\s*전까지).{0,20}만.{0,20}(?:답|응답|말|얘기|나와|나오|끼어들)",
+            r"(?:멘션|태그|호출|부르).{0,16}(?:없(?:이|으면|을\s*때)|안\s*하면|전까지).{0,24}(?:답|응답|말|얘기|나오|나와|끼어들).{0,10}(?:마|말|않)",
+            r"(?:태그|멘션|호출).{0,12}전(?:까지)?.{0,16}(?:나오지|답하지|응답하지|말하지).{0,8}(?:마|말아|마라|않)",
+            r"(?:나오지|답하지|응답하지|말하지|얘기하지|끼어들지).{0,8}(?:마|말아|마라|않)",
+            r"그만.{0,8}(?:나와|답해|말해|얘기해|끼어들어)",
+            r"(?:only|just).{0,20}(?:reply|respond|answer).{0,20}(?:mention|tag|called)",
+            r"(?:do\s*not|don't|dont).{0,20}(?:reply|respond|answer|talk).{0,24}(?:unless|until).{0,20}(?:mention|tag|called)",
+            r"(?:stay quiet|mute|mention[-_ ]?only|mention only).{0,16}(?:on|enable|true)?",
+        ]
+        if any(re.search(pattern, normalized) for pattern in enable_patterns):
+            return "enable"
+        return None
 
     def _slack_require_mention(self) -> bool:
         """Return whether channel messages require an explicit bot mention.
