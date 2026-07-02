@@ -181,6 +181,30 @@ def _make_hermes_provider_class() -> Optional[type]:
             if tokens is not None and tokens.expires_in is not None:
                 self.context.update_token_expiry(tokens)
 
+            # Headless reconnects must not fall through to the SDK's full
+            # authorization-code browser flow when the cached credential is
+            # expired and cannot be refreshed.  In gateways/cron/startup
+            # discovery there is no user to complete that flow; letting it run
+            # blocks until the callback timeout and then looks like a generic
+            # transport failure.  Fail fast with the same auth-specific
+            # exception the tool handler already maps to ``needs_reauth``.
+            if tokens is not None:
+                from tools.mcp_oauth import OAuthNonInteractiveError, _is_interactive
+
+                if (
+                    not _is_interactive()
+                    and not self.context.is_token_valid()
+                    and not self.context.can_refresh_token()
+                ):
+                    raise OAuthNonInteractiveError(
+                        f"MCP OAuth for '{self._hermes_server_name}' requires "
+                        "re-authentication: the cached access token is expired "
+                        "and no refresh_token is available. Run `hermes mcp "
+                        f"login {self._hermes_server_name}` interactively to "
+                        "refresh the credential before using this server from "
+                        "a headless gateway or cron job."
+                    )
+
             # Cold-load: restore OAuth server metadata from disk before any
             # refresh attempt. Without this, a restarted process with cached
             # tokens but no in-memory metadata would fall back to the SDK's
