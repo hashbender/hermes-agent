@@ -80,8 +80,21 @@ def _effective_provider_label() -> str:
     except AuthError:
         effective = requested or "auto"
 
-    if effective == "openrouter" and get_env_value("OPENAI_BASE_URL"):
-        effective = "custom"
+    if effective == "openrouter":
+        # A custom endpoint may be configured either in config.yaml
+        # (model.base_url — the canonical location; the runtime treats
+        # config.yaml as the single source of truth) or via the legacy
+        # OPENAI_BASE_URL env var. Either way, labeling it "OpenRouter"
+        # is misleading (#3296).
+        config_base_url = ""
+        try:
+            model_cfg = load_config().get("model")
+            if isinstance(model_cfg, dict):
+                config_base_url = (model_cfg.get("base_url") or "").strip()
+        except Exception:
+            pass
+        if config_base_url or get_env_value("OPENAI_BASE_URL"):
+            effective = "custom"
 
     return provider_label(effective)
 
@@ -412,17 +425,6 @@ def show_status(args):
     elif terminal_env == "daytona":
         daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
         print(f"  Daytona Image: {daytona_image}")
-    elif terminal_env == "tenki":
-        tenki_image = os.getenv("TERMINAL_TENKI_IMAGE", "")
-        tenki_endpoint = os.getenv("TERMINAL_TENKI_API_ENDPOINT", "https://api.tenki.cloud")
-        tenki_workspace = os.getenv("TERMINAL_TENKI_WORKSPACE_ID", "")
-        tenki_project = os.getenv("TERMINAL_TENKI_PROJECT_ID", "")
-        tenki_sync = os.getenv("TERMINAL_TENKI_SYNC_HERMES_HOME", "false").lower() in {"true", "1", "yes"}
-        print(f"  Tenki Image:  {tenki_image or '(Tenki default)'}")
-        print(f"  Endpoint:     {tenki_endpoint}")
-        print(f"  Workspace:    {tenki_workspace or '(from Tenki CLI)'}")
-        print(f"  Project:      {tenki_project or '(from Tenki CLI)'}")
-        print(f"  Sync .hermes: {check_mark(tenki_sync)} {'enabled' if tenki_sync else 'disabled'}")
 
     sudo_password = os.getenv("SUDO_PASSWORD", "")
     print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
