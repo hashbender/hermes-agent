@@ -701,6 +701,25 @@ class TestSearchFilesFallbackHiddenPaths:
         assert result.error is None
         assert set(result.files) == {str(visible_file), str(visible_nested_file)}
 
+    def test_fallback_find_includes_empty_directories(self, tmp_path, monkeypatch):
+        """target='files' doubles as ls; empty directories must be discoverable."""
+        root = tmp_path / "repo"
+        root.mkdir()
+        empty_dir = root / "vault"
+        empty_dir.mkdir()
+        nonempty_dir = root / "notes"
+        nonempty_dir.mkdir()
+        (nonempty_dir / "readme.md").write_text("x")
+
+        ops = ShellFileOperations(self._make_env())
+        monkeypatch.setattr(ops, "_has_command", lambda command: command == "find")
+        result = ops._search_files("*", str(root), limit=50, offset=0)
+
+        assert result.error is None
+        assert str(empty_dir) in result.files
+        assert str(nonempty_dir) in result.files
+        assert str(nonempty_dir / "readme.md") in result.files
+
 
 class TestShellFileOpsWriteDenied:
     def test_write_file_denied_path(self, file_ops):
