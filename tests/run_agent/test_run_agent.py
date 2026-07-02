@@ -55,6 +55,46 @@ def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
 
 
+def test_run_conversation_dict_returns_include_final_response():
+    """Structurally enforce final_response on dict returns from run_conversation().
+
+    This parses source, including nested helpers, so it requires the .py file
+    to be available. It guards key presence and literal None values; runtime
+    tests still cover branch-specific values.
+    """
+    from agent import conversation_loop
+
+    try:
+        source = inspect.getsource(conversation_loop.run_conversation)
+    except OSError as exc:
+        pytest.skip(f"run_conversation source is unavailable: {exc}")
+    tree = ast.parse(source)
+    missing = []
+    literal_none = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Dict):
+            continue
+        keys = [
+            key.value if isinstance(key, ast.Constant) else None
+            for key in node.value.keys
+        ]
+        if "final_response" not in keys:
+            missing.append(node.lineno)
+            continue
+        value = node.value.values[keys.index("final_response")]
+        if isinstance(value, ast.Constant) and value.value is None:
+            literal_none.append(node.lineno)
+
+    assert missing == [], (
+        "run_conversation() dict returns must preserve the final_response "
+        f"contract; missing at source-local lines {missing}"
+    )
+    assert literal_none == [], (
+        "run_conversation() dict returns must expose actionable final_response "
+        f"text instead of literal None; literal None at source-local lines {literal_none}"
+    )
+
+
 @pytest.fixture()
 def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
@@ -5037,8 +5077,8 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
 
         # Without think tags, the agent should attempt continuation retries
-        # (up to 3), not immediately fire thinking-exhaustion.
-        assert result["api_calls"] == 3
+        # (up to 4), not immediately fire thinking-exhaustion.
+        assert result["api_calls"] == 4
         assert result["completed"] is False
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
@@ -5379,6 +5419,7 @@ class TestRetryExhaustion:
         assert result.get("failed") is True
         assert "error" in result
         assert "Invalid API response" in result["error"]
+        assert result.get("final_response") == result["error"]
 
     def test_content_filter_refusal_surfaced_not_retried(self, agent):
         """A model refusal must be surfaced immediately, NOT laundered into
@@ -6871,6 +6912,27 @@ class TestStreamingApiCall:
         assert resp.choices[0].message.content is None
         assert resp.choices[0].message.tool_calls is None
 
+    def test_reasoning_content_in_delta_model_extra_counts_as_stream_output(self, agent):
+        """OpenAI-compatible providers may expose reasoning deltas via model_extra."""
+        delta = SimpleNamespace(
+            content=None,
+            tool_calls=None,
+            model_extra={"reasoning_content": "thinking only"},
+        )
+        chunks = [
+            SimpleNamespace(
+                model="openai-compatible/reasoning",
+                choices=[SimpleNamespace(delta=delta, finish_reason=None)],
+            )
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp.choices[0].message.content is None
+        assert resp.choices[0].message.reasoning_content == "thinking only"
+        assert resp.choices[0].finish_reason == "stop"
+
     def test_callback_exception_swallowed(self, agent):
         chunks = [
             _make_chunk(content="Hello"),
@@ -7110,7 +7172,16 @@ class TestPersistUserMessageOverride:
 
         agent._persist_session(messages, [])
 
-        assert messages[0]["content"] == "Hello there"
+        # The original messages list must NOT be mutated — the persist
+        # override is applied only to the DB row (resolved inside the flush
+        # chokepoint), so the live list keeps the original content for the
+        # API call (#48677).
+        assert (
+            messages[0]["content"]
+            == "[Voice input — respond concisely and conversationally, "
+            "2-3 sentences max. No code blocks or markdown.] Hello there"
+        )
+        # But the DB write must get the override.
         first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
         assert first_db_write["content"] == "Hello there"
 
