@@ -182,3 +182,22 @@ def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
     assert runner_called["hit"] is False, (
         "POSIX must not take the Windows loop-factory branch"
     )
+
+
+def test_config_schema_exposes_coder_terminal_backend_and_fields():
+    fields = web_server.CONFIG_SCHEMA
+
+    assert "coder" in fields["terminal.backend"]["options"]
+
+    assert fields["terminal.coder_url"]["type"] == "string"
+    assert fields["terminal.coder_url"]["category"] == "terminal"
+    assert "Coder" in fields["terminal.coder_url"]["description"]
+
+    assert fields["terminal.coder_organization"]["type"] == "string"
+    assert fields["terminal.coder_workspace"]["type"] == "string"
+    assert fields["terminal.coder_workspace"].get("required") is True
+    assert "required" in fields["terminal.coder_workspace"]["description"].lower()
+    assert "per-session" not in fields["terminal.coder_workspace"]["description"].lower()
+    assert fields["terminal.coder_forward_env"]["type"] == "list"
+    assert fields["terminal.coder_workspace_startup_timeout"]["type"] == "number"
+    assert "startup" in fields["terminal.coder_workspace_startup_timeout"]["description"].lower()
