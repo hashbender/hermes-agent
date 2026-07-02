@@ -614,7 +614,7 @@ class DockerEnvironment(BaseEnvironment):
         logger.info(f"DockerEnvironment volumes: {volumes}")
         # Ensure volumes is a list (config.yaml could be malformed)
         if volumes is not None and not isinstance(volumes, list):
-            logger.warning(f"docker_volumes config is not a list: {volumes!r}")
+            logger.warning("docker_volumes config is not a list: %r", volumes)
             volumes = []
 
         # Fail fast if Docker is not available.
@@ -652,7 +652,7 @@ class DockerEnvironment(BaseEnvironment):
         workspace_explicitly_mounted = False
         for vol in (volumes or []):
             if not isinstance(vol, str):
-                logger.warning(f"Docker volume entry is not a string: {vol!r}")
+                logger.warning("Docker volume entry is not a string: %r", vol)
                 continue
             vol = vol.strip()
             if not vol:
@@ -662,7 +662,7 @@ class DockerEnvironment(BaseEnvironment):
                 if ":/workspace" in vol:
                     workspace_explicitly_mounted = True
             else:
-                logger.warning(f"Docker volume '{vol}' missing colon, skipping")
+                logger.warning("Docker volume '%s' missing colon, skipping", vol)
 
         host_cwd_abs = os.path.abspath(os.path.expanduser(host_cwd)) if host_cwd else ""
         bind_host_cwd = (
