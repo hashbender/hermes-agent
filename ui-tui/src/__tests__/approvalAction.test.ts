@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { approvalAction } from '../components/prompts.js'
+import { approvalAction, approvalFullReviewMessage, approvalOverflowMessage } from '../components/prompts.js'
 
 describe('approvalAction — pure key dispatch for ApprovalPrompt', () => {
   it('maps Esc to deny — parity with global Ctrl+C cancellation', () => {
@@ -36,11 +36,35 @@ describe('approvalAction — pure key dispatch for ApprovalPrompt', () => {
     expect(approvalAction('', { downArrow: true }, 3)).toEqual({ kind: 'noop' })
   })
 
+  it('offers a full-payload review row only when the command preview overflows', () => {
+    expect(approvalAction('v', {}, 0)).toEqual({ kind: 'noop' })
+    expect(approvalAction('5', {}, 0)).toEqual({ kind: 'noop' })
+    expect(approvalAction('', { downArrow: true }, 3)).toEqual({ kind: 'noop' })
+
+    expect(approvalAction('v', {}, 0, undefined, true)).toEqual({ kind: 'toggleFull' })
+    expect(approvalAction('V', {}, 0, undefined, true)).toEqual({ kind: 'toggleFull' })
+    expect(approvalAction('5', {}, 0, undefined, true)).toEqual({ kind: 'toggleFull' })
+    expect(approvalAction('', { return: true }, 4, undefined, true)).toEqual({ kind: 'toggleFull' })
+    expect(approvalAction('', { downArrow: true }, 3, undefined, true)).toEqual({ kind: 'move', delta: 1 })
+    expect(approvalAction('', { downArrow: true }, 4, undefined, true)).toEqual({ kind: 'noop' })
+  })
+
+  it('uses approval-local overflow copy instead of the old scrollback fallback', () => {
+    expect(approvalOverflowMessage(1)).toBe('… +1 more line hidden - select View full payload to review here')
+    expect(approvalOverflowMessage(3)).toBe('… +3 more lines hidden - select View full payload to review here')
+    expect(approvalOverflowMessage(3)).not.toContain('full text above')
+    expect(approvalFullReviewMessage()).toBe('Full payload shown in this prompt')
+  })
+
   it('Esc beats numeric/return — denying is always the first interpretation', () => {
     // If a terminal somehow delivers Esc + a digit in the same event, deny
     // wins.  Documents the precedence so a future refactor doesn't flip it.
-    expect(approvalAction('1', { escape: true }, 0)).toEqual({ kind: 'choose', choice: 'deny' })
-    expect(approvalAction('', { escape: true, return: true }, 1)).toEqual({ kind: 'choose', choice: 'deny' })
+    expect(approvalAction('1', { escape: true }, 0, undefined, true)).toEqual({ kind: 'choose', choice: 'deny' })
+    expect(approvalAction('v', { escape: true }, 0, undefined, true)).toEqual({ kind: 'choose', choice: 'deny' })
+    expect(approvalAction('', { escape: true, return: true }, 1, undefined, true)).toEqual({
+      kind: 'choose',
+      choice: 'deny'
+    })
   })
 
   it('returns noop for unrelated keystrokes (printable letters etc.)', () => {
@@ -57,5 +81,8 @@ describe('approvalAction — pure key dispatch for ApprovalPrompt', () => {
     expect(approvalAction('4', {}, 0, opts)).toEqual({ kind: 'noop' })
     expect(approvalAction('', { downArrow: true }, 2, opts)).toEqual({ kind: 'noop' })
     expect(approvalAction('', { return: true }, 2, opts)).toEqual({ kind: 'choose', choice: 'deny' })
+
+    expect(approvalAction('4', {}, 0, opts, true)).toEqual({ kind: 'toggleFull' })
+    expect(approvalAction('', { return: true }, 3, opts, true)).toEqual({ kind: 'toggleFull' })
   })
 })
