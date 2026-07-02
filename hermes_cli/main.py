@@ -616,6 +616,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_stepfun,
     _model_flow_bedrock_api_key,
     _model_flow_bedrock,
+    _model_flow_vertex,
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
@@ -1748,10 +1749,12 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         )
         sys.exit(1)
 
-    if not ext_dir:
-        _ensure_tui_workspace(tui_dir)
-
     # 1. Prebuilt bundle (nix / packaged release): just run it.
+    #    These paths need no ``ui-tui/`` source workspace, so check them BEFORE
+    #    requiring one — a pip/uv wheel ships the prebuilt bundle but has no
+    #    ``ui-tui/`` dir and isn't a git checkout, so calling
+    #    _ensure_tui_workspace() first would abort with a bogus "git restore"
+    #    message and never reach the bundle it actually shipped.
     if not tui_dev:
         if ext_dir:
             p = Path(ext_dir)
@@ -1770,6 +1773,11 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     #    Existing desktop behaviour runs npm from the workspace root.  Termux
     #    scopes the install to ui-tui so launch does not pull desktop/web
     #    dependencies into the hot path.
+    #    This is the only path that builds from the ``ui-tui/`` source tree, so
+    #    the workspace guard belongs here (skipped when HERMES_TUI_DIR points at
+    #    an external checkout, matching the prior behaviour).
+    if not ext_dir:
+        _ensure_tui_workspace(tui_dir)
     did_install = False
     termux_startup = _is_termux_startup_environment()
     termux_need_rebuild = False
@@ -3109,6 +3117,8 @@ def select_provider_and_model(args=None):
         _model_flow_stepfun(config, current_model)
     elif selected_provider == "bedrock":
         _model_flow_bedrock(config, current_model)
+    elif selected_provider == "vertex":
+        _model_flow_vertex(config, current_model)
     elif selected_provider == "azure-foundry":
         _model_flow_azure_foundry(config, current_model)
     elif selected_provider in {
@@ -11902,7 +11912,7 @@ def _build_provider_choices() -> list[str]:
         # Fallback: static list guarantees the CLI always works
         return [
             "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
-            "anthropic", "gemini", "xai", "bedrock", "azure-foundry",
+            "anthropic", "gemini", "vertex", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
             "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
