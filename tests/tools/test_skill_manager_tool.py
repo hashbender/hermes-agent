@@ -733,6 +733,84 @@ class TestSecurityScanGate:
 
 
 # ---------------------------------------------------------------------------
+# _find_skill — symlinked skill directories
+# ---------------------------------------------------------------------------
+
+
+class TestFindSkillSymlinks:
+    """_find_skill must follow symlinked skill directories.
+
+    ``Path.rglob`` does NOT descend into symlinked directories. Skills
+    installed as symlinks (common in multi-profile setups where
+    ``~/.hermes/skills/<namespace>/<slug>`` is a directory symlink to a
+    checkout) are invisible to ``rglob`` — but the skill *loader*
+    (``iter_skill_index_files``) uses ``os.walk(followlinks=True)``
+    and finds them fine. This test reproduces the discrepancy and verifies
+    the fix brings ``_find_skill`` in line with the loader.
+    """
+
+    def test_find_skill_follows_symlinked_dir(self, tmp_path):
+        """A skill whose directory is a symlink should be findable."""
+        import os
+
+        from tools.skill_manager_tool import _find_skill
+
+        # Real skill lives outside the skills dir
+        real_skill_dir = tmp_path / "real-skills" / "my-symlinked-skill"
+        real_skill_dir.mkdir(parents=True)
+        (real_skill_dir / "SKILL.md").write_text(
+            "---\nname: my-symlinked-skill\ndescription: A skill behind a symlink.\n---\n\n# Test\n"
+        )
+
+        # Skills dir contains a directory symlink to the real skill
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        link = skills_dir / "my-symlinked-skill"
+        link.symlink_to(real_skill_dir, target_is_directory=True)
+
+        with patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]):
+            result = _find_skill("my-symlinked-skill")
+
+        assert result is not None, (
+            "_find_skill returned None for a symlinked skill — "
+            "rglob does not follow symlinks; use iter_skill_index_files"
+        )
+        assert result["path"].name == "my-symlinked-skill"
+
+    def test_find_skill_in_other_profiles_follows_symlinks(self, tmp_path):
+        """_find_skill_in_other_profiles should also follow symlinks."""
+        from tools.skill_manager_tool import _find_skill_in_other_profiles
+
+        # Real skill in a "source" location
+        real_skill_dir = tmp_path / "source" / "shared-skill"
+        real_skill_dir.mkdir(parents=True)
+        (real_skill_dir / "SKILL.md").write_text(
+            "---\nname: shared-skill\ndescription: Shared.\n---\n\n# Shared\n"
+        )
+
+        # A profile with a symlinked skill
+        profile_dir = tmp_path / "profiles" / "other-profile" / "skills"
+        profile_dir.mkdir(parents=True)
+        link = profile_dir / "shared-skill"
+        link.symlink_to(real_skill_dir, target_is_directory=True)
+
+        # Active skills dir (empty — forces search in other profiles)
+        active_skills = tmp_path / "skills"
+        active_skills.mkdir()
+
+        with patch("tools.skill_manager_tool.SKILLS_DIR", active_skills), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[active_skills]):
+            # Mock get_default_hermes_root to point at our tmp_path
+            with patch("hermes_constants.get_default_hermes_root", return_value=tmp_path):
+                matches = _find_skill_in_other_profiles("shared-skill")
+
+        assert len(matches) == 1, f"Expected 1 match, got {matches}"
+        assert matches[0][0] == "other-profile"
+        assert matches[0][1].name == "shared-skill"
+
+
+# ---------------------------------------------------------------------------
 # External skills directories (skills.external_dirs) — mutations in place
 # ---------------------------------------------------------------------------
 
