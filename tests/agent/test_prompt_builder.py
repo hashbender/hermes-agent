@@ -33,6 +33,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
+    HERMES_AGENT_HELP_GUIDANCE,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -43,6 +44,11 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_hermes_help_guidance_avoids_plaintext_tool_call_syntax(self):
+        assert "skill_view(name='hermes-agent')" not in HERMES_AGENT_HELP_GUIDANCE
+        assert "`hermes-agent` skill" in HERMES_AGENT_HELP_GUIDANCE
+        assert "skill_view tool" in HERMES_AGENT_HELP_GUIDANCE
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
@@ -1299,7 +1305,7 @@ class TestEnvironmentHints:
     def test_remote_backend_list_covers_known_sandboxes(self):
         """Regression guard: if someone adds a remote backend, they must list it here."""
         import agent.prompt_builder as _pb
-        for backend in ("docker", "singularity", "modal", "daytona", "tenki", "ssh"):
+        for backend in ("docker", "singularity", "modal", "daytona", "ssh"):
             assert backend in _pb._REMOTE_TERMINAL_BACKENDS, (
                 f"{backend!r} must be in _REMOTE_TERMINAL_BACKENDS so its host "
                 f"info is suppressed in the system prompt"
@@ -1644,4 +1650,5 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
+
 
