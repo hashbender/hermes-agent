@@ -99,6 +99,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "provider.anthropic": ("anthropic==0.87.0",),  # CVE-2026-34450, CVE-2026-34452
     # AWS Bedrock provider
     "provider.bedrock": ("boto3==1.42.89",),
+    # Google Vertex AI provider — OAuth2 token minting for the Gemini
+    # OpenAI-compatible endpoint. Only loaded when provider=vertex is selected;
+    # google-auth is NOT in [all] so plain installs don't carry it.
+    "provider.vertex": ("google-auth==2.55.1",),
     # Microsoft Foundry — Entra ID auth (managed identity, workload identity,
     # service principal, az login, VS Code, azd, PowerShell). Only loaded
     # when model.auth_mode=entra_id is selected; key-based azure-foundry
@@ -196,6 +200,12 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # installed on demand like every other messaging platform; also exposed
     # as the `teams` extra in pyproject for packagers / explicit installs.
     "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
+    # WhatsApp adapter — the Python side talks to the Node.js bridge over HTTP
+    # via aiohttp. Lazy-installed on demand like every other messaging
+    # platform; without this the gateway crashed with
+    # ModuleNotFoundError: No module named 'aiohttp' and fell back to
+    # cron-only mode (issue #54217).
+    "platform.whatsapp": ("aiohttp==3.14.1",),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
 
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),
