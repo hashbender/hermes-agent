@@ -157,7 +157,7 @@ The following patterns trigger approval prompts (defined in `tools/approval.py`)
 | `gateway run` with `&`/`disown`/`nohup`/`setsid` | Prevents starting gateway outside service manager |
 
 :::info
-**Container bypass**: When running in `docker`, `singularity`, `modal`, `daytona`, or `tenki` backends, dangerous command checks are **skipped** because the container itself is the security boundary. Destructive commands inside a container can't harm the host.
+**Container bypass**: When running in `docker`, `singularity`, `modal`, or `daytona` backends, dangerous command checks are **skipped** because the container itself is the security boundary. Destructive commands inside a container can't harm the host.
 :::
 
 ### Approval Flow (CLI)
@@ -198,9 +198,27 @@ Commands approved with "always" are saved to `~/.hermes/config.yaml`:
 command_allowlist:
   - rm
   - systemctl
+  - pattern: chmod
+    args_glob:
+      - ~/.hermes/**
 ```
 
-These patterns are loaded at startup and silently approved in all future sessions.
+String patterns are loaded at startup and silently approved in all future sessions. Structured entries can scope an allowed verb to path-shaped arguments. For example, the `chmod` rule above allows `chmod +x ~/.hermes/skills/foo/run.sh` without allowing `chmod` against `/etc` or `/usr`.
+
+Compound shell commands (`a && b`, `a | b`, `a ; b`, redirection, subshells, and heredocs) are not matched by the allowlist shortcut; each risky operation must be approved independently.
+
+### Deployment-Specific Approval Rules
+
+Admins can require approval for local commands that are operationally disruptive in their deployment even when the command is not universally dangerous:
+
+```yaml
+approvals:
+  command_approval_required:
+    - "systemctl --user restart hermes-gateway*"
+    - "systemctl --user restart openclaw-gateway*"
+```
+
+These rules use the same approval flow as built-in dangerous-command patterns. Entries may be exact commands, command globs, bare verbs, or structured rules with `pattern` and `args_glob`.
 
 :::tip
 Use `hermes config edit` to review or remove patterns from your permanent allowlist.
@@ -355,7 +373,7 @@ terminal:
 - **Ephemeral mode** (`container_persistent: false`): Uses tmpfs for workspace — everything is lost on cleanup
 
 :::tip
-For production gateway deployments, use `docker`, `modal`, `daytona`, or `tenki` backend to isolate agent commands from your host system. This eliminates the need for dangerous command approval entirely.
+For production gateway deployments, use `docker`, `modal`, or `daytona` backend to isolate agent commands from your host system. This eliminates the need for dangerous command approval entirely.
 :::
 
 :::warning
@@ -372,7 +390,6 @@ If you add names to `terminal.docker_forward_env`, those variables are intention
 | **singularity** | Container | ❌ Skipped | HPC environments |
 | **modal** | Cloud sandbox | ❌ Skipped | Scalable cloud isolation |
 | **daytona** | Cloud sandbox | ❌ Skipped | Persistent cloud workspaces |
-| **tenki** | Cloud sandbox | ❌ Skipped | On-demand cloud compute |
 
 ## Environment Variable Passthrough {#environment-variable-passthrough}
 

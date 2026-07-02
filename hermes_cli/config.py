@@ -2392,10 +2392,16 @@ DEFAULT_CONFIG = {
     # cron_mode — what to do when a cron job hits a dangerous command:
     #   deny    — block the command and let the agent find another way (default, safe)
     #   approve — auto-approve all dangerous commands in cron jobs
+    #
+    # command_approval_required — deployment-local command patterns that must
+    # enter the same approval flow as built-in dangerous commands. Entries may
+    # be exact commands, shell-style command globs, bare verbs, or structured
+    # rules with pattern/args_glob.
     "approvals": {
         "mode": "manual",
         "timeout": 60,
         "cron_mode": "deny",
+        "command_approval_required": [],
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system
@@ -2415,7 +2421,10 @@ DEFAULT_CONFIG = {
         "destructive_slash_confirm": True,
     },
 
-    # Permanently allowed dangerous command patterns (added via "always" approval)
+    # Permanently allowed dangerous command patterns (added via "always" approval).
+    # Entries may be legacy strings ("recursive delete", "podman *") or
+    # structured path-scoped rules:
+    #   {"pattern": "chmod", "args_glob": ["~/.hermes/**"]}
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
