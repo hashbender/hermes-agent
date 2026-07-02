@@ -20,6 +20,34 @@ _IS_WINDOWS = platform.system() == "Windows"
 logger = logging.getLogger(__name__)
 
 
+# MSYS/Git Bash treats ``cmd /c`` as a POSIX ``/c/...`` path unless excluded
+# or doubled (``cmd //c``). Without this, GUI launches report exit 0 but
+# never spawn the target process (#56147, related #54201).
+_CMD_SLASH_C_RE = re.compile(r"\b(cmd(?:\.exe)?)(\s+)/([cC])\b", re.IGNORECASE)
+
+
+def _normalize_windows_cmd_slash_c(command: str) -> str:
+    """Rewrite ``cmd /c`` → ``cmd //c`` so MSYS does not eat the flag."""
+    if not _IS_WINDOWS or not command:
+        return command
+    return _CMD_SLASH_C_RE.sub(r"\1\2//\3", command)
+
+
+def _apply_msys_cmd_c_arg_exclusion(run_env: dict) -> None:
+    """Exclude ``/c`` from MSYS argument path conversion for cmd.exe."""
+    if not _IS_WINDOWS:
+        return
+    token = "/c"
+    existing = run_env.get("MSYS2_ARG_CONV_EXCL", "")
+    if not existing:
+        run_env["MSYS2_ARG_CONV_EXCL"] = token
+        return
+    parts = [part.strip() for part in existing.split(";") if part.strip()]
+    if token not in parts:
+        parts.append(token)
+        run_env["MSYS2_ARG_CONV_EXCL"] = ";".join(parts)
+
+
 def _msys_to_windows_path(cwd: str) -> str:
     """Translate a Git Bash / MSYS-style POSIX path (``/c/Users/x``) to the
     native Windows form (``C:\\Users\\x``) so ``os.path.isdir`` and
@@ -155,6 +183,10 @@ def _build_provider_env_blocklist() -> frozenset:
         "CLAUDE_CODE_OAUTH_TOKEN",
         "LLM_MODEL",
         "GOOGLE_API_KEY",
+        # Path to a GCP service-account JSON, not a bare key, so
+        # OPTIONAL_ENV_VARS marks it password=False and the loop above skips it.
+        "VERTEX_CREDENTIALS_PATH",
+        "GOOGLE_APPLICATION_CREDENTIALS",
         "DEEPSEEK_API_KEY",
         "MISTRAL_API_KEY",
         "GROQ_API_KEY",
@@ -791,6 +823,8 @@ def _make_run_env(env: dict) -> dict:
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
 
+    _apply_msys_cmd_c_arg_exclusion(run_env)
+
     return run_env
 
 
@@ -890,6 +924,10 @@ class LocalEnvironment(BaseEnvironment):
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
         self.init_session()
+
+    def _prepare_command(self, command: str) -> tuple[str, str | None]:
+        command, sudo_stdin = super()._prepare_command(command)
+        return _normalize_windows_cmd_slash_c(command), sudo_stdin
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
