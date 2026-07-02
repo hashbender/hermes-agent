@@ -214,11 +214,20 @@ def _run_reference(
         # trimmed view (_reference_messages) already strips the agent's own
         # system prompt, so this is the only system message the reference sees.
         messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
+        # Optional per-slot reasoning effort (preset key ``reasoning_effort``
+        # on a reference slot, preserved by moa_config._clean_slot). References
+        # are advisors, so presets commonly dial their thinking down ("low")
+        # without touching the acting aggregator's reasoning config. Passed via
+        # extra_body so backends that don't support it simply reject/ignore it
+        # per their normal handling — and a rejected reference degrades to a
+        # labelled note, never aborting the MoA turn.
+        effort = str(slot.get("reasoning_effort") or "").strip().lower()
         response = call_llm(
             task="moa_reference",
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            extra_body={"reasoning_effort": effort} if effort else None,
             **runtime,
         )
         usage = CanonicalUsage()
@@ -715,10 +724,17 @@ class MoAChatCompletions:
         # aggregator's spend (often the bulk of the turn) is silently dropped
         # and the session cost reflects advisor fan-out only.
         self.last_aggregator_slot = dict(aggregator) if aggregator else None
-        # MoA does not cap reference or aggregator output: each model uses its
-        # own maximum. Passing max_tokens=None makes call_llm omit the parameter
-        # (it never caps by default), so a long aggregator synthesis is never
-        # truncated and providers that reject max_tokens don't 400.
+        # By default MoA does not cap reference or aggregator output: each model
+        # uses its own maximum (max_tokens=None → call_llm omits the parameter,
+        # so a long aggregator synthesis is never truncated and providers that
+        # reject max_tokens don't 400). A preset MAY set reference_max_tokens to
+        # cap ADVISOR output only — advisor generation is the dominant MoA
+        # latency (turn latency correlates ~0.88 with output tokens), and the
+        # aggregator only needs the gist of each advisor's judgement, so a cap
+        # (e.g. 600) measurably cuts per-turn wall time (~44% on a sample task).
+        # The acting aggregator is never capped here (its output is the
+        # user-visible answer).
+        reference_max_tokens = preset.get("reference_max_tokens")
         temperature = float(preset.get("reference_temperature", 0.6) or 0.6)
         aggregator_temperature = float(preset.get("aggregator_temperature", api_kwargs.get("temperature") or 0.4) or 0.4)
 
@@ -762,7 +778,7 @@ class MoAChatCompletions:
                 reference_models,
                 ref_messages,
                 temperature=temperature,
-                max_tokens=None,
+                max_tokens=reference_max_tokens,
             )
             self._ref_cache_key = _cache_key
             self._ref_cache_outputs = list(reference_outputs)

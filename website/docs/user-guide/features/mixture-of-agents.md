@@ -97,6 +97,65 @@ Default preset:
 - reference: `openrouter:deepseek/deepseek-v4-pro`
 - aggregator / acting model: `openrouter:anthropic/claude-opus-4.8`
 
+### Tuning advisor speed with `reference_max_tokens`
+
+Each turn, MoA runs the reference models (advisors) in parallel and then the
+aggregator acts. Advisor generation is the dominant per-turn latency — turn
+wall time correlates strongly with how many tokens the advisors emit, because
+the turn waits for the slowest advisor to finish writing. By default advisors
+are **uncapped** (`reference_max_tokens` unset), so they may write long,
+essay-length advice.
+
+Set `reference_max_tokens` on a preset to cap advisor output and give concise
+advice instead. The aggregator only needs the gist of each advisor's
+judgement, so a cap (e.g. `600`) measurably cuts per-turn wall time with little
+quality impact. It caps **advisors only** — the acting aggregator's output (the
+user-visible answer) is never capped.
+
+```yaml
+moa:
+  presets:
+    fast:
+      reference_models:
+        - provider: openrouter
+          model: anthropic/claude-opus-4.8
+        - provider: openrouter
+          model: openai/gpt-5.5
+      aggregator:
+        provider: openrouter
+        model: anthropic/claude-opus-4.8
+      reference_max_tokens: 600   # concise advice → faster turns
+```
+
+### Dialing down advisor thinking with `reasoning_effort`
+
+Reasoning models spend most of their advisor turn *thinking* rather than
+writing. For models that accept a reasoning-effort parameter (gpt-oss,
+o-series-style backends), you can set `reasoning_effort` **per reference
+slot** to cap that spend without touching the acting aggregator's own
+reasoning configuration:
+
+```yaml
+moa:
+  presets:
+    fast:
+      reference_models:
+        - provider: openrouter
+          model: openai/gpt-5.5
+          reasoning_effort: low   # advisors think briefly; aggregator unaffected
+      aggregator:
+        provider: openrouter
+        model: anthropic/claude-opus-4.8
+```
+
+The value is passed through to the slot's backend as-is (`low` / `medium` /
+`high` on most providers). Backends that don't support the parameter reject or
+ignore it per their normal handling — a rejected reference degrades to a
+labelled note for the aggregator, never aborting the turn. Slots without the
+key behave exactly as before.
+
+Leave it unset (or `0`/blank) to keep the prior uncapped behavior.
+
 ## Terminal preset management
 
 ```bash
