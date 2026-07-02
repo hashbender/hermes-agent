@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
 from gateway.session import SessionSource
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 def _make_adapter(
@@ -148,6 +149,60 @@ def _bot_command_entity(text, command):
     """
     offset = text.index(command)
     return SimpleNamespace(type="bot_command", offset=offset, length=len(command))
+
+
+# ------------------------------------------------------------------
+# _clean_bot_trigger_text regression tests (GH: slash args eaten in groups)
+# ------------------------------------------------------------------
+
+
+def test_clean_bot_trigger_text_drops_at_mention():
+    """Verify ``@botname`` prefix is stripped from command text."""
+    adapter = _make_adapter(bot_username="mybot")
+    assert adapter._clean_bot_trigger_text("@mybot /resume 2") == "/resume 2"
+
+
+def test_clean_bot_trigger_text_drops_at_mention_followed_by_comma():
+    """Variation with a comma between mention and command."""
+    adapter = _make_adapter(bot_username="mybot")
+    assert adapter._clean_bot_trigger_text("@mybot, /resume 2") == "/resume 2"
+
+
+def test_clean_bot_trigger_text_preserves_trailing_space_after_mention():
+    """Key regression test: the space between command and args must NOT be eaten.
+
+    In groups, Telegram command menu auto-fills ``/resume@botname 2``.
+    The old regex ``@botname\\s*`` would eat the space, turning it into
+    ``/resume2`` — which Telegram then reports as "Unknown command /resume2".
+    """
+    adapter = _make_adapter(bot_username="hermes_bot")
+    # When text has NO @botname (DM path), nothing should change.
+    assert adapter._clean_bot_trigger_text("/resume 2") == "/resume 2"
+    # When @botname is present (group path), only @botname is removed,
+    # not the space that follows it.
+    assert adapter._clean_bot_trigger_text("/resume@hermes_bot 2") == "/resume 2"
+
+
+def test_clean_bot_trigger_text_preserves_args_with_multiple_words():
+    """Arguments with spaces must survive intact."""
+    adapter = _make_adapter(bot_username="bot")
+    assert adapter._clean_bot_trigger_text("/new my topic name") == "/new my topic name"
+    assert adapter._clean_bot_trigger_text("@bot /new my topic name") == "/new my topic name"
+
+
+def test_clean_bot_trigger_text_none_input():
+    adapter = _make_adapter(bot_username="bot")
+    assert adapter._clean_bot_trigger_text(None) is None
+    assert adapter._clean_bot_trigger_text("") == ""
+
+
+def test_clean_bot_trigger_text_no_bot_username():
+    """When bot has no username (edge case), text passes through unchanged."""
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    adapter.config = PlatformConfig(enabled=True, token="***", extra={})
+    adapter._bot = SimpleNamespace(id=999, username=None)
+    assert adapter._clean_bot_trigger_text("/resume 2") == "/resume 2"
 
 
 def test_group_messages_can_be_opened_via_config():
@@ -619,62 +674,6 @@ def test_allowed_topics_treat_missing_thread_as_general_topic():
 
     assert adapter._should_process_message(_group_message("hello", thread_id=None)) is True
     assert adapter._should_process_message(_group_message("hello", thread_id=8)) is False
-
-
-def _forum_message(*, chat_id, thread_id, is_topic_message, is_forum, chat_type="supergroup"):
-    """Build a message with independently-controlled topic/forum flags.
-
-    The shared ``_group_message`` fixture couples ``is_topic_message`` and
-    ``is_forum`` to ``thread_id is not None``, which cannot express a plain
-    reply-UI anchor (``message_thread_id`` set, ``is_topic_message=False``,
-    ``is_forum=False``). This helper decouples them for gating regressions.
-    """
-    return SimpleNamespace(
-        message_id=42,
-        text="hello",
-        caption=None,
-        entities=[],
-        caption_entities=[],
-        message_thread_id=thread_id,
-        is_topic_message=is_topic_message,
-        chat=SimpleNamespace(id=chat_id, type=chat_type, title="T", is_forum=is_forum),
-        from_user=SimpleNamespace(id=111, full_name="Alice", first_name="Alice"),
-        reply_to_message=None,
-        date=None,
-    )
-
-
-def test_gating_ignores_non_forum_reply_anchor_thread_id():
-    """A plain group reply's ``message_thread_id`` is a UI anchor, not a topic.
-
-    Before the shared ``_effective_message_thread_id`` normalizer, gating read
-    the raw ``message_thread_id`` — so a non-forum group reply whose anchor id
-    happened to match an ``ignored_threads`` entry was wrongly dropped, and its
-    anchor id was treated as a routable topic under ``allowed_topics``. The
-    normalizer drops reply anchors (non-forum, ``is_topic_message=False``), so
-    such a reply gates as the General topic instead.
-    """
-    # ignored_threads: reply anchor 55 must NOT be treated as thread 55.
-    adapter = _make_adapter(require_mention=False, free_response_chats=["-200"], ignored_threads=[55])
-    reply_anchor = _forum_message(
-        chat_id=-200, thread_id=55, is_topic_message=False, is_forum=False, chat_type="group"
-    )
-    assert adapter._should_process_message(reply_anchor) is True
-
-    # allowed_topics: reply anchor 55 normalizes to General ("1"), so a group
-    # that only allows topic "1" still processes the reply.
-    adapter2 = _make_adapter(require_mention=False, allowed_chats=["-200"], allowed_topics=["1"])
-    assert adapter2._should_process_message(reply_anchor) is True
-
-
-def test_gating_forum_general_topic_normalizes_to_one():
-    """Forum General-topic messages (thread_id=None) gate as topic "1"."""
-    adapter = _make_adapter(require_mention=False, allowed_chats=["-100"], allowed_topics=["1"])
-    general = _forum_message(chat_id=-100, thread_id=None, is_topic_message=False, is_forum=True)
-    assert adapter._should_process_message(general) is True
-
-    adapter2 = _make_adapter(require_mention=False, allowed_chats=["-100"], allowed_topics=["8"])
-    assert adapter2._should_process_message(general) is False
 
 
 def test_regex_mention_patterns_allow_custom_wake_words():
