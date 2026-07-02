@@ -41,6 +41,7 @@ _OWN_POLICY_PLATFORMS = [
     Platform.YUANBAO,
     Platform.QQBOT,
     Platform.WHATSAPP,
+    Platform.FEISHU,
 ]
 
 
@@ -52,6 +53,7 @@ def _clear_auth_env(monkeypatch) -> None:
         "QQ_ALLOWED_USERS",
         "QQ_GROUP_ALLOWED_USERS",
         "WHATSAPP_ALLOWED_USERS",
+        "FEISHU_ALLOWED_USERS",
         "TELEGRAM_ALLOWED_USERS",
         "GATEWAY_ALLOWED_USERS",
         "GATEWAY_ALLOW_ALL_USERS",
@@ -60,6 +62,7 @@ def _clear_auth_env(monkeypatch) -> None:
         "YUANBAO_ALLOW_ALL_USERS",
         "QQ_ALLOW_ALL_USERS",
         "WHATSAPP_ALLOW_ALL_USERS",
+        "FEISHU_ALLOW_ALL_USERS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -113,6 +116,7 @@ def test_base_adapter_defaults_to_not_owning_access_policy():
         ("gateway.platforms.yuanbao", "YuanbaoAdapter"),
         ("gateway.platforms.qqbot.adapter", "QQAdapter"),
         ("plugins.platforms.whatsapp.adapter", "WhatsAppAdapter"),
+        ("plugins.platforms.feishu.adapter", "FeishuAdapter"),
     ],
 )
 def test_own_policy_adapters_declare_the_flag(module_path, class_name):
@@ -143,6 +147,19 @@ def test_own_policy_allowlist_authorized_without_env_allowlist(monkeypatch, plat
     _clear_auth_env(monkeypatch)
     config = GatewayConfig(
         platforms={platform: PlatformConfig(enabled=True, extra={"dm_policy": "allowlist"})}
+    )
+    runner, _adapter = _make_runner(platform, config, enforces=True)
+
+    assert runner._is_user_authorized(_source(platform)) is True
+
+
+@pytest.mark.parametrize("platform", _OWN_POLICY_PLATFORMS)
+def test_own_policy_open_dm_authorized_with_gateway_allow_all(monkeypatch, platform):
+    """Explicit ``GATEWAY_ALLOW_ALL_USERS`` unlocks ``dm_policy: open``."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    config = GatewayConfig(
+        platforms={platform: PlatformConfig(enabled=True, extra={"dm_policy": "open"})}
     )
     runner, _adapter = _make_runner(platform, config, enforces=True)
 
@@ -201,6 +218,82 @@ def test_own_policy_open_group_not_authorized_without_allowlist(monkeypatch, pla
     _clear_auth_env(monkeypatch)
     config = GatewayConfig(
         platforms={platform: PlatformConfig(enabled=True, extra={"group_policy": "open"})}
+    )
+    runner, _adapter = _make_runner(platform, config, enforces=True)
+
+    assert runner._is_user_authorized(_source(platform, chat_type="group")) is False
+
+
+@pytest.mark.parametrize(
+    "module_path, class_name, dm_helper",
+    [
+        ("plugins.platforms.whatsapp.adapter", "WhatsAppAdapter", "_is_dm_allowed"),
+        ("plugins.platforms.wecom.adapter", "WeComAdapter", "_is_dm_allowed"),
+        ("gateway.platforms.weixin", "WeixinAdapter", "_is_dm_allowed"),
+        ("gateway.platforms.qqbot.adapter", "QQAdapter", "_is_dm_allowed"),
+    ],
+)
+def test_pairing_dm_policy_strict_intake_auth_denies_unknown(
+    monkeypatch, module_path, class_name, dm_helper,
+):
+    """Default ``dm_policy: pairing`` must not admit senders via strict auth."""
+    _clear_auth_env(monkeypatch)
+    import importlib
+
+    from gateway.config import PlatformConfig
+
+    module = importlib.import_module(module_path)
+    adapter_cls = getattr(module, class_name)
+    adapter = adapter_cls(PlatformConfig(enabled=True, extra={"dm_policy": "pairing"}))
+    assert getattr(adapter, dm_helper)("unknown-user") is False
+
+
+@pytest.mark.parametrize(
+    "module_path, class_name, intake_helper",
+    [
+        ("gateway.platforms.qqbot.adapter", "QQAdapter", "_is_dm_intake_allowed"),
+        ("plugins.platforms.wecom.adapter", "WeComAdapter", "_is_dm_intake_allowed"),
+        ("plugins.platforms.whatsapp.adapter", "WhatsAppAdapter", "_is_dm_intake_allowed"),
+    ],
+)
+@pytest.mark.parametrize("blank_sender", ["", "   ", None])
+def test_pairing_dm_intake_denies_blank_principal(
+    monkeypatch, module_path, class_name, intake_helper, blank_sender,
+):
+    """Pairing intake must not forward senderless DM callbacks to the gateway."""
+    _clear_auth_env(monkeypatch)
+    import importlib
+
+    from gateway.config import PlatformConfig
+
+    module = importlib.import_module(module_path)
+    adapter_cls = getattr(module, class_name)
+    adapter = adapter_cls(PlatformConfig(enabled=True, extra={"dm_policy": "pairing"}))
+    assert getattr(adapter, intake_helper)(blank_sender) is False
+
+
+@pytest.mark.parametrize("blank_sender", ["", "   ", None])
+def test_yuanbao_pairing_dm_intake_denies_blank_principal(monkeypatch, blank_sender):
+    """Yuanbao pairing intake must not forward senderless C2C callbacks."""
+    _clear_auth_env(monkeypatch)
+    from gateway.platforms.yuanbao import AccessPolicy
+
+    policy = AccessPolicy(
+        dm_policy="pairing",
+        dm_allow_from=[],
+        group_policy="pairing",
+        group_allow_from=[],
+    )
+    assert policy.is_dm_intake_allowed(blank_sender) is False
+    assert policy.is_dm_intake_allowed("user-1") is True
+
+
+@pytest.mark.parametrize("platform", _OWN_POLICY_PLATFORMS)
+def test_pairing_group_policy_not_blanket_authorized(monkeypatch, platform):
+    """Default ``group_policy: pairing`` must not authorize unknown group senders."""
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={platform: PlatformConfig(enabled=True, extra={"group_policy": "pairing"})}
     )
     runner, _adapter = _make_runner(platform, config, enforces=True)
 
