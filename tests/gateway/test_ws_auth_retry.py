@@ -187,6 +187,41 @@ class TestMatrixSyncAuthRetry:
         asyncio.run(run())
         assert call_count == 1
 
+    def test_introspection_auth_error_stops_loop(self):
+        """mautrix token introspection failures should not retry forever."""
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+        adapter = MatrixAdapter.__new__(MatrixAdapter)
+        adapter._closing = False
+
+        call_count = 0
+
+        async def fake_sync(timeout=30000, since=None):
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("Unable to introspect the access token")
+
+        adapter._client = MagicMock()
+        adapter._client.sync = fake_sync
+        adapter._client.sync_store = MagicMock()
+        adapter._client.sync_store.get_next_batch = AsyncMock(return_value=None)
+        adapter._pending_megolm = []
+        adapter._joined_rooms = set()
+
+        async def run():
+            import types
+            nio_mock = types.ModuleType("nio")
+            nio_mock.SyncError = type("SyncError", (), {})
+
+            import sys
+            sys.modules["nio"] = nio_mock
+            try:
+                await adapter._sync_loop()
+            finally:
+                del sys.modules["nio"]
+
+        asyncio.run(run())
+        assert call_count == 1
+
     def test_transient_error_retries(self):
         """A transient error should retry (not stop immediately)."""
         from plugins.platforms.matrix.adapter import MatrixAdapter

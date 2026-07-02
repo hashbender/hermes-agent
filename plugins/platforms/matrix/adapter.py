@@ -360,6 +360,16 @@ _E2EE_INSTALL_HINT = (
     "(requires libolm C library)"
 )
 
+_PERMANENT_AUTH_ERROR_MARKERS = (
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "m_unknown_token",
+    "unknown_token",
+    "unable to introspect",
+)
+
 _MATRIX_IMAGE_FILENAME_EXTS = frozenset({
     ".jpg",
     ".jpeg",
@@ -372,6 +382,13 @@ _MATRIX_IMAGE_FILENAME_EXTS = frozenset({
     ".heif",
     ".avif",
 })
+
+
+def _is_permanent_auth_error_text(text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    lower = text.lower()
+    return any(marker in lower for marker in _PERMANENT_AUTH_ERROR_MARKERS)
 
 _MATRIX_MODEL_PICKER_REACTIONS = (
     "1\ufe0f\u20e3",
@@ -806,6 +823,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._device_id: str = config.extra.get("device_id", "") or os.getenv(
             "MATRIX_DEVICE_ID", ""
         )
+        self._device_id_unverified: bool = False
 
         self._client: Any = None  # mautrix.client.Client
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
@@ -1039,6 +1057,12 @@ class MatrixAdapter(BasePlatformAdapter):
         self, client: Any, local_ed25519: str
     ) -> bool:
         """Re-query the server after share_keys() and verify our ed25519 key matches."""
+        if not client.device_id or self._device_id_unverified:
+            logger.warning(
+                "Matrix: skipping post-upload key verification — "
+                "device_id not yet established"
+            )
+            return True
         try:
             resp = await client.query_keys({client.mxid: [client.device_id]})
             dk = getattr(resp, "device_keys", {}) or {}
@@ -1065,6 +1089,12 @@ class MatrixAdapter(BasePlatformAdapter):
         Returns True if keys are valid or were successfully re-uploaded.
         Returns False if verification fails (caller should refuse E2EE).
         """
+        if not client.device_id or self._device_id_unverified:
+            logger.warning(
+                "Matrix: skipping device key verification — "
+                "device_id not yet established"
+            )
+            return True
         try:
             resp = await client.query_keys({client.mxid: [client.device_id]})
         except Exception as exc:
@@ -1139,6 +1169,13 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the Matrix homeserver and start syncing."""
+        self._device_id_unverified = False
+        if self._client is not None:
+            try:
+                await self.disconnect()
+            except Exception as exc:
+                logger.warning("Matrix: error disconnecting before reconnect: %s", exc)
+
         from mautrix.api import HTTPAPI
         from mautrix.client import Client
         from mautrix.client.state_store import MemoryStateStore, MemorySyncStore
@@ -1188,6 +1225,36 @@ class MatrixAdapter(BasePlatformAdapter):
                 effective_device_id = self._device_id or resolved_device_id
                 if effective_device_id:
                     client.device_id = effective_device_id
+
+                if not client.device_id:
+                    try:
+                        dev_resp = await client.query_keys({client.mxid: []})
+                        all_devices = (
+                            (getattr(dev_resp, "device_keys", {}) or {})
+                            .get(str(client.mxid)) or {}
+                        )
+                        if len(all_devices) == 1:
+                            client.device_id = next(iter(all_devices))
+                        elif len(all_devices) == 0:
+                            logger.warning(
+                                "Matrix: no devices found for %s — "
+                                "key verification will be skipped",
+                                client.mxid,
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "Matrix: device list query failed: %s", exc
+                        )
+
+                if not client.device_id:
+                    logger.warning(
+                        "Matrix: device_id could not be resolved for %s. "
+                        "Set MATRIX_DEVICE_ID for full key verification. "
+                        "E2EE will proceed without server-side device "
+                        "key confirmation.",
+                        client.mxid,
+                    )
+                    self._device_id_unverified = True
 
                 logger.info(
                     "Matrix: using access token for %s%s",
@@ -1409,9 +1476,21 @@ class MatrixAdapter(BasePlatformAdapter):
         # Without this the INVITE handler below never fires.
         client.add_dispatcher(MembershipEventDispatcher)
 
-        client.add_event_handler(EventType.ROOM_MESSAGE, self._on_room_message)
-        client.add_event_handler(EventType.REACTION, self._on_reaction)
-        client.add_event_handler(IntEvt.INVITE, self._on_invite)
+        client.add_event_handler(
+            EventType.ROOM_MESSAGE,
+            self._on_room_message,
+            wait_sync=True,
+        )
+        client.add_event_handler(
+            EventType.REACTION,
+            self._on_reaction,
+            wait_sync=True,
+        )
+        client.add_event_handler(
+            IntEvt.INVITE,
+            self._on_invite,
+            wait_sync=True,
+        )
 
         # Initial sync to catch up, then start background sync.
         self._startup_ts = time.time()
@@ -2220,14 +2299,12 @@ class MatrixAdapter(BasePlatformAdapter):
                 # nio returns SyncError objects (not exceptions) for auth
                 # failures like M_UNKNOWN_TOKEN.  Detect and stop immediately.
                 _sync_msg = getattr(sync_data, "message", None)
-                if _sync_msg and isinstance(_sync_msg, str):
-                    _lower = _sync_msg.lower()
-                    if "m_unknown_token" in _lower or "unknown_token" in _lower:
-                        logger.error(
-                            "Matrix: permanent auth error from sync: %s — stopping",
-                            _sync_msg,
-                        )
-                        return
+                if _is_permanent_auth_error_text(_sync_msg):
+                    logger.error(
+                        "Matrix: permanent auth error from sync: %s — stopping",
+                        _sync_msg,
+                    )
+                    return
 
                 if isinstance(sync_data, dict):
                     self._last_sync_ts = time.time()
@@ -2262,13 +2339,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 if self._closing:
                     return
                 # Detect permanent auth/permission failures.
-                err_str = str(exc).lower()
-                if (
-                    "401" in err_str
-                    or "403" in err_str
-                    or "unauthorized" in err_str
-                    or "forbidden" in err_str
-                ):
+                if _is_permanent_auth_error_text(str(exc)):
                     logger.error(
                         "Matrix: permanent auth error: %s — stopping sync", exc
                     )
@@ -2967,6 +3038,19 @@ class MatrixAdapter(BasePlatformAdapter):
             return True
         except Exception as exc:
             logger.warning("Matrix: error joining %s: %s", room_id, exc)
+            # Abandoned rooms (no current members) surface as "no servers
+            # in the room have been provided" or "room not found". The
+            # pending invite keeps retrying every startup unless we
+            # explicitly leave it. The match is narrow enough that
+            # transient failures still leave the invite untouched for the
+            # next try.
+            msg = str(exc).lower()
+            if ("no servers" in msg) or ("room not found" in msg):
+                try:
+                    await self._client.leave_room(RoomID(room_id))
+                    logger.info("Matrix: declined dead invite to %s", room_id)
+                except Exception:
+                    pass
             return False
 
     def _schedule_invite_join(
