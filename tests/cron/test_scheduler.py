@@ -1086,6 +1086,84 @@ class TestRunJobSessionPersistence:
         assert final_response == "Daily report: 4 PRs merged."
         assert success is True
 
+    def test_run_job_warns_on_truncated_response(self, tmp_path):
+        """When the agent hits its token budget (finish_reason=length), a
+        warning must be appended to the delivered output (issue #56790)."""
+        from run_agent import AIAgent
+        job = {"id": "test-job", "name": "test", "prompt": "hello"}
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "Here is the analysis of your data...",
+                "turn_exit_reason": "text_response(finish_reason=length)",
+            }
+            mock_agent_cls.return_value = mock_agent
+            mock_agent_cls._format_turn_completion_explanation = (
+                AIAgent._format_turn_completion_explanation
+            )
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert "truncated" in final_response.lower()
+        assert "⚠️" in final_response
+        # The original content must still be present.
+        assert "Here is the analysis of your data..." in final_response
+
+    def test_run_job_no_warning_when_finish_reason_stop(self, tmp_path):
+        """A normal response (finish_reason=stop) must NOT get a truncation
+        warning (issue #56790 — false-positive guard)."""
+        from run_agent import AIAgent
+        job = {"id": "test-job", "name": "test", "prompt": "hello"}
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "All tasks completed successfully.",
+                "turn_exit_reason": "text_response(finish_reason=stop)",
+            }
+            mock_agent_cls.return_value = mock_agent
+            mock_agent_cls._format_turn_completion_explanation = (
+                AIAgent._format_turn_completion_explanation
+            )
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert "truncated" not in final_response.lower()
+        assert final_response == "All tasks completed successfully."
+
     def test_run_job_titles_cron_session_from_job_not_important_hint(self, tmp_path):
         # The cron session's first message is the injected "[IMPORTANT: …]"
         # hint, which used to surface as the sidebar/history row label. run_job
@@ -4391,3 +4469,79 @@ class TestCronContinuableSurfaceInChannel:
         store.get_or_create_session.assert_not_called()
         mirror_mock.assert_not_called()
 
+
+class TestMultiTargetDeliveryContinuesOnFailure:
+    """When delivery to one target fails inside the standalone thread-pool
+    fallback, the loop must continue to the remaining targets (#47163).
+
+    The fallback runs inside the `except RuntimeError` block of
+    `_deliver_result`. Before the fix, an exception raised there (SMTP
+    ConnectionError, future.result timeout) escaped the function entirely —
+    it is NOT caught by the sibling `except Exception` — crashing the loop
+    and silently dropping every subsequent target.
+    """
+
+    def _email_cfg(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+        return mock_cfg
+
+    def test_first_target_failure_does_not_crash_loop(self):
+        """First email target fails in the fallback; the second is still attempted."""
+        job = {
+            "id": "multi-email-job",
+            "deliver": "email:a@example.com,email:b@example.com",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
+             patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
+            mock_pool = MagicMock()
+            mock_pool_cls.return_value = mock_pool
+
+            fail_future = MagicMock()
+            fail_future.result.side_effect = ConnectionError("SMTP connection refused")
+            ok_future = MagicMock()
+            ok_future.result.return_value = {"success": True}
+            mock_pool.submit.side_effect = [fail_future, ok_future]
+
+            result = _deliver_result(job, "Report content")
+
+        # Both targets attempted — the loop did not crash after the first failure.
+        assert mock_pool.submit.call_count == 2, (
+            f"expected 2 delivery attempts, got {mock_pool.submit.call_count}"
+        )
+        # First target's failure is surfaced in the returned error string.
+        assert result is not None
+        assert "a@example.com" in result
+        assert "SMTP connection refused" in result
+
+    def test_all_targets_fail_returns_combined_errors(self):
+        """When every target fails, the result reports all of them."""
+        job = {
+            "id": "all-fail-job",
+            "deliver": "email:a@example.com,email:b@example.com",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
+             patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
+            mock_pool = MagicMock()
+            mock_pool_cls.return_value = mock_pool
+
+            fail_future = MagicMock()
+            fail_future.result.side_effect = ConnectionError("connection refused")
+            mock_pool.submit.return_value = fail_future
+
+            result = _deliver_result(job, "Report content")
+
+        assert result is not None
+        assert "a@example.com" in result
+        assert "b@example.com" in result
+        assert mock_pool.submit.call_count == 2
