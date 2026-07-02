@@ -66,6 +66,24 @@ def _install_example_plugin(_isolate_hermes_home):
         shutil.rmtree(dst)
     shutil.copytree(_EXAMPLE_PLUGIN_FIXTURE, dst)
 
+    # The dashboard now gates user-plugin asset serving + backend import
+    # behind the ``plugins.enabled`` allow-list (GHSA-mcfc-hp25-cjv7).
+    # An installed-but-not-enabled user plugin has its API mount skipped
+    # and its assets 404'd — which is the whole point of the gate. These
+    # fixtures exist to exercise the *serving* paths, so opt the example
+    # plugin in exactly as a real operator would with `hermes plugins
+    # enable example`.
+    from hermes_cli.config import load_config, save_config
+    _cfg = load_config()
+    _plugins_cfg = _cfg.setdefault("plugins", {})
+    _enabled = _plugins_cfg.get("enabled")
+    if not isinstance(_enabled, list):
+        _enabled = []
+    if "example" not in _enabled:
+        _enabled.append("example")
+    _plugins_cfg["enabled"] = _enabled
+    save_config(_cfg)
+
     # Snapshot the existing routes BEFORE mounting so we can:
     #   1. Identify the routes the mount call appends.
     #   2. Restore the original list on teardown — otherwise leftover
@@ -373,7 +391,11 @@ class TestWebServerEndpoints:
         fields = self._provider_field_map(data)
         assert fields["mode"]["kind"] == "select"
         assert fields["mode"]["value"] == "cloud"
-        assert {opt["value"] for opt in fields["mode"]["options"]} == {"cloud", "local_external"}
+        assert {opt["value"] for opt in fields["mode"]["options"]} == {
+            "cloud",
+            "local_external",
+            "local_embedded",
+        }
         assert fields["api_url"]["value"] == "https://api.hindsight.vectorize.io"
         assert fields["bank_id"]["value"] == "hermes"
         assert fields["recall_budget"]["value"] == "mid"
@@ -411,7 +433,9 @@ class TestWebServerEndpoints:
             "recall_budget": "high",
         }
 
-    def test_put_memory_provider_config_rejects_unsupported_select_value(self):
+    def test_put_memory_provider_config_accepts_local_embedded_mode(self):
+        from hermes_constants import get_hermes_home
+
         resp = self.client.put(
             "/api/memory/providers/hindsight/config",
             json={
@@ -424,7 +448,11 @@ class TestWebServerEndpoints:
             },
         )
 
-        assert resp.status_code == 400
+        assert resp.status_code == 200
+
+        config_path = get_hermes_home() / "hindsight" / "config.json"
+        provider_config = json.loads(config_path.read_text(encoding="utf-8"))
+        assert provider_config["mode"] == "local_embedded"
 
     def test_put_unknown_memory_provider_returns_404(self):
         resp = self.client.put(
