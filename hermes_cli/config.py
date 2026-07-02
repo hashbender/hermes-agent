@@ -1924,6 +1924,21 @@ DEFAULT_CONFIG = {
         # falls through to request reconstruction rather than breaking
         # the login flow.
         "public_url": "",
+        # Desktop backend memory optimization (idle RSS).  Applies when the
+        # dashboard is spawned by the Electron app (``HERMES_DESKTOP=1``).
+        # CLI/gateway users are unaffected unless they opt in here.
+        "memory": {
+            # ``auto`` — preload mimalloc on macOS/Linux desktop backends;
+            # ``mimalloc`` — always preload; ``system`` — OS allocator only.
+            "allocator": "auto",
+            # Defer stdio MCP child processes (e.g. Playwright) until first
+            # tool call when a schema cache exists (or connect once to build it).
+            "lazy_mcp": True,
+            # Return freed Python heap to the OS after startup / idle ticks.
+            "trim": True,
+            "trim_idle_seconds": 60,
+            "trim_cooldown_seconds": 120,
+        },
     },
 
     # Privacy settings
@@ -2297,6 +2312,7 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
+        "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
