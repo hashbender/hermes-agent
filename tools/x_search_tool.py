@@ -60,6 +60,8 @@ DEFAULT_X_SEARCH_MODEL = "grok-4.20-reasoning"
 DEFAULT_X_SEARCH_TIMEOUT_SECONDS = 180
 DEFAULT_X_SEARCH_RETRIES = 2
 MAX_HANDLES = 10
+MAX_X_SEARCH_RESPONSE_BYTES = 2 * 1024 * 1024
+_RESPONSE_CHUNK_SIZE = 64 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -243,13 +245,56 @@ def _extract_inline_citations(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return citations
 
 
+def _read_response_body_capped(
+    response: requests.Response,
+    *,
+    max_bytes: int = MAX_X_SEARCH_RESPONSE_BYTES,
+) -> bytes:
+    """Read an xAI response body with an explicit byte ceiling."""
+    content_length = response.headers.get("Content-Length") if response.headers else None
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except (TypeError, ValueError):
+            declared_size = None
+        if declared_size is not None and declared_size > max_bytes:
+            raise RuntimeError(
+                "x_search upstream response exceeded size limit "
+                f"({declared_size} bytes > {max_bytes} bytes)"
+            )
+
+    chunks: List[bytes] = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=_RESPONSE_CHUNK_SIZE):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise RuntimeError(
+                "x_search upstream response exceeded size limit "
+                f"({max_bytes} bytes)"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _response_json_capped(response: requests.Response) -> Dict[str, Any]:
+    body = _read_response_body_capped(response)
+    payload = json.loads(body.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("x_search upstream response was not a JSON object")
+    return payload
+
+
 def _http_error_message(exc: requests.HTTPError) -> str:
     response = getattr(exc, "response", None)
     if response is None:
         return str(exc)
 
+    body = b""
     try:
-        payload = response.json()
+        body = _read_response_body_capped(response)
+        payload = json.loads(body.decode("utf-8"))
     except Exception:
         payload = None
 
@@ -261,7 +306,9 @@ def _http_error_message(exc: requests.HTTPError) -> str:
             message = f"{code}: {message}"
         return message or str(exc)
 
-    text = str(getattr(response, "text", "") or "").strip()
+    text = body.decode("utf-8", errors="replace").strip()
+    if not text:
+        text = str(getattr(response, "reason", "") or "").strip()
     if text:
         return text[:500]
     return str(exc)
@@ -339,6 +386,7 @@ def x_search_tool(
                     },
                     json=payload,
                     timeout=timeout_seconds,
+                    stream=True,
                 )
                 response.raise_for_status()
                 break
@@ -367,7 +415,7 @@ def x_search_tool(
         if response is None:
             raise RuntimeError("x_search request did not return a response")
 
-        data = response.json()
+        data = _response_json_capped(response)
 
         answer = _extract_response_text(data)
         citations = list(data.get("citations") or [])
