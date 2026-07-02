@@ -34,6 +34,8 @@ def hermes_home(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def server(hermes_home):
+    # Mocks are scoped to the initial import only (see
+    # tests/tui_gateway/test_protocol.py for the rationale).
     with patch.dict(
         "sys.modules",
         {
@@ -42,12 +44,20 @@ def server(hermes_home):
         },
     ):
         mod = importlib.import_module("tui_gateway.server")
-        yield mod
-        mod._sessions.clear()
-        mod._pending.clear()
-        mod._answers.clear()
-        mod._methods.clear()
-        importlib.reload(mod)
+
+    methods = dict(mod._methods)
+    yield mod
+    # Restore in place instead of the old clear+reload: importlib.reload
+    # re-registers atexit hooks (duplicate ThreadPoolExecutor shutdowns
+    # race the stderr buffer at interpreter exit) and re-captures
+    # module-level paths like _hermes_home against this test's soon-deleted
+    # tmpdir, breaking later files in the same process.
+    mod._methods.clear()
+    mod._methods.update(methods)
+    mod._sessions.clear()
+    mod._pending.clear()
+    mod._answers.clear()
+    mod._db = None
 
 
 @pytest.fixture()
