@@ -100,6 +100,37 @@ _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
 )
 
 
+def _format_exec_approval_fallback_prompt(
+    *,
+    command: str,
+    description: str,
+    typed_command_prefix: str = "/",
+    include_command: bool = True,
+) -> str:
+    """Build the plain-text dangerous-command approval prompt."""
+
+    _p = typed_command_prefix or "/"
+    desc = description or "dangerous command"
+    instructions = (
+        f"Reply `{_p}approve` to execute, `{_p}approve session` to approve this pattern "
+        f"for the session, `{_p}approve always` to approve permanently, or `{_p}deny` to cancel."
+    )
+    if not include_command:
+        return (
+            "⚠️ **Dangerous command requires approval.**\n"
+            f"Reason: {desc}\n\n"
+            f"{instructions}"
+        )
+
+    cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    return (
+        "⚠️ **Dangerous command requires approval:**\n"
+        f"```\n{cmd_preview}\n```\n"
+        f"Reason: {desc}\n\n"
+        f"{instructions}"
+    )
+
+
 def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     """True only for programmatic/local surfaces that must keep raw text."""
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
@@ -17431,14 +17462,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # typed prefix so Slack/Matrix users are told the form they
                 # can actually type (`!approve`) — typed "/" is blocked in
                 # Slack threads and reserved by Matrix clients.
-                _p = getattr(_status_adapter, "typed_command_prefix", "/")
-                cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
-                    f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
-                    f"Reply `{_p}approve` to execute, `{_p}approve session` to approve this pattern "
-                    f"for the session, `{_p}approve always` to approve permanently, or `{_p}deny` to cancel."
+                msg = _format_exec_approval_fallback_prompt(
+                    command=cmd,
+                    description=desc,
+                    typed_command_prefix=getattr(_status_adapter, "typed_command_prefix", "/"),
+                    include_command=progress_mode != "off",
                 )
                 try:
                     _approval_send_fut = safe_schedule_threadsafe(
