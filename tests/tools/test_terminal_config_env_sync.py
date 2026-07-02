@@ -324,23 +324,27 @@ def test_docker_forward_env_is_bridged_everywhere():
     assert "TERMINAL_DOCKER_FORWARD_ENV" in _terminal_tool_env_var_names()
 
 
-def test_tenki_config_is_bridged_everywhere():
-    """Tenki backend config must reach every Hermes entry point."""
-    tenki_keys = {
-        "tenki_image": "TERMINAL_TENKI_IMAGE",
-        "tenki_api_endpoint": "TERMINAL_TENKI_API_ENDPOINT",
-        "tenki_workspace_id": "TERMINAL_TENKI_WORKSPACE_ID",
-        "tenki_project_id": "TERMINAL_TENKI_PROJECT_ID",
-        "tenki_name_prefix": "TERMINAL_TENKI_NAME_PREFIX",
-        "tenki_allow_inbound": "TERMINAL_TENKI_ALLOW_INBOUND",
-        "tenki_allow_outbound": "TERMINAL_TENKI_ALLOW_OUTBOUND",
-        "tenki_max_duration": "TERMINAL_TENKI_MAX_DURATION",
-        "tenki_idle_timeout": "TERMINAL_TENKI_IDLE_TIMEOUT",
-        "tenki_pause_retention": "TERMINAL_TENKI_PAUSE_RETENTION",
-        "tenki_sync_hermes_home": "TERMINAL_TENKI_SYNC_HERMES_HOME",
+def test_apple_container_config_is_bridged_everywhere():
+    """Apple container backend keys must not drift across entry points."""
+    required = {
+        "apple_container_image": "TERMINAL_APPLE_CONTAINER_IMAGE",
+        "apple_container_binary": "TERMINAL_APPLE_CONTAINER_BINARY",
+        "apple_container_volumes": "TERMINAL_APPLE_CONTAINER_VOLUMES",
+        "apple_container_mount_cwd_to_workspace": "TERMINAL_APPLE_CONTAINER_MOUNT_CWD_TO_WORKSPACE",
+        "apple_container_forward_env": "TERMINAL_APPLE_CONTAINER_FORWARD_ENV",
+        "apple_container_env": "TERMINAL_APPLE_CONTAINER_ENV",
+        "apple_container_extra_args": "TERMINAL_APPLE_CONTAINER_EXTRA_ARGS",
+        "apple_container_run_as_host_user": "TERMINAL_APPLE_CONTAINER_RUN_AS_HOST_USER",
+        "apple_container_persist_across_processes": "TERMINAL_APPLE_CONTAINER_PERSIST_ACROSS_PROCESSES",
     }
-    for key, env_var in tenki_keys.items():
-        assert key in _cli_env_map_keys()
-        assert key in _gateway_env_map_keys()
-        assert key in _save_config_env_sync_keys()
-        assert env_var in _terminal_tool_env_var_names()
+
+    cli_keys = _cli_env_map_keys()
+    gateway_keys = _gateway_env_map_keys()
+    save_keys = _save_config_env_sync_keys()
+    terminal_env_vars = _terminal_tool_env_var_names()
+
+    for key, env_var in required.items():
+        assert key in cli_keys
+        assert key in gateway_keys
+        assert key in save_keys
+        assert env_var in terminal_env_vars
