@@ -953,8 +953,29 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
         pct = round((speed - 1.0) * 100)
         kwargs["rate"] = f"{pct:+d}%"
 
+    save_path = output_path
+    explicit_opus = output_path.lower().endswith(".ogg")
+    if explicit_opus:
+        # edge-tts always writes MP3 bytes regardless of the filename. Do not
+        # save those bytes directly under a .ogg extension; write a neighboring
+        # MP3 first, then convert to real Ogg/Opus for Telegram voice delivery.
+        save_path = str(Path(output_path).with_suffix(".mp3"))
+
     communicate = _edge_tts.Communicate(text, **kwargs)
-    await communicate.save(output_path)
+    await communicate.save(save_path)
+
+    if explicit_opus:
+        converted = _convert_to_opus(save_path)
+        if not converted:
+            raise RuntimeError(
+                "Edge TTS requires ffmpeg to write Ogg/Opus output for .ogg paths"
+            )
+        if converted != output_path:
+            os.replace(converted, output_path)
+        try:
+            os.remove(save_path)
+        except OSError:
+            pass
     return output_path
 
 
@@ -2406,6 +2427,11 @@ def text_to_speech_tool(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
+        elif provider == "edge" and file_str.endswith(".ogg"):
+            # _generate_edge_tts only leaves an .ogg here after converting the
+            # MP3 stream to real Ogg/Opus, so an explicit .ogg path is safe to
+            # route as a native voice bubble even outside a session context.
+            voice_compatible = True
         elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
 
