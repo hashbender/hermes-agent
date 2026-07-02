@@ -616,6 +616,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_stepfun,
     _model_flow_bedrock_api_key,
     _model_flow_bedrock,
+    _model_flow_vertex,
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
@@ -3109,6 +3110,8 @@ def select_provider_and_model(args=None):
         _model_flow_stepfun(config, current_model)
     elif selected_provider == "bedrock":
         _model_flow_bedrock(config, current_model)
+    elif selected_provider == "vertex":
+        _model_flow_vertex(config, current_model)
     elif selected_provider == "azure-foundry":
         _model_flow_azure_foundry(config, current_model)
     elif selected_provider in {
@@ -6422,11 +6425,22 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         "hermes-update-autostash-%Y%m%d-%H%M%S"
     )
     print("→ Local changes detected — stashing before update...")
-    subprocess.run(
-        git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
-        cwd=cwd,
-        check=True,
-    )
+    try:
+        subprocess.run(
+            git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
+            cwd=cwd,
+            check=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            "  ⚠ git stash timed out after 120s — skipping auto-stash.\n"
+            "  Your local changes are NOT stashed.  The update will proceed\n"
+            "  without stashing; if git complains, manually stash or reset:\n"
+            "    git stash push --include-untracked\n"
+            "    git reset --hard HEAD"
+        )
+        return None
     stash_ref = subprocess.run(
         git_cmd + ["rev-parse", "--verify", "refs/stash"],
         cwd=cwd,
@@ -11902,7 +11916,7 @@ def _build_provider_choices() -> list[str]:
         # Fallback: static list guarantees the CLI always works
         return [
             "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
-            "anthropic", "gemini", "xai", "bedrock", "azure-foundry",
+            "anthropic", "gemini", "vertex", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
             "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
