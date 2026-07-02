@@ -8,7 +8,6 @@ import os
 import sys
 import subprocess
 import shutil
-import importlib.util
 from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
@@ -198,6 +197,32 @@ def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None
     """Emit a check_fail and append the corresponding fix instruction."""
     check_fail(text, detail)
     issues.append(fix)
+
+
+def _enabled_cli_toolsets_for_doctor() -> set[str] | None:
+    """Return toolsets enabled for the CLI, or None if config resolution fails."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        return {str(toolset) for toolset in _get_platform_tools(load_config() or {}, "cli")}
+    except Exception:
+        return None
+
+
+def _missing_api_key_toolsets_for_summary(unavailable: list[dict]) -> list[dict]:
+    """Filter unavailable API-key toolsets to those enabled for the CLI."""
+    api_key_unavailable = [
+        item for item in unavailable
+        if item.get("missing_vars") or item.get("env_vars")
+    ]
+    enabled_toolsets = _enabled_cli_toolsets_for_doctor()
+    if enabled_toolsets is None:
+        return api_key_unavailable
+    return [
+        item for item in api_key_unavailable
+        if str(item.get("name") or "") in enabled_toolsets
+    ]
 
 
 def _read_pyproject_version() -> str | None:
@@ -730,14 +755,23 @@ def run_doctor(args):
                 pass
             try:
                 from hermes_cli.config import get_compatible_custom_providers as _compatible_custom_providers
+                from hermes_cli.models import _KNOWN_PROVIDER_NAMES as _MODEL_KNOWN_PROVIDER_NAMES
+                from hermes_cli.models import normalize_provider as _normalize_model_provider
                 from hermes_cli.providers import (
-                    normalize_provider as _normalize_catalog_provider,
                     resolve_provider_full as _resolve_provider_full,
                 )
             except Exception:
                 _compatible_custom_providers = None
-                _normalize_catalog_provider = None
+                _MODEL_KNOWN_PROVIDER_NAMES = None
+                _normalize_model_provider = None
                 _resolve_provider_full = None
+
+            if _MODEL_KNOWN_PROVIDER_NAMES is not None:
+                known_providers.update(
+                    str(name).strip().lower()
+                    for name in _MODEL_KNOWN_PROVIDER_NAMES
+                    if str(name).strip()
+                )
 
             custom_providers = []
             if _compatible_custom_providers is not None:
@@ -758,14 +792,20 @@ def run_doctor(args):
 
             valid_provider_ids = set(known_providers)
             provider_ids_to_accept = {provider} if provider else set()
-            if _normalize_catalog_provider is not None:
+            if _normalize_model_provider is not None:
                 for known_provider in known_providers:
                     try:
-                        valid_provider_ids.add(_normalize_catalog_provider(known_provider))
+                        valid_provider_ids.add(_normalize_model_provider(known_provider))
                     except Exception:
                         continue
 
             runtime_provider = provider
+            if provider and _normalize_model_provider is not None:
+                try:
+                    runtime_provider = _normalize_model_provider(provider)
+                    provider_ids_to_accept.add(runtime_provider)
+                except Exception:
+                    runtime_provider = provider
             if (
                 provider
                 and _resolve_auth_provider is not None
@@ -775,9 +815,15 @@ def run_doctor(args):
                     runtime_provider = _resolve_auth_provider(provider)
                     provider_ids_to_accept.add(runtime_provider)
                 except Exception:
-                    runtime_provider = provider
+                    pass
 
             catalog_provider = provider
+            if catalog_provider and _normalize_model_provider is not None:
+                try:
+                    catalog_provider = _normalize_model_provider(catalog_provider)
+                    provider_ids_to_accept.add(catalog_provider)
+                except Exception:
+                    catalog_provider = provider
             if (
                 provider
                 and _resolve_provider_full is not None
@@ -786,13 +832,18 @@ def run_doctor(args):
                 provider_def = _resolve_provider_full(provider, user_providers, custom_providers)
                 catalog_provider = provider_def.id if provider_def is not None else None
                 if catalog_provider is not None:
+                    if _normalize_model_provider is not None:
+                        try:
+                            catalog_provider = _normalize_model_provider(catalog_provider)
+                        except Exception:
+                            pass
                     provider_ids_to_accept.add(catalog_provider)
 
             if provider and provider != "auto":
-                if catalog_provider is None or (
-                    known_providers
-                    and not (provider_ids_to_accept & valid_provider_ids)
-                ):
+                provider_is_known = bool(provider_ids_to_accept & valid_provider_ids)
+                if catalog_provider is not None:
+                    provider_is_known = True
+                if not provider_is_known:
                     known_list = ", ".join(sorted(known_providers)) if known_providers else "(unavailable)"
                     _fail_and_issue(
                         f"model.provider '{provider_raw}' is not a recognised provider",
@@ -820,6 +871,9 @@ def run_doctor(args):
                 "lmstudio",
                 "nous",
                 "nvidia",
+                # Vertex's native model IDs are vendor-prefixed (e.g.
+                # google/gemini-3-flash-preview) by design.
+                "vertex",
             }
             provider_accepts_vendor_slug = (
                 provider_policy_id in providers_accepting_vendor_slugs
@@ -1519,51 +1573,6 @@ def run_doctor(args):
                 issues,
             )
 
-    # Tenki (if using tenki backend)
-    if terminal_env == "tenki":
-        try:
-            from tools.tenki_config import (
-                has_tenki_auth,
-                resolve_tenki_project_id,
-                resolve_tenki_workspace_id,
-            )
-        except Exception:
-            has_tenki_auth = lambda: False  # noqa: E731
-            resolve_tenki_project_id = lambda _explicit="": ""  # noqa: E731
-            resolve_tenki_workspace_id = lambda _explicit="": ""  # noqa: E731
-
-        if has_tenki_auth():
-            check_ok("Tenki auth", "(configured)")
-        else:
-            _fail_and_issue(
-                "Tenki auth not found",
-                "(required for TERMINAL_ENV=tenki)",
-                "Run tenki login or set TENKI_AUTH_TOKEN/TENKI_API_KEY",
-                issues,
-            )
-
-        workspace_id = resolve_tenki_workspace_id(os.getenv("TERMINAL_TENKI_WORKSPACE_ID", ""))
-        project_id = resolve_tenki_project_id(os.getenv("TERMINAL_TENKI_PROJECT_ID", ""))
-        if workspace_id and project_id:
-            check_ok("Tenki workspace/project", "(configured)")
-        else:
-            _fail_and_issue(
-                "Tenki workspace/project not configured",
-                "(required for TERMINAL_ENV=tenki)",
-                "Run tenki login or set terminal.tenki_workspace_id and terminal.tenki_project_id",
-                issues,
-            )
-
-        if importlib.util.find_spec("tenki_sandbox") is not None:
-            check_ok("tenki-sandbox SDK", "(installed)")
-        else:
-            _fail_and_issue(
-                "tenki-sandbox SDK not installed",
-                "(pip install tenki-sandbox==0.1.1)",
-                "Install Tenki SDK: pip install tenki-sandbox==0.1.1",
-                issues,
-            )
-
     # Node.js + agent-browser (for browser automation tools)
     if _safe_which("node"):
         check_ok("Node.js")
@@ -2207,8 +2216,10 @@ def run_doctor(args):
             else:
                 check_warn(item["name"], "(system dependency not met)")
 
-        # Count disabled tools with API key requirements
-        api_disabled = [u for u in unavailable if (u.get("missing_vars") or u.get("env_vars"))]
+        # Count missing API-key requirements only for toolsets enabled in the
+        # current CLI platform. Default-off or explicitly disabled toolsets may
+        # still show warnings above, but should not pollute the final summary.
+        api_disabled = _missing_api_key_toolsets_for_summary(unavailable)
         if api_disabled:
             issues.append("Run 'hermes setup' to configure missing API keys for full tool access")
     except Exception as e:
