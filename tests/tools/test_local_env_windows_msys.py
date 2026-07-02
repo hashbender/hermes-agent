@@ -24,8 +24,10 @@ from unittest.mock import patch
 from tools.environments import local as local_mod
 from tools.environments.local import (
     LocalEnvironment,
+    _make_run_env,
     _msys_to_windows_path,
     _resolve_safe_cwd,
+    _sanitize_subprocess_env,
     _windows_to_msys_path,
 )
 
@@ -267,3 +269,41 @@ class TestWrapCommandWindowsNativeCwd:
 
         assert "builtin cd -- /c/Users/liush 2>/dev/null || true" in captured["script"]
         assert r"C:\Users\liush" not in captured["script"]
+
+
+# ---------------------------------------------------------------------------
+# Windows terminal subprocess env — disable MSYS argv path conversion
+# ---------------------------------------------------------------------------
+
+class TestWindowsMsysPathConversionEnv:
+    def test_make_run_env_disables_msys_arg_path_conversion(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(local_mod, "_resolve_hermes_bin_dir", lambda: None)
+
+        with patch.dict(local_mod.os.environ, {"PATH": r"C:\Windows\System32"}, clear=True):
+            env = _make_run_env({})
+
+        assert env["MSYS_NO_PATHCONV"] == "1"
+
+    def test_make_run_env_respects_explicit_msys_pathconv_override(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(local_mod, "_resolve_hermes_bin_dir", lambda: None)
+
+        with patch.dict(local_mod.os.environ, {"PATH": r"C:\Windows\System32"}, clear=True):
+            env = _make_run_env({"MSYS_NO_PATHCONV": "0"})
+
+        assert env["MSYS_NO_PATHCONV"] == "0"
+
+    def test_sanitize_subprocess_env_disables_msys_arg_path_conversion(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+
+        env = _sanitize_subprocess_env({"PATH": r"C:\Windows\System32"})
+
+        assert env["MSYS_NO_PATHCONV"] == "1"
+
+    def test_non_windows_env_does_not_inject_msys_pathconv(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+
+        env = _sanitize_subprocess_env({"PATH": "/usr/bin"})
+
+        assert "MSYS_NO_PATHCONV" not in env
