@@ -16,7 +16,7 @@ Architecture (two transports):
   **Remote backends (file-based RPC):**
   1. Parent generates `hermes_tools.py` with file-based RPC stubs
   2. Parent ships both files to the remote environment
-  3. Script runs inside the terminal backend (Docker/SSH/Modal/Daytona/Tenki/etc.)
+  3. Script runs inside the terminal backend (Docker/SSH/Modal/Daytona/etc.)
   4. Tool calls are written as request files; a polling thread on the parent
      reads them via env.execute(), dispatches, and writes response files
   5. The script polls for response files and continues
@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import platform
+import secrets
 import shlex
 import socket
 import subprocess
@@ -235,7 +236,7 @@ _TOOL_STUBS = {
     "read_file": (
         "read_file",
         "path: str, offset: int = 1, limit: int = 500",
-        '"""Read a file (1-indexed lines). Returns dict with "content" and "total_lines"."""',
+        '"""Read a file. Returns dict with raw "content" and "total_lines"."""',
         '{"path": path, "offset": offset, "limit": limit}',
     ),
     "write_file": (
@@ -381,7 +382,11 @@ def _connect():
 
 def _call(tool_name, args):
     """Send a tool call to the parent process and return the parsed result."""
-    request = json.dumps({"tool": tool_name, "args": args}) + "\\n"
+    request = json.dumps({
+        "tool": tool_name,
+        "args": args,
+        "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+    }) + "\\n"
     with _call_lock:
         conn = _connect()
         conn.sendall(request.encode())
@@ -434,7 +439,12 @@ def _call(tool_name, args):
     # non-ASCII chars in tool args when encoding them as JSON.
     tmp = req_file + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"tool": tool_name, "args": args, "seq": seq}, f)
+        json.dump({
+            "tool": tool_name,
+            "args": args,
+            "seq": seq,
+            "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+        }, f)
     os.rename(tmp, req_file)
 
     # Wait for response with adaptive polling
@@ -474,6 +484,48 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
 
 
+def _strip_read_file_display_prefixes(content: str) -> str:
+    """Remove read_file's model-facing ``LINE_NUM|`` prefixes.
+
+    The top-level read_file tool returns line-numbered display text because
+    models need stable line references. execute_code exposes a programmatic
+    Python API, and scripts commonly pass read_file()["content"] into
+    write_file(). Returning display text there silently corrupts one-line files
+    as ``1|...``. Keep standard read_file safety checks by dispatching through
+    the normal tool, then strip only the display prefix before handing content
+    to the child script.
+    """
+    if not isinstance(content, str) or "|" not in content:
+        return content
+
+    stripped_lines: list[str] = []
+    for line in content.split("\n"):
+        prefix, sep, rest = line.partition("|")
+        if sep and prefix.isdigit():
+            stripped_lines.append(rest)
+        else:
+            stripped_lines.append(line)
+    return "\n".join(stripped_lines)
+
+
+def _normalize_execute_code_tool_result(tool_name: str, result: str) -> str:
+    """Adjust standard tool results for execute_code's programmatic API."""
+    if tool_name != "read_file":
+        return result
+    try:
+        payload = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        return result
+    if not isinstance(payload, dict) or "error" in payload:
+        return result
+    content = payload.get("content")
+    if isinstance(content, str):
+        payload["content"] = _strip_read_file_display_prefixes(content)
+        payload["content_raw"] = True
+        return json.dumps(payload, ensure_ascii=False)
+    return result
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -482,6 +534,7 @@ def _rpc_server_loop(
     max_tool_calls: int,
     allowed_tools: frozenset,
     stop_event: threading.Event,
+    rpc_token: str,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -524,6 +577,13 @@ def _rpc_server_loop(
                     request = json.loads(line.decode())
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     resp = tool_error(f"Invalid RPC request: {exc}")
+                    conn.sendall((resp + "\n").encode())
+                    continue
+
+                if not rpc_token or not secrets.compare_digest(
+                    str(request.get("token") or ""), rpc_token
+                ):
+                    resp = json.dumps({"error": "Unauthorized RPC request"})
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -570,6 +630,7 @@ def _rpc_server_loop(
                         result = handle_function_call(
                             tool_name, tool_args, task_id=task_id
                         )
+                        result = _normalize_execute_code_tool_result(tool_name, result)
                     finally:
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
                         devnull.close()
@@ -652,15 +713,13 @@ def _get_or_create_env(task_id: str):
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
-        elif env_type == "tenki":
-            image = overrides.get("tenki_image") or config["tenki_image"]
         else:
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "tenki"}:
+        if env_type in {"docker", "singularity", "modal", "daytona"}:
             container_config = {
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
@@ -668,16 +727,6 @@ def _get_or_create_env(task_id: str):
                 "container_persistent": config.get("container_persistent", True),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                "tenki_project_id": config.get("tenki_project_id", ""),
-                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
-                "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
             }
 
         ssh_config = None
@@ -762,6 +811,7 @@ def _rpc_poll_loop(
     max_tool_calls: int,
     allowed_tools: frozenset,
     stop_event: threading.Event,
+    rpc_token: str,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -815,6 +865,13 @@ def _rpc_poll_loop(
                     env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
                     continue
 
+                if not rpc_token or not secrets.compare_digest(
+                    str(request.get("token") or ""), rpc_token
+                ):
+                    logger.debug("Unauthorized RPC request in %s", req_file)
+                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                    continue
+
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
                 seq = request.get("seq", 0)
@@ -854,6 +911,9 @@ def _rpc_poll_loop(
                             sys.stderr = devnull
                             tool_result = handle_function_call(
                                 tool_name, tool_args, task_id=task_id
+                            )
+                            tool_result = _normalize_execute_code_tool_result(
+                                tool_name, tool_result
                             )
                         finally:
                             sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -954,6 +1014,8 @@ def _execute_remote(
             f"mkdir -p {quoted_rpc_dir}", cwd="/", timeout=10,
         )
 
+        rpc_token = secrets.token_urlsafe(32)
+
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
             list(sandbox_tools), transport="file",
@@ -969,7 +1031,7 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event,
+                sandbox_tools, stop_event, rpc_token,
             ),
             daemon=True,
         )
@@ -978,6 +1040,7 @@ def _execute_remote(
         # Build environment variable prefix for the script
         env_prefix = (
             f"HERMES_RPC_DIR={shlex.quote(f'{sandbox_dir}/rpc')} "
+            f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
@@ -1216,6 +1279,7 @@ def execute_code(
             f.write(code)
 
         # --- Start RPC server ---
+        rpc_token = secrets.token_urlsafe(32)
         # Two transports:
         #   POSIX: AF_UNIX stream socket on sock_path, chmod 0600 for
         #   owner-only access.  Filesystem permissions gate the socket.
@@ -1242,7 +1306,7 @@ def execute_code(
             target=propagate_context_to_thread(_rpc_server_loop),
             args=(
                 server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools, stop_event,
+                tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
             ),
             daemon=True,
         )
@@ -1260,6 +1324,7 @@ def execute_code(
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
+        child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
         # Force UTF-8 for the child's stdio and default file encoding.
         #
@@ -1753,7 +1818,7 @@ _TOOL_DOC_LINES = [
      "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
     ("read_file",
      "  read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n"
-     "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
+     "    Returns raw {\"content\": \"...\", \"total_lines\": N}; offset/limit are 1-indexed."),
     ("write_file",
      "  write_file(path: str, content: str) -> dict\n"
      "    Always overwrites the entire file."),
