@@ -33,7 +33,6 @@ import threading
 import time
 import urllib.error
 import urllib.parse
-import zipfile
 
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
 import urllib.request
@@ -57,7 +56,6 @@ from hermes_cli.config import (
     get_hermes_home,
     load_config,
     load_env,
-    read_raw_config,
     save_config,
     save_env_value,
     remove_env_value,
@@ -67,7 +65,6 @@ from hermes_cli.config import (
     recommended_update_command_for_method,
     redact_key,
     write_platform_config_field,
-    _deep_merge,
 )
 from hermes_cli.memory_providers import (
     MemoryProvider,
@@ -548,7 +545,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "terminal.backend": {
         "type": "select",
         "description": "Terminal execution backend",
-        "options": ["local", "docker", "ssh", "modal", "daytona", "tenki", "singularity"],
+        "options": ["local", "docker", "ssh", "modal", "daytona", "singularity"],
     },
     "terminal.modal_mode": {
         "type": "select",
@@ -1911,169 +1908,6 @@ async def fs_default_cwd():
     return {"cwd": cwd, "branch": _fs_git_branch(cwd)}
 
 
-# ---------------------------------------------------------------------------
-# Git ops — the remote half of the desktop coding rail + review pane.
-#
-# The desktop runs these as Electron-local git on the user's machine; over a
-# remote gateway that's the wrong filesystem, so we mirror them here (same auth
-# gate + path hardening as /api/fs). Logic lives in ``hermes_cli.web_git``;
-# these are thin, executor-offloaded wrappers (git/gh can block).
-# ---------------------------------------------------------------------------
-
-from hermes_cli import web_git as _web_git  # noqa: E402
-
-
-async def _git_op(fn, *args):
-    """Run a (blocking) git op off the event loop; map a failed mutation to 400."""
-    loop = asyncio.get_running_loop()
-    try:
-        return await loop.run_in_executor(None, fn, *args)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc) or "git operation failed")
-
-
-def _git_path(path: str) -> str:
-    return str(_fs_path(path))
-
-
-class GitPathBody(BaseModel):
-    path: str
-
-
-class GitFileBody(BaseModel):
-    path: str
-    file: Optional[str] = None
-
-
-class GitCommitBody(BaseModel):
-    path: str
-    message: str
-    push: bool = False
-
-
-class GitWorktreeAddBody(BaseModel):
-    path: str
-    name: Optional[str] = None
-    branch: Optional[str] = None
-    base: Optional[str] = None
-    existingBranch: Optional[str] = None
-
-
-class GitWorktreeRemoveBody(BaseModel):
-    path: str
-    worktreePath: str
-    force: bool = False
-
-
-class GitBranchSwitchBody(BaseModel):
-    path: str
-    branch: str
-
-
-@app.get("/api/git/status")
-async def git_status_route(path: str):
-    return await _git_op(_web_git.repo_status, _git_path(path))
-
-
-@app.get("/api/git/worktrees")
-async def git_worktrees_route(path: str):
-    return {"worktrees": await _git_op(_web_git.worktree_list, _git_path(path))}
-
-
-@app.get("/api/git/branches")
-async def git_branches_route(path: str):
-    return {"branches": await _git_op(_web_git.branch_list, _git_path(path))}
-
-
-@app.get("/api/git/review/list")
-async def git_review_list_route(path: str, scope: str = "uncommitted", base: Optional[str] = None):
-    return await _git_op(_web_git.review_list, _git_path(path), scope, base)
-
-
-@app.get("/api/git/review/diff")
-async def git_review_diff_route(
-    path: str, file: str, scope: str = "uncommitted", base: Optional[str] = None, staged: bool = False
-):
-    return {"diff": await _git_op(_web_git.review_diff, _git_path(path), file, scope, base, staged)}
-
-
-@app.get("/api/git/file-diff")
-async def git_file_diff_route(path: str, file: str):
-    return {"diff": await _git_op(_web_git.file_diff_vs_head, _git_path(path), file)}
-
-
-@app.get("/api/git/review/commit-context")
-async def git_commit_context_route(path: str):
-    return await _git_op(_web_git.review_commit_context, _git_path(path))
-
-
-@app.get("/api/git/review/rev-parse")
-async def git_rev_parse_route(path: str, ref: Optional[str] = None):
-    return {"sha": await _git_op(_web_git.review_rev_parse, _git_path(path), ref)}
-
-
-@app.get("/api/git/review/ship-info")
-async def git_ship_info_route(path: str):
-    return await _git_op(_web_git.review_ship_info, _git_path(path))
-
-
-@app.post("/api/git/review/stage")
-async def git_stage_route(body: GitFileBody):
-    return await _git_op(_web_git.review_stage, _git_path(body.path), body.file)
-
-
-@app.post("/api/git/review/unstage")
-async def git_unstage_route(body: GitFileBody):
-    return await _git_op(_web_git.review_unstage, _git_path(body.path), body.file)
-
-
-@app.post("/api/git/review/revert")
-async def git_revert_route(body: GitFileBody):
-    return await _git_op(_web_git.review_revert, _git_path(body.path), body.file)
-
-
-@app.post("/api/git/review/commit")
-async def git_commit_route(body: GitCommitBody):
-    return await _git_op(_web_git.review_commit, _git_path(body.path), body.message, body.push)
-
-
-@app.post("/api/git/review/push")
-async def git_push_route(body: GitPathBody):
-    return await _git_op(_web_git.review_push, _git_path(body.path))
-
-
-@app.post("/api/git/review/create-pr")
-async def git_create_pr_route(body: GitPathBody):
-    return await _git_op(_web_git.review_create_pr, _git_path(body.path))
-
-
-@app.post("/api/git/worktree/add")
-async def git_worktree_add_route(body: GitWorktreeAddBody):
-    options = {
-        key: value
-        for key, value in {
-            "name": body.name,
-            "branch": body.branch,
-            "base": body.base,
-            "existingBranch": body.existingBranch,
-        }.items()
-        if value
-    }
-    return await _git_op(_web_git.worktree_add, _git_path(body.path), options)
-
-
-@app.post("/api/git/worktree/remove")
-async def git_worktree_remove_route(body: GitWorktreeRemoveBody):
-    return await _git_op(
-        _web_git.worktree_remove, _git_path(body.path), _git_path(body.worktreePath), body.force
-    )
-
-
-@app.post("/api/git/branch/switch")
-async def git_branch_switch_route(body: GitBranchSwitchBody):
-    return await _git_op(_web_git.branch_switch, _git_path(body.path), body.branch)
-
-
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None
@@ -2450,70 +2284,6 @@ async def run_curator():
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to run curator: {exc}")
     return {"ok": True, "pid": proc.pid, "name": "curator-run"}
-
-
-@app.get("/api/learning/graph")
-async def get_learning_graph(profile: Optional[str] = None):
-    """Learning graph payload for the desktop panel.
-
-    Profile-scoped view of learned, non-base skills plus memory chunks, with
-    graph links derived from skill relations and memory-skill overlap.
-    """
-    try:
-        from agent.learning_graph import build_learning_graph
-
-        with _profile_scope(profile):
-            return build_learning_graph()
-    except Exception:
-        _log.exception("GET /api/learning/graph failed")
-        raise HTTPException(status_code=500, detail="Failed to build learning graph")
-
-
-class LearningNodeRef(BaseModel):
-    id: str
-    profile: Optional[str] = None
-
-
-class LearningNodeEdit(BaseModel):
-    id: str
-    content: str
-    profile: Optional[str] = None
-
-
-@app.get("/api/learning/node")
-async def get_learning_node(id: str, profile: Optional[str] = None):
-    """Current content of a journey node (skill SKILL.md or memory chunk), for an edit prefill."""
-    from agent.learning_mutations import node_detail
-
-    with _profile_scope(profile):
-        res = node_detail(id)
-    if not res.get("ok"):
-        raise HTTPException(status_code=404, detail=res.get("message", "not found"))
-    return res
-
-
-@app.delete("/api/learning/node")
-async def delete_learning_node(body: LearningNodeRef):
-    """Delete a journey node — skills are archived (restorable), memories removed."""
-    from agent.learning_mutations import delete_node
-
-    with _profile_scope(body.profile):
-        res = delete_node(body.id)
-    if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("message", "delete failed"))
-    return res
-
-
-@app.put("/api/learning/node")
-async def update_learning_node(body: LearningNodeEdit):
-    """Rewrite a journey node's content (SKILL.md or memory chunk)."""
-    from agent.learning_mutations import edit_node
-
-    with _profile_scope(body.profile):
-        res = edit_node(body.id, body.content)
-    if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("message", "edit failed"))
-    return res
 
 
 def _safe_call(mod, fn_name: str, default):
@@ -2932,15 +2702,8 @@ async def gateway_drain(request: Request):
             detail=f"Unknown drain action {action!r}; expected 'drain' or 'cancel'",
         )
 
-    payload = write_drain_request(
-        principal=str(principal),
-        suppress_notification=bool((body or {}).get("suppress_notification", False)),
-    )
-    _log.info(
-        "Gateway drain BEGIN requested by %s (suppress_notification=%s)",
-        principal,
-        payload["suppress_notification"],
-    )
+    payload = write_drain_request(principal=str(principal))
+    _log.info("Gateway drain BEGIN requested by %s", principal)
     return {
         "ok": True,
         "action": "drain",
@@ -2948,7 +2711,6 @@ async def gateway_drain(request: Request):
         # Echo so a caller polling /api/status knows the marker is now set;
         # the gateway watcher flips gateway_state -> draining within ~1s.
         "draining": drain_requested(),
-        "suppress_notification": payload["suppress_notification"],
     }
 
 
@@ -3219,28 +2981,6 @@ def _elevenlabs_voice_label(voice: Dict[str, Any]) -> str:
     return f"{name} ({category})" if category else name
 
 
-# Collapses repeated identical ElevenLabs voice-list failures (the desktop
-# re-polls on every settings open/focus) to a single log line. Re-arms on
-# success or when the error signature changes, so a real new failure is seen.
-_voice_list_last_error: Optional[str] = None
-
-
-def _voice_list_error_logged_once(signature: Optional[str]) -> bool:
-    """Return True if ``signature`` is new and should be logged now.
-
-    Passing ``None`` clears the latch (call on success). Idempotent per
-    signature: the same error logs once until it changes.
-    """
-    global _voice_list_last_error
-    if signature is None:
-        _voice_list_last_error = None
-        return False
-    if signature == _voice_list_last_error:
-        return False
-    _voice_list_last_error = signature
-    return True
-
-
 @app.get("/api/audio/elevenlabs/voices")
 async def get_elevenlabs_voices():
     """Return ElevenLabs voices when an API key is configured.
@@ -3268,27 +3008,9 @@ async def get_elevenlabs_voices():
                 return json.loads(response.read().decode("utf-8"))
 
         payload = await loop.run_in_executor(None, _fetch)
-    except urllib.error.HTTPError as exc:
-        # An auth failure (bad/expired/scoped key) is a persistent,
-        # user-fixable state, not a transient blip — the desktop polls this on
-        # every settings open/focus, so a per-poll WARNING floods the log
-        # (#voice-list-401-spam). Treat 401/403 as "integration unavailable":
-        # report it to the UI with a 200 and log at most once until the error
-        # signature changes (see _voice_list_error_logged_once).
-        if exc.code in (401, 403):
-            if _voice_list_error_logged_once(f"http-{exc.code}"):
-                _log.info(
-                    "ElevenLabs voices unavailable: %s — check ELEVENLABS_API_KEY", exc
-                )
-            return {"available": False, "voices": [], "error": "unauthorized"}
-        if _voice_list_error_logged_once(f"http-{exc.code}"):
-            _log.warning("ElevenLabs voice list failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Could not load ElevenLabs voices")
     except Exception as exc:
-        if _voice_list_error_logged_once(str(exc)):
-            _log.warning("ElevenLabs voice list failed: %s", exc)
+        _log.warning("ElevenLabs voice list failed: %s", exc)
         raise HTTPException(status_code=502, detail="Could not load ElevenLabs voices")
-    _voice_list_error_logged_once(None)  # success — re-arm logging for next failure
 
     voices = []
     for voice in payload.get("voices") or []:
@@ -3502,7 +3224,7 @@ async def get_sessions(
 
 
 @app.get("/api/profiles/sessions")
-def get_profiles_sessions(
+async def get_profiles_sessions(
     limit: int = 20,
     offset: int = 0,
     min_messages: int = 0,
@@ -4128,8 +3850,14 @@ def get_model_options(profile: Optional[str] = None, refresh: bool = False):
                 include_unconfigured=True,
                 picker_hints=True,
                 canonical_order=True,
-                pricing=True,
-                capabilities=True,
+                # Normal picker opens must return the routable model list fast.
+                # Pricing/capability badges are best-effort metadata and may hit
+                # models.dev / Portal tier checks / provider catalogs; only do
+                # that work on an explicit refresh, with a short degradation
+                # budget so the desktop IPC layer does not hit its 15s timeout.
+                pricing=bool(refresh),
+                capabilities=bool(refresh),
+                enrichment_timeout=2.0 if refresh else None,
                 refresh=bool(refresh),
             )
     except HTTPException:
@@ -4546,56 +4274,6 @@ def _apply_model_assignment_sync(
 
 
 
-def _infer_provider_on_model_change(model_val: str, prev_provider: str) -> tuple[str, str]:
-    """Infer which provider serves ``model_val`` when the flat Config-page Model
-    field changes, given the previously-saved ``prev_provider``.
-
-    Returns ``(provider, model)``; ``provider`` is empty when no switch is
-    warranted (leave the existing provider untouched). Two signals, in order:
-
-    1. Curated-catalog detection (``detect_provider_for_model``) — handles the
-       ~28 OpenRouter-curated models and direct provider-static catalogs.
-    2. Vendor-slug heuristic — a ``vendor/model`` slug cannot belong to a
-       single-model / non-aggregator provider (e.g. ``ollama-local``). When the
-       current provider is not an aggregator that serves vendor-prefixed slugs,
-       route to an aggregator. ``_normalize_main_model_assignment`` (called by
-       the caller) keeps the user's current aggregator when they're already on
-       one, else falls back to openrouter — the same chokepoint logic as
-       ``POST /api/model/set``.
-    """
-    name = (model_val or "").strip()
-    if not name:
-        return "", name
-    try:
-        from hermes_cli.models import (
-            _AGGREGATOR_PROVIDERS,
-            detect_provider_for_model,
-            normalize_provider,
-        )
-    except Exception:
-        return "", name
-
-    try:
-        detected = detect_provider_for_model(name, prev_provider)
-    except Exception:
-        detected = None
-    if detected:
-        return detected[0], detected[1]
-
-    # Vendor-prefixed slug under a non-aggregator provider → reassign. Use a
-    # sentinel "openrouter" here; _normalize_main_model_assignment resolves the
-    # real aggregator (keeps a current aggregator, else openrouter).
-    if "/" in name:
-        try:
-            cur_is_aggregator = normalize_provider(prev_provider) in _AGGREGATOR_PROVIDERS
-        except Exception:
-            cur_is_aggregator = False
-        if not cur_is_aggregator:
-            return "openrouter", name
-
-    return "", name
-
-
 def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
     """Reverse _normalize_config_for_web before saving.
 
@@ -4628,31 +4306,6 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
             disk_config = load_config()
             disk_model = disk_config.get("model")
             if isinstance(disk_model, dict):
-                prev_default = str(disk_model.get("default") or "").strip()
-                prev_provider = str(disk_model.get("provider") or "").strip()
-                # When the model name actually changed, re-detect which
-                # provider serves it. The Config-page Model field is a flat
-                # string with no provider info, so without this a user who
-                # picks an OpenRouter model while their default provider is
-                # ollama-local keeps the stale provider and 404s. Only fires
-                # on a real model change so saving unrelated config fields
-                # never overwrites an explicit provider.
-                if model_val != prev_default and prev_provider:
-                    new_provider, resolved_model = _infer_provider_on_model_change(
-                        model_val, prev_provider
-                    )
-                    if new_provider and new_provider.strip().lower() != prev_provider.lower():
-                        # Route through the canonical assignment chokepoints so
-                        # the model is normalized for the new provider and stale
-                        # base_url/api_mode/api_key are cleared on the switch
-                        # (and preserved on a same-provider re-pick).
-                        norm_provider, norm_model = _normalize_main_model_assignment(
-                            new_provider, resolved_model
-                        )
-                        disk_model = _apply_main_model_assignment(
-                            disk_model, norm_provider, norm_model
-                        )
-                        model_val = norm_model
                 # Preserve all subkeys, update default with the new value
                 disk_model["default"] = model_val
                 # Write context_length into the model dict (0 = remove/auto)
@@ -4677,15 +4330,7 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
 async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
     try:
         with _profile_scope(body.profile or profile):
-            # The dashboard form is schema-driven (see CONFIG_SCHEMA). Any root
-            # key absent from the schema — most visibly ``custom_providers``, but
-            # also ``agent.personalities``, ``terminal.lifetime_seconds``, etc. —
-            # is not sent in the PUT body. A full-replace save would silently
-            # drop those keys. Deep-merge incoming over what's on disk so the
-            # frontend can only overwrite what it explicitly sends.
-            existing = read_raw_config()
-            incoming = _denormalize_config_from_web(body.config)
-            save_config(_deep_merge(existing, incoming))
+            save_config(_denormalize_config_from_web(body.config))
         return {"ok": True}
     except HTTPException:
         raise
@@ -4789,7 +4434,7 @@ async def get_env_vars(profile: Optional[str] = None):
     channel_keys = _channel_managed_env_keys()
     catalog_meta = _catalog_provider_env_metadata()
 
-    def _row(var_name: str, info: dict, *, custom: bool = False) -> dict:
+    def _row(var_name: str, info: dict) -> dict:
         value = env_on_disk.get(var_name)
         cat_meta = catalog_meta.get(var_name) or {}
         # Hand OPTIONAL_ENV_VARS prose wins where present; the catalog fills any
@@ -4812,12 +4457,6 @@ async def get_env_vars(profile: Optional[str] = None):
             # CLI `hermes model` picker uses (not desktop-only prefix guesses).
             "provider": cat_meta.get("provider", ""),
             "provider_label": cat_meta.get("provider_label", ""),
-            # True when this key exists in the user's .env but is NOT in any
-            # catalog (OPTIONAL_ENV_VARS or the provider catalog) — an
-            # arbitrary/custom env var the user added directly. Surfaced so the
-            # Keys page can list (and let the user manage) them instead of
-            # hiding everything it doesn't recognise.
-            "custom": custom,
         }
 
     result = {}
@@ -4829,19 +4468,6 @@ async def get_env_vars(profile: Optional[str] = None):
     for var_name in catalog_meta:
         if var_name not in result:
             result[var_name] = _row(var_name, {})
-    # Surface arbitrary/custom keys the user set in .env that aren't in any
-    # catalog. These are always "set" (they're on disk). Treated as secrets by
-    # default (is_password=True → redacted, reveal-gated) since an unrecognised
-    # key could hold anything. Channel-managed credentials are excluded — those
-    # belong to the Channels page. This makes the "add a custom key" surface
-    # round-trip: a key added there reappears here under its own section.
-    for var_name in env_on_disk:
-        if var_name in result or var_name in channel_keys:
-            continue
-        row = _row(var_name, {}, custom=True)
-        row["category"] = "custom"
-        row["is_password"] = True
-        result[var_name] = row
     return result
 
 
@@ -8254,139 +7880,15 @@ async def get_logs(
 
 
 class CronJobCreate(BaseModel):
-    prompt: str = ""
+    prompt: str
     schedule: str
     name: str = ""
     deliver: str = "local"
     skills: Optional[List[str]] = None
-    model: Optional[str] = None
-    provider: Optional[str] = None
-    base_url: Optional[str] = None
-    script: Optional[str] = None
-    context_from: Optional[Any] = None
-    enabled_toolsets: Optional[List[str]] = None
-    workdir: Optional[str] = None
-    no_agent: bool = False
 
 
 class CronJobUpdate(BaseModel):
     updates: dict
-
-
-def _cron_optional_text(value: Any, *, strip_trailing_slash: bool = False) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if strip_trailing_slash:
-        text = text.rstrip("/")
-    return text or None
-
-
-def _cron_string_list(value: Any) -> Optional[List[str]]:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        raw_items = re.split(r"[\n,]", value)
-    elif isinstance(value, (list, tuple)):
-        raw_items = value
-    else:
-        return None
-    items = [str(item).strip() for item in raw_items if str(item).strip()]
-    return items or None
-
-
-def _normalize_dashboard_cron_script(value: Any, profile_home: Path) -> Optional[str]:
-    """Validate a dashboard-selected cron script against the profile sandbox."""
-    text = _cron_optional_text(value)
-    if not text:
-        return None
-
-    scripts_root = (profile_home / "scripts").resolve()
-    raw_path = Path(text).expanduser()
-    candidate = raw_path.resolve() if raw_path.is_absolute() else (scripts_root / raw_path).resolve()
-    try:
-        relative = candidate.relative_to(scripts_root)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"script must be inside {scripts_root}",
-        ) from exc
-    if not candidate.exists():
-        raise HTTPException(status_code=400, detail=f"script does not exist: {candidate}")
-    if not candidate.is_file():
-        raise HTTPException(status_code=400, detail=f"script is not a file: {candidate}")
-    return str(relative)
-
-
-def _validate_dashboard_cron_effective_job(job: Dict[str, Any]) -> None:
-    prompt = _cron_optional_text(job.get("prompt"))
-    script = _cron_optional_text(job.get("script"))
-    skills = _cron_string_list(job.get("skills")) or _cron_string_list(job.get("skill"))
-    no_agent = bool(job.get("no_agent"))
-
-    if no_agent:
-        if not script:
-            raise HTTPException(
-                status_code=400,
-                detail="no_agent=True requires a script",
-            )
-        return
-
-    if not (prompt or skills or script):
-        raise HTTPException(
-            status_code=400,
-            detail="agent cron jobs require a prompt, skill, or script",
-        )
-
-
-def _normalize_dashboard_cron_updates(
-    updates: Dict[str, Any],
-    profile_home: Path,
-) -> Dict[str, Any]:
-    """Normalize dashboard JSON into cron.jobs.update_job's storage shape.
-
-    This intentionally stays in the dashboard adapter layer: cron/jobs.py is the
-    source of truth for scheduling behaviour; the dashboard only translates form
-    payloads into the shapes that existing core functions already accept.
-    """
-    normalized = dict(updates or {})
-
-    for key in ("model", "provider", "workdir"):
-        if key in normalized:
-            normalized[key] = _cron_optional_text(normalized[key])
-    if "script" in normalized:
-        normalized["script"] = _normalize_dashboard_cron_script(
-            normalized["script"],
-            profile_home,
-        )
-    if "base_url" in normalized:
-        normalized["base_url"] = _cron_optional_text(
-            normalized["base_url"], strip_trailing_slash=True
-        )
-    if "deliver" in normalized:
-        normalized["deliver"] = _cron_optional_text(normalized["deliver"]) or "local"
-    if "context_from" in normalized:
-        normalized["context_from"] = _cron_string_list(normalized["context_from"])
-    if "enabled_toolsets" in normalized:
-        normalized["enabled_toolsets"] = _cron_string_list(normalized["enabled_toolsets"])
-    return normalized
-
-
-def _validate_dashboard_cron_context_from(
-    refs: Optional[List[str]],
-    profile_name: str,
-) -> None:
-    if not refs:
-        return
-    for ref in refs:
-        if not _call_cron_for_profile(profile_name, "get_job", ref):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"context_from job '{ref}' not found in profile "
-                    f"'{profile_name}'"
-                ),
-            )
 
 
 _CRON_PROFILE_LOCK = threading.RLock()
@@ -8426,7 +7928,7 @@ def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[st
     return annotated
 
 
-def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args, **kwargs):
+def _call_cron_for_profile(profile: Optional[str], func_name: str, *args, **kwargs):
     """Run cron.jobs helpers against the selected profile's cron directory.
 
     cron.jobs keeps CRON_DIR/JOBS_FILE/OUTPUT_DIR as module globals resolved
@@ -8434,18 +7936,13 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
     process that can inspect many profiles, so temporarily retarget those
     globals while holding a lock and restore them immediately after the call.
     """
-    profile_name, home = _cron_profile_home(target_profile)
+    profile_name, home = _cron_profile_home(profile)
     with _CRON_PROFILE_LOCK:
         from cron import jobs as cron_jobs
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
-        )
 
         old_cron_dir = cron_jobs.CRON_DIR
         old_jobs_file = cron_jobs.JOBS_FILE
         old_output_dir = cron_jobs.OUTPUT_DIR
-        token = set_hermes_home_override(str(home))
         cron_jobs.CRON_DIR = home / "cron"
         cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
         cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
@@ -8455,7 +7952,6 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
             cron_jobs.CRON_DIR = old_cron_dir
             cron_jobs.JOBS_FILE = old_jobs_file
             cron_jobs.OUTPUT_DIR = old_output_dir
-            reset_hermes_home_override(token)
 
     if isinstance(result, list):
         return [_annotate_cron_job(j, profile_name, home) for j in result]
@@ -8553,37 +8049,15 @@ async def list_cron_job_runs(job_id: str, profile: Optional[str] = None, limit: 
 @app.post("/api/cron/jobs")
 async def create_cron_job(body: CronJobCreate, profile: str = "default"):
     try:
-        profile_name, profile_home = _cron_profile_home(profile)
-        script = _normalize_dashboard_cron_script(body.script, profile_home)
-        skills = _cron_string_list(body.skills)
-        context_from = _cron_string_list(body.context_from)
-        _validate_dashboard_cron_context_from(context_from, profile_name)
-        no_agent = bool(body.no_agent)
-        _validate_dashboard_cron_effective_job({
-            "prompt": body.prompt,
-            "skills": skills,
-            "script": script,
-            "no_agent": no_agent,
-        })
         return _call_cron_for_profile(
-            profile_name,
+            profile,
             "create_job",
-            prompt=body.prompt or "",
+            prompt=body.prompt,
             schedule=body.schedule,
             name=body.name,
-            deliver=_cron_optional_text(body.deliver) or "local",
-            skills=skills,
-            model=_cron_optional_text(body.model),
-            provider=_cron_optional_text(body.provider),
-            base_url=_cron_optional_text(body.base_url, strip_trailing_slash=True),
-            script=script,
-            context_from=context_from,
-            enabled_toolsets=_cron_string_list(body.enabled_toolsets),
-            workdir=_cron_optional_text(body.workdir),
-            no_agent=no_agent,
+            deliver=body.deliver,
+            skills=body.skills,
         )
-    except HTTPException:
-        raise
     except Exception as e:
         _log.exception("POST /api/cron/jobs failed")
         raise HTTPException(status_code=400, detail=str(e))
@@ -8623,28 +8097,7 @@ async def update_cron_job(job_id: str, body: CronJobUpdate, profile: Optional[st
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
-        profile_name, profile_home = _cron_profile_home(selected)
-        existing = _call_cron_for_profile(profile_name, "get_job", job_id)
-        if not existing:
-            raise HTTPException(status_code=404, detail="Job not found")
-        updates = _normalize_dashboard_cron_updates(
-            body.updates,
-            profile_home,
-        )
-        if "context_from" in updates:
-            _validate_dashboard_cron_context_from(
-                updates.get("context_from"),
-                profile_name,
-            )
-        execution_fields = {"prompt", "skill", "skills", "script", "no_agent"}
-        if execution_fields.intersection(updates):
-            effective = {**existing, **updates}
-            if "skills" in updates and "skill" not in updates:
-                effective["skill"] = None
-            _validate_dashboard_cron_effective_job(effective)
-        job = _call_cron_for_profile(profile_name, "update_job", job_id, updates)
-    except HTTPException:
-        raise
+        job = _call_cron_for_profile(selected, "update_job", job_id, body.updates)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not job:
@@ -9723,63 +9176,17 @@ class BackupRequest(BaseModel):
     output: Optional[str] = None
 
 
-def _dashboard_backup_dir() -> Path:
-    return get_hermes_home() / "backups"
-
-
-def _new_dashboard_backup_path() -> Path:
-    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-    return _dashboard_backup_dir() / f"hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
-
-
 @app.post("/api/ops/backup")
 async def run_backup(body: BackupRequest):
     args = ["backup"]
-    archive: Optional[Path] = None
     if body.output:
         args.append(body.output.strip())
-    else:
-        archive = _new_dashboard_backup_path()
-        try:
-            archive.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Could not create backup directory: {exc}",
-            )
-        args.append(str(archive))
     try:
         proc = _spawn_hermes_action(args, "backup")
     except Exception as exc:
         _log.exception("Failed to spawn backup")
         raise HTTPException(status_code=500, detail=f"Failed to run backup: {exc}")
-    response = {"ok": True, "pid": proc.pid, "name": "backup"}
-    if archive is not None:
-        response["archive"] = str(archive)
-    return response
-
-
-@app.get("/api/ops/backup/download")
-async def download_dashboard_backup(archive: str):
-    try:
-        backup_dir = _dashboard_backup_dir().expanduser().resolve(strict=False)
-        target = Path(archive).expanduser().resolve(strict=True)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Backup not found")
-    except (OSError, RuntimeError):
-        raise HTTPException(status_code=400, detail="Invalid backup path")
-
-    if not _path_is_under(backup_dir, target):
-        raise HTTPException(status_code=403, detail="Backup is outside the dashboard backup directory")
-    if not target.is_file():
-        raise HTTPException(status_code=404, detail="Backup not found")
-
-    return FileResponse(
-        path=str(target),
-        media_type="application/zip",
-        filename=target.name,
-        content_disposition_type="attachment",
-    )
+    return {"ok": True, "pid": proc.pid, "name": "backup"}
 
 
 class ImportRequest(BaseModel):
@@ -9810,94 +9217,6 @@ async def run_import(body: ImportRequest):
         _log.exception("Failed to spawn import")
         raise HTTPException(status_code=500, detail=f"Failed to run import: {exc}")
     return {"ok": True, "pid": proc.pid, "name": "import"}
-
-
-def _safe_backup_upload_name(filename: str | None) -> str:
-    name = Path(filename or "backup.zip").name.strip()
-    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
-    if not name:
-        name = "backup.zip"
-    if not name.lower().endswith(".zip"):
-        name = f"{name}.zip"
-    return name
-
-
-@app.post("/api/ops/import-upload")
-async def run_import_upload(
-    file: UploadFile = File(...),
-    force: bool = Form(False),
-):
-    staging_dir = _dashboard_backup_dir()
-    try:
-        staging_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not create import staging directory: {exc}",
-        )
-
-    safe_name = _safe_backup_upload_name(file.filename)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    target = staging_dir / f"dashboard-import-{stamp}-{secrets.token_hex(4)}-{safe_name}"
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=".upload",
-        dir=str(staging_dir),
-    )
-    tmp_path = Path(tmp_name)
-    total = 0
-    renamed = False
-    try:
-        with os.fdopen(tmp_fd, "wb") as out:
-            while True:
-                chunk = await file.read(_UPLOAD_CHUNK_BYTES)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > _MANAGED_FILE_MAX_BYTES:
-                    raise HTTPException(status_code=413, detail="Archive is too large")
-                out.write(chunk)
-        os.replace(tmp_path, target)
-        renamed = True
-    except HTTPException:
-        raise
-    except PermissionError:
-        raise HTTPException(
-            status_code=403,
-            detail="Import staging directory is not writable",
-        )
-    except OSError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not write uploaded archive: {exc}",
-        )
-    finally:
-        if not renamed:
-            tmp_path.unlink(missing_ok=True)
-        await file.close()
-
-    if not zipfile.is_zipfile(target):
-        target.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded archive is not a valid zip file",
-        )
-
-    args = ["import", str(target)]
-    if force:
-        args.append("--force")
-    try:
-        proc = _spawn_hermes_action(args, "import")
-    except Exception as exc:
-        _log.exception("Failed to spawn import")
-        raise HTTPException(status_code=500, detail=f"Failed to run import: {exc}")
-    return {
-        "ok": True,
-        "pid": proc.pid,
-        "name": "import",
-        "archive": str(target),
-        "uploaded_bytes": total,
-    }
 
 
 @app.get("/api/ops/hooks")
@@ -10791,9 +10110,7 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
 async def list_profiles_endpoint():
     from hermes_cli import profiles as profiles_mod
     try:
-        loop = asyncio.get_running_loop()
-        profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
-        return {"profiles": [_profile_to_dict(p) for p in profiles]}
+        return {"profiles": [_profile_to_dict(p) for p in profiles_mod.list_profiles()]}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
         return {"profiles": _fallback_profile_dicts(profiles_mod)}
@@ -12619,54 +11936,26 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # --- reader task: PTY master → WebSocket ----------------------------
     async def pump_pty_to_ws() -> None:
-        try:
-            while True:
-                chunk = await loop.run_in_executor(
-                    None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
-                )
-                if chunk is None:  # EOF
-                    return
-                if not chunk:  # no data this tick; yield control and retry
-                    await asyncio.sleep(0)
-                    continue
-                try:
-                    await ws.send_bytes(chunk)
-                except Exception:
-                    return
-        finally:
-            # The child has exited (EOF) or the send side broke.  Close the
-            # WebSocket so the writer loop's ``ws.receive()`` returns instead
-            # of blocking forever — otherwise, when the browser's socket is
-            # half-open (no FIN delivered, common on macOS/launchd) the
-            # handler never reaches its ``finally`` and the PTY's fds leak.
-            # With dashboard auto-reconnect (#52962) every dropped socket then
-            # stacks a fresh PTY on top of the orphaned one, exhausting fds.
-            #
-            # Reap the bridge here too (close() is idempotent): on child EOF the
-            # writer loop's ``finally`` is the usual closer, but if the handler
-            # task is cancelled the instant we close the WS, that ``finally``
-            # can be skipped, leaking the PTY. Closing from the EOF path makes
-            # the reap independent of that cancellation race (#54028).
+        while True:
+            chunk = await loop.run_in_executor(
+                None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
+            )
+            if chunk is None:  # EOF
+                return
+            if not chunk:  # no data this tick; yield control and retry
+                await asyncio.sleep(0)
+                continue
             try:
-                await asyncio.to_thread(bridge.close)
+                await ws.send_bytes(chunk)
             except Exception:
-                pass
-            try:
-                await ws.close()
-            except Exception:
-                pass
+                return
 
     reader_task = asyncio.create_task(pump_pty_to_ws())
 
     # --- writer loop: WebSocket → PTY master ----------------------------
     try:
         while True:
-            try:
-                msg = await ws.receive()
-            except RuntimeError:
-                # Raised when ws.receive() is called after the socket is
-                # already disconnected (e.g. closed by the reader task above).
-                break
+            msg = await ws.receive()
             msg_type = msg.get("type")
             if msg_type == "websocket.disconnect":
                 break
@@ -14107,15 +13396,6 @@ def start_server(
     # For explicit non-zero ports, if the port is taken uvicorn catches
     # OSError inside create_server() and exits with a clear error — no
     # separate preflight probe needed.
-    # Loopback binds are the Desktop case: a single local client, no reverse
-    # proxy in front. A GIL-heavy agent turn can stall the event loop past 20s,
-    # and uvicorn's ws keepalive ping runs on that same starved loop — so a
-    # 20s ping timeout kills an otherwise-healthy local connection over a
-    # recoverable stall (QW-1). Give loopback a longer 60s timeout / 30s
-    # interval to ride out those stalls. Non-loopback binds sit behind a
-    # Cloudflare Tunnel (idle timeout ~100s), so keep them at 20/20 to detect
-    # half-open connections promptly and stay under the tunnel's idle window.
-    _is_loopback = host in ("127.0.0.1", "localhost", "::1")
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
@@ -14129,9 +13409,9 @@ def start_server(
         # Detect half-open WS connections (reverse-proxy 524, dropped
         # tunnels) within ~20-40s so WebSocketDisconnect fires the
         # disconnect→reap path.  20s stays under Cloudflare Tunnel's idle
-        # timeout, keeping it warm.  Loopback gets a longer window (see above).
-        ws_ping_interval=30.0 if _is_loopback else 20.0,
-        ws_ping_timeout=60.0 if _is_loopback else 20.0,
+        # timeout, keeping it warm.
+        ws_ping_interval=20.0,
+        ws_ping_timeout=20.0,
     )
     server = uvicorn.Server(config)
 
@@ -14153,48 +13433,6 @@ def start_server(
             print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)
             print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
-
-            # Collapse the peer-hangup teardown flood (#50005). When the Desktop
-            # forcibly closes its WebSocket mid-write, asyncio logs a full
-            # traceback per pending connection-lost callback — 50+ identical
-            # WinError 10054 (ConnectionResetError) lines per disconnect on
-            # Windows. This filter downgrades exactly that class to one debug
-            # line and passes every other loop error through unchanged.
-            try:
-                from tui_gateway.loop_noise import install_loop_noise_filter
-
-                install_loop_noise_filter(asyncio.get_running_loop())
-            except Exception as exc:  # pragma: no cover - best-effort
-                _log.debug("loop noise filter install skipped: %s", exc)
-
-            # ── Loop heartbeat watchdog (CF-1) ───────────────────────────
-            # Confirm the GIL-pressure hypothesis in production. Re-arm a 2s
-            # tick and measure the drift between when it *should* fire and
-            # when it actually does: a healthy loop drifts ~0, but a turn that
-            # holds the GIL blocks the loop and the next tick fires late by the
-            # stall duration. We log that so a stalled-loop WS drop is
-            # diagnosable from the gateway log. Uses loop.time() (monotonic)
-            # for drift, and call_later (not a task) so it dies with the loop —
-            # nothing to cancel on shutdown.
-            _hb_interval = 2.0
-            _hb_stall_threshold = 5.0
-            _hb_loop = asyncio.get_running_loop()
-
-            def _loop_heartbeat(expected: float) -> None:
-                now = _hb_loop.time()
-                drift = now - expected
-                if drift > _hb_stall_threshold:
-                    _log.warning(
-                        "event loop stalled %.1fs (GIL pressure suspected)",
-                        drift,
-                    )
-                _hb_loop.call_later(
-                    _hb_interval, _loop_heartbeat, now + _hb_interval
-                )
-
-            _hb_loop.call_later(
-                _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
-            )
 
             await server.main_loop()
             if server.started:
