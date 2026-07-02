@@ -427,6 +427,14 @@ class SlackAdapter(BasePlatformAdapter):
     # the prefix that works everywhere — instruction text must show it.
     typed_command_prefix = "!"
 
+    # Slack has both halves the ``in_channel`` continuable-cron surface needs:
+    # a flat-reply outbound gate (``reply_in_thread: false`` → ``_resolve_thread_ts``
+    # returns None for top-level channel messages) AND a whole-channel inbound
+    # session bucket keyed ``(platform, channel_id, None)`` (the same
+    # ``reply_in_thread: false`` path in ``_handle_slack_message``).  So a
+    # continuable cron delivered flat here continues in-context on a plain reply.
+    supports_inchannel_continuable = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
         self._app: Optional[Any] = None
@@ -1073,6 +1081,7 @@ class SlackAdapter(BasePlatformAdapter):
 
                 self._warn_if_missing_group_dm_scopes(auth_response, team_name)
                 self._warn_if_not_bot_token(auth_response, team_name)
+                self._warn_if_inchannel_without_flat_reply(team_name)
 
             # Register message event handler
             @self._app.event("message")
@@ -1089,6 +1098,10 @@ class SlackAdapter(BasePlatformAdapter):
             @self._app.event("app_mention")
             async def handle_app_mention(event, say):
                 await self._handle_slack_message(event)
+
+            @self._app.event("app_home_opened")
+            async def handle_app_home_opened(event, say):
+                await self._handle_app_home_opened(event)
 
             # File lifecycle events can arrive around snippet uploads even when
             # the actual user message is what we care about. Ack them so Slack
@@ -1561,6 +1574,62 @@ class SlackAdapter(BasePlatformAdapter):
         if raw is None:
             return True  # default: each DM thread is its own session
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _cron_continuable_surface(self) -> str:
+        """Resolve the continuable-cron delivery surface for this platform.
+
+        Values: ``"thread"`` (default — today's behaviour: a continuable cron
+        job opens a dedicated hidden thread and seeds it) or ``"in_channel"``
+        (deliver FLAT into the channel timeline; the shared-channel session
+        ``(slack, channel_id, None)`` is the continuation surface).  Set
+        ``platforms.slack.extra.cron_continuable_surface: in_channel`` in
+        config.yaml.  Pair with ``reply_in_thread: false`` so the user's reply
+        is answered flat in the channel and keyed to the same shared session —
+        see ``_warn_if_inchannel_without_flat_reply``.  Any unrecognised value
+        coerces to ``"thread"`` (fail safe).
+        """
+        raw = self.config.extra.get("cron_continuable_surface")
+        if raw is None:
+            return "thread"
+        val = str(raw).strip().lower()
+        return "in_channel" if val == "in_channel" else "thread"
+
+    def _warn_if_inchannel_without_flat_reply(self, team_name: str) -> None:
+        """Warn when ``in_channel`` is set without the required ``reply_in_thread: false`` pairing.
+
+        The two knobs are orthogonal (D4/D5): ``cron_continuable_surface:
+        in_channel`` skips thread creation on delivery, and ``reply_in_thread:
+        false`` makes the bot answer inbound channel messages flat and key them
+        to the whole-channel session ``(slack, channel_id, None)``.  For a
+        continuable in-channel cron to actually continue on a plain reply, BOTH
+        must hold: the seed lands in the shared-channel session, and the reply
+        must resolve to (and be answered in) that same flat session.
+
+        Enforcement is WARN, not hard-require (D5): the misconfiguration fails
+        SAFE — ``in_channel`` without ``reply_in_thread: false`` yields a
+        threaded continuation (≈ today's behaviour), never a dropped/orphaned
+        session — so a config-load rejection would be heavier than warranted
+        and would make the two knobs non-orthogonal.  Mirrors the existing
+        connect-time warning pattern (``_warn_if_missing_group_dm_scopes``,
+        ``_warn_if_not_bot_token``).
+        """
+        try:
+            if self._cron_continuable_surface() != "in_channel":
+                return
+            # reply_in_thread defaults True (legacy: reply in a thread).
+            if self.config.extra.get("reply_in_thread", True):
+                logger.warning(
+                    "[Slack] %s: cron_continuable_surface=in_channel is set "
+                    "WITHOUT reply_in_thread=false. A continuable in-channel "
+                    "cron job will deliver flat, but the bot will still reply "
+                    "to your continuation in a thread — so it falls back to a "
+                    "threaded continuation (\u2248 default behaviour), not the "
+                    "flat channel session you asked for. Set "
+                    "platforms.slack.extra.reply_in_thread: false to pair them.",
+                    team_name,
+                )
+        except Exception:
+            pass
 
     def _resolve_thread_ts(
         self,
@@ -2437,11 +2506,64 @@ class SlackAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
 
+    def _seed_agent_dm_session(self, metadata: Dict[str, str]) -> None:
+        """Prime the session store when Slack reports a user opened the DM.
+
+        In Slack's Agent messaging experience, ``app_home_opened`` with
+        ``tab == "messages"`` replaces ``assistant_thread_started`` as the
+        "user opened the DM" signal. It is only a lifecycle signal: do not send
+        a welcome message or enter the agent loop from this event.
+        """
+        session_store = getattr(self, "_session_store", None)
+        if not session_store:
+            return
+
+        channel_id = metadata.get("channel_id", "")
+        user_id = metadata.get("user_id", "")
+        if not channel_id or not user_id:
+            return
+
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_name=channel_id,
+            chat_type="dm",
+            user_id=user_id,
+        )
+
+        try:
+            session_store.get_or_create_session(source)
+        except Exception:
+            logger.debug(
+                "[Slack] Failed to seed agent DM session for %s",
+                channel_id,
+                exc_info=True,
+            )
+
     async def _handle_assistant_thread_lifecycle_event(self, event: dict) -> None:
         """Handle Slack Assistant lifecycle events that carry user/thread identity."""
         metadata = self._extract_assistant_thread_metadata(event)
         self._cache_assistant_thread_metadata(metadata)
         self._seed_assistant_thread_session(metadata)
+
+    async def _handle_app_home_opened(self, event: dict) -> None:
+        """Handle Slack Agent DM-open lifecycle events without producing replies."""
+        if event.get("tab") != "messages":
+            return
+
+        channel_id = event.get("channel") or event.get("channel_id") or ""
+        user_id = event.get("user") or event.get("user_id") or ""
+        team_id = event.get("team") or event.get("team_id") or ""
+
+        if team_id and channel_id:
+            self._channel_team[str(channel_id)] = str(team_id)
+
+        self._seed_agent_dm_session(
+            {
+                "channel_id": str(channel_id) if channel_id else "",
+                "user_id": str(user_id) if user_id else "",
+                "team_id": str(team_id) if team_id else "",
+            }
+        )
 
     async def _handle_slack_file_shared(self, event: dict) -> None:
         """Fallback for Slack file shares that do not arrive as message.files.
