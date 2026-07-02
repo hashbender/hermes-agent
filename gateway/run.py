@@ -17432,10 +17432,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # can actually type (`!approve`) — typed "/" is blocked in
                 # Slack threads and reserved by Matrix clients.
                 _p = getattr(_status_adapter, "typed_command_prefix", "/")
+                try:
+                    from gateway.display_config import resolve_display_setting
+
+                    _approval_platform_key = _platform_config_key(event.source.platform)
+                    _tool_progress_mode = str(
+                        resolve_display_setting(
+                            _load_gateway_config(),
+                            _approval_platform_key,
+                            "tool_progress",
+                            "all",
+                        )
+                    ).strip().lower()
+                except Exception:
+                    _tool_progress_mode = "all"
+                _show_cmd_preview = _tool_progress_mode in {"all", "verbose"}
                 cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+                if _show_cmd_preview:
+                    preview_block = f"```\n{cmd_preview}\n```\n"
+                else:
+                    preview_block = (
+                        "_Command preview hidden by `display.platforms.<platform>.tool_progress`._\n"
+                    )
                 msg = (
                     f"⚠️ **Dangerous command requires approval:**\n"
-                    f"```\n{cmd_preview}\n```\n"
+                    f"{preview_block}"
                     f"Reason: {desc}\n\n"
                     f"Reply `{_p}approve` to execute, `{_p}approve session` to approve this pattern "
                     f"for the session, `{_p}approve always` to approve permanently, or `{_p}deny` to cancel."
