@@ -552,6 +552,33 @@ class TestRoutingIntents:
             assert platforms == ["discord", "telegram"], f"token={token!r} -> {platforms}"
 
 
+class TestBuiltinDeliveryPlatforms:
+    """Built-in platforms must pass the ``_KNOWN_DELIVERY_PLATFORMS`` gate."""
+
+    def test_whatsapp_cloud_home_channel_resolves(self, monkeypatch):
+        """whatsapp_cloud is a built-in adapter (never in the plugin
+        registry), so the hardcoded set is its only admission path; without
+        it the home-channel target silently vanishes from the resolution."""
+        from cron.scheduler import _resolve_delivery_targets
+
+        monkeypatch.setenv("WHATSAPP_CLOUD_HOME_CHANNEL", "15551234567")
+        targets = _resolve_delivery_targets(
+            {"deliver": "whatsapp_cloud", "origin": None}
+        )
+        assert targets == [
+            {"platform": "whatsapp_cloud", "chat_id": "15551234567", "thread_id": None}
+        ]
+
+    def test_every_home_target_platform_is_known(self):
+        """Anti-drift guard: every platform with a home-target env var must
+        be deliverable — a mismatch means cron delivery is silently dropped
+        (the resolver returns no target and records no delivery error)."""
+        from cron.scheduler import _HOME_TARGET_ENV_VARS, _is_known_delivery_platform
+
+        for platform in _HOME_TARGET_ENV_VARS:
+            assert _is_known_delivery_platform(platform), platform
+
+
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
 
@@ -4391,3 +4418,79 @@ class TestCronContinuableSurfaceInChannel:
         store.get_or_create_session.assert_not_called()
         mirror_mock.assert_not_called()
 
+
+class TestMultiTargetDeliveryContinuesOnFailure:
+    """When delivery to one target fails inside the standalone thread-pool
+    fallback, the loop must continue to the remaining targets (#47163).
+
+    The fallback runs inside the `except RuntimeError` block of
+    `_deliver_result`. Before the fix, an exception raised there (SMTP
+    ConnectionError, future.result timeout) escaped the function entirely —
+    it is NOT caught by the sibling `except Exception` — crashing the loop
+    and silently dropping every subsequent target.
+    """
+
+    def _email_cfg(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+        return mock_cfg
+
+    def test_first_target_failure_does_not_crash_loop(self):
+        """First email target fails in the fallback; the second is still attempted."""
+        job = {
+            "id": "multi-email-job",
+            "deliver": "email:a@example.com,email:b@example.com",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
+             patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
+            mock_pool = MagicMock()
+            mock_pool_cls.return_value = mock_pool
+
+            fail_future = MagicMock()
+            fail_future.result.side_effect = ConnectionError("SMTP connection refused")
+            ok_future = MagicMock()
+            ok_future.result.return_value = {"success": True}
+            mock_pool.submit.side_effect = [fail_future, ok_future]
+
+            result = _deliver_result(job, "Report content")
+
+        # Both targets attempted — the loop did not crash after the first failure.
+        assert mock_pool.submit.call_count == 2, (
+            f"expected 2 delivery attempts, got {mock_pool.submit.call_count}"
+        )
+        # First target's failure is surfaced in the returned error string.
+        assert result is not None
+        assert "a@example.com" in result
+        assert "SMTP connection refused" in result
+
+    def test_all_targets_fail_returns_combined_errors(self):
+        """When every target fails, the result reports all of them."""
+        job = {
+            "id": "all-fail-job",
+            "deliver": "email:a@example.com,email:b@example.com",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
+             patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
+            mock_pool = MagicMock()
+            mock_pool_cls.return_value = mock_pool
+
+            fail_future = MagicMock()
+            fail_future.result.side_effect = ConnectionError("connection refused")
+            mock_pool.submit.return_value = fail_future
+
+            result = _deliver_result(job, "Report content")
+
+        assert result is not None
+        assert "a@example.com" in result
+        assert "b@example.com" in result
+        assert mock_pool.submit.call_count == 2
