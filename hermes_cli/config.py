@@ -897,6 +897,9 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
+    "credential_pool_quota_aware": {
+        "avoid_below_fraction": 0.20,
+    },
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
@@ -1194,7 +1197,6 @@ DEFAULT_CONFIG = {
         "engine": "auto",
         "auto_local_for_private_urls": True,  # When a cloud provider is set, auto-spawn local Chromium for LAN/localhost URLs instead of sending them to the cloud
         "cdp_url": "",  # Optional persistent CDP endpoint for attaching to an existing Chromium/Chrome
-        "allow_unsafe_evaluate": False,  # Allow browser_console(expression=...) to use sensitive JS primitives (cookies/storage/clipboard/network/form values)
         # CDP supervisor — dialog + frame detection via a persistent WebSocket.
         # Active only when a CDP-capable backend is attached (Browserbase or
         # local Chrome via /browser connect). See
@@ -1465,13 +1467,6 @@ DEFAULT_CONFIG = {
     # Each aux task is independent — main-agent provider_routing and
     # openrouter.min_coding_score do NOT propagate to aux calls by design.
     "auxiliary": {
-        # Same-provider retries for a transient transport blip (connection
-        # reset / timeout / 5xx / 408) on ANY auxiliary call before falling
-        # back. Default 2 (→ 3 total attempts), clamped [0,6]. Matters most for
-        # pinned calls like MoA reference advisors, where provider fallback is
-        # not a meaningful recovery, so an unretried blip silently loses the
-        # call.
-        "transient_retries": 2,
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
@@ -1631,7 +1626,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 900,
+            "timeout": 600,
             "extra_body": {},
         },
         "moa_aggregator": {
@@ -1639,7 +1634,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 900,
+            "timeout": 600,
             "extra_body": {},
         },
     },
@@ -2304,7 +2299,6 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
-        "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
@@ -3095,24 +3089,6 @@ DEFAULT_CONFIG = {
     },
 
 
-    # Google Vertex AI provider (Gemini via the OpenAI-compatible endpoint).
-    # Auth is OAuth2 (short-lived access tokens minted from a service-account
-    # JSON or Application Default Credentials) — NOT a static API key. The
-    # credential *path* is a secret-adjacent pointer and lives in .env
-    # (VERTEX_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS); these two
-    # settings are non-secret routing config and live here. Both are bridged to
-    # the VERTEX_PROJECT_ID / VERTEX_REGION env vars the adapter reads, so an
-    # explicit env var still wins over config.yaml.
-    "vertex": {
-        # GCP project ID. Empty → use the project_id embedded in the service
-        # account JSON (or ADC-resolved project).
-        "project_id": "",
-        # Vertex region. "global" is required for the Gemini 3.x preview models
-        # (regional endpoints silently 404 them). Override to a regional value
-        # (e.g. "us-central1") only if your models are pinned to a region.
-        "region": "global",
-    },
-
     # Config schema version - bump this when adding new required fields
     "_config_version": 32,
 }
@@ -3178,18 +3154,6 @@ OPTIONAL_ENV_VARS = {
         "description": "Google AI Studio base URL override",
         "prompt": "Gemini base URL (leave empty for default)",
         "url": None,
-        "password": False,
-        "category": "provider",
-        "advanced": True,
-    },
-    "VERTEX_CREDENTIALS_PATH": {
-        "description": "Path to a Google Cloud service account JSON for Vertex AI (Gemini). "
-                       "Vertex uses OAuth2, not a static API key — this points at the "
-                       "credentials Hermes mints short-lived tokens from. Falls back to "
-                       "GOOGLE_APPLICATION_CREDENTIALS, then to ADC (gcloud auth "
-                       "application-default login). Set project/region under vertex: in config.yaml.",
-        "prompt": "Vertex service account JSON path (leave empty to use ADC / GOOGLE_APPLICATION_CREDENTIALS)",
-        "url": "https://cloud.google.com/iam/docs/keys-create-delete",
         "password": False,
         "category": "provider",
         "advanced": True,
@@ -4486,7 +4450,7 @@ def _normalize_custom_provider_entry(
         "api_mode", "transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
-        "discover_models", "extra_body", "ssl_ca_cert", "ssl_verify",
+        "discover_models", "extra_body",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -4593,16 +4557,6 @@ def _normalize_custom_provider_entry(
     if isinstance(extra_body, dict):
         normalized["extra_body"] = dict(extra_body)
 
-    ssl_ca_cert = entry.get("ssl_ca_cert")
-    if isinstance(ssl_ca_cert, str) and ssl_ca_cert.strip():
-        normalized["ssl_ca_cert"] = ssl_ca_cert.strip()
-
-    ssl_verify = entry.get("ssl_verify")
-    if isinstance(ssl_verify, bool):
-        normalized["ssl_verify"] = ssl_verify
-    elif isinstance(ssl_verify, str) and ssl_verify.strip():
-        normalized["ssl_verify"] = ssl_verify.strip()
-
     return normalized
 
 
@@ -4630,8 +4584,6 @@ def _custom_provider_entry_to_provider_config(
         "rate_limit_delay",
         "discover_models",
         "extra_body",
-        "ssl_ca_cert",
-        "ssl_verify",
     ):
         if field in normalized:
             provider_entry[field] = normalized[field]
@@ -4706,71 +4658,6 @@ def get_compatible_custom_providers(
         _append_if_new(entry)
 
     return compatible
-
-
-def _coerce_ssl_verify(value: Any) -> Optional[bool]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"false", "0", "no", "off"}:
-            return False
-        if lowered in {"true", "1", "yes", "on"}:
-            return True
-    return None
-
-
-def get_custom_provider_tls_settings(
-    base_url: str,
-    custom_providers: Optional[List[Dict[str, Any]]] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Return TLS settings from a matching ``custom_providers`` / ``providers`` entry."""
-    if custom_providers is None:
-        try:
-            custom_providers = get_compatible_custom_providers(config)
-        except Exception:
-            custom_providers = []
-    if not base_url or not isinstance(custom_providers, list):
-        return {}
-
-    # Case-insensitive compare: elsewhere custom_providers are keyed on a
-    # lowercased base_url (see get_compatible_custom_providers dedup), and
-    # scheme/host are case-insensitive anyway — so a config entry written as
-    # https://Ollama.Example.com/v1 must still match a lowercased runtime
-    # base_url. Exact match after rstrip('/') + lower() (no prefix/substring).
-    target_url = (base_url or "").rstrip("/").lower()
-    for entry in custom_providers:
-        if not isinstance(entry, dict):
-            continue
-        entry_url = (entry.get("base_url") or "").rstrip("/").lower()
-        if not entry_url or entry_url != target_url:
-            continue
-        out: Dict[str, Any] = {}
-        ca = entry.get("ssl_ca_cert")
-        if isinstance(ca, str) and ca.strip():
-            out["ssl_ca_cert"] = ca.strip()
-        verify = _coerce_ssl_verify(entry.get("ssl_verify"))
-        if verify is not None:
-            out["ssl_verify"] = verify
-        return out
-    return {}
-
-
-def apply_custom_provider_tls_to_client_kwargs(
-    client_kwargs: Dict[str, Any],
-    base_url: str,
-    custom_providers: Optional[List[Dict[str, Any]]] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Attach per-provider TLS knobs to OpenAI client kwargs when matched."""
-    tls = get_custom_provider_tls_settings(base_url, custom_providers, config)
-    if tls.get("ssl_ca_cert"):
-        client_kwargs["ssl_ca_cert"] = tls["ssl_ca_cert"]
-    if "ssl_verify" in tls:
-        client_kwargs["ssl_verify"] = tls["ssl_verify"]
 
 
 def get_custom_provider_context_length(
@@ -4898,7 +4785,6 @@ _KNOWN_ROOT_KEYS = {
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
     "context_length", "rate_limit_delay", "extra_body",
-    "ssl_ca_cert", "ssl_verify",
     # key_env is read at runtime by runtime_provider.py and auxiliary_client.py
     # — include it here so the set accurately describes the supported schema.
     "key_env",
