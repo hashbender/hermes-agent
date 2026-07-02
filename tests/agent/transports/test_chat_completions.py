@@ -727,6 +727,80 @@ class TestChatCompletionsLmStudioReasoning:
         assert kw["reasoning_effort"] == "high"
 
 
+class TestChatCompletionsMistralReasoning:
+    def test_mistral_reasoning_effort_top_level_from_reasoning_config(self, transport):
+        kw = transport.build_kwargs(
+            model="mistral4-small",
+            messages=[{"role": "user", "content": "Hi"}],
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert kw["reasoning_effort"] == "high"
+
+    def test_mistral_reasoning_effort_disabled_maps_to_none(self, transport):
+        kw = transport.build_kwargs(
+            model="mistral4-small",
+            messages=[{"role": "user", "content": "Hi"}],
+            reasoning_config={"enabled": False},
+        )
+        assert kw["reasoning_effort"] == "none"
+
+    def test_mistral_custom_override_promotes_legacy_enable_thinking(self, transport):
+        kw = transport.build_kwargs(
+            model="mistral4-small",
+            messages=[{"role": "user", "content": "Hi"}],
+            request_overrides={
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": True},
+                    "metadata": {"session": "s1"},
+                }
+            },
+        )
+        assert kw["reasoning_effort"] == "high"
+        assert kw["extra_body"] == {"metadata": {"session": "s1"}}
+
+    def test_mistral_custom_override_supports_disabled_thinking(self, transport):
+        kw = transport.build_kwargs(
+            model="mistral4-small",
+            messages=[{"role": "user", "content": "Hi"}],
+            request_overrides={
+                "extra_body": {
+                    "enable_thinking": False,
+                }
+            },
+        )
+        assert kw["reasoning_effort"] == "none"
+        assert "extra_body" not in kw
+
+    def test_mistral_profile_override_strips_legacy_thinking_keys(self, transport):
+        from providers.base import ProviderProfile
+        profile = ProviderProfile(name="_mistral")
+        kw = transport.build_kwargs(
+            model="mistral4-small",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_profile=profile,
+            request_overrides={
+                "extra_body": {
+                    "reasoning_effort": "medium",
+                    "chat_template_kwargs": {"enable_thinking": True},
+                    "metadata": {"session": "s1"},
+                }
+            },
+        )
+        assert kw["reasoning_effort"] == "high"
+        assert kw["extra_body"] == {"metadata": {"session": "s1"}}
+
+    def test_mistral_profile_path_uses_reasoning_config(self, transport):
+        from providers.base import ProviderProfile
+        profile = ProviderProfile(name="_mistral")
+        kw = transport.build_kwargs(
+            model="mistral4-small",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_profile=profile,
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        assert kw["reasoning_effort"] == "high"
+
+
 class TestChatCompletionsValidate:
 
     def test_none(self, transport):

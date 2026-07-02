@@ -19,9 +19,11 @@ def _extract_last_reasoning(messages):
     for msg in reversed(messages):
         if msg.get("role") == "user":
             break
-        if msg.get("role") == "assistant" and msg.get("reasoning"):
-            last_reasoning = msg["reasoning"]
-            break
+        if msg.get("role") == "assistant":
+            reasoning_text = msg.get("reasoning") or msg.get("reasoning_content")
+            if reasoning_text:
+                last_reasoning = reasoning_text
+                break
     return last_reasoning
 
 
@@ -105,3 +107,22 @@ def test_empty_string_reasoning_treated_as_missing():
         {"role": "assistant", "content": "hello", "reasoning": ""},
     ]
     assert _extract_last_reasoning(messages) is None
+
+
+def test_reasoning_content_fallback_used_for_streaming_turns():
+    """Streaming chat-completions can finalize with reasoning_content only.
+
+    Mistral/vLLM streams are accumulated into a synthetic final message that
+    carries ``reasoning_content`` but no ``reasoning`` attribute. Gateway and
+    Matrix display must still surface that thinking body.
+    """
+    messages = [
+        {"role": "user", "content": "solve this"},
+        {
+            "role": "assistant",
+            "content": "1161",
+            "reasoning": None,
+            "reasoning_content": "27*40 is 1080, 27*3 is 81, total 1161.",
+        },
+    ]
+    assert _extract_last_reasoning(messages) == "27*40 is 1080, 27*3 is 81, total 1161."

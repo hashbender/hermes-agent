@@ -392,9 +392,11 @@ def finalize_turn(
     for msg in reversed(messages):
         if msg.get("role") == "user":
             break  # turn boundary — don't cross into prior turns
-        if msg.get("role") == "assistant" and msg.get("reasoning"):
-            last_reasoning = msg["reasoning"]
-            break
+        if msg.get("role") == "assistant":
+            reasoning_text = msg.get("reasoning") or msg.get("reasoning_content")
+            if reasoning_text:
+                last_reasoning = reasoning_text
+                break
 
     # Build result with interrupt info if applicable
     result = {

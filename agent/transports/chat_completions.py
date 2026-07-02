@@ -115,6 +115,82 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     return "gemini" in m or "gemma" in m
 
 
+def _uses_mistral_reasoning_effort(model: Any) -> bool:
+    """True when the target model uses Mistral's top-level reasoning_effort.
+
+    Mistral Small 4 and related Mistral-family chat-completions endpoints use
+    a top-level ``reasoning_effort`` field and reject older custom-provider
+    payloads like ``extra_body.chat_template_kwargs.enable_thinking``.
+    """
+    return "mistral" in str(model or "").strip().lower()
+
+
+def _mistral_reasoning_effort_from_extra_body(extra_body: dict[str, Any] | None) -> str | None:
+    """Derive Mistral's top-level ``reasoning_effort`` from legacy extra_body.
+
+    Historically some custom-provider routes used ``enable_thinking`` or
+    ``chat_template_kwargs.enable_thinking``. Mistral chat-completions expects
+    only ``reasoning_effort`` with values ``none`` or ``high``.
+    """
+    if not isinstance(extra_body, dict) or not extra_body:
+        return None
+
+    value = extra_body.get("reasoning_effort")
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "none", "off", "disabled", "false"}:
+            return "none"
+        if normalized in {"high", "medium", "low", "minimal", "xhigh", "max", "on", "enabled", "true"}:
+            return "high"
+
+    for key in ("enable_thinking",):
+        toggle = extra_body.get(key)
+        if isinstance(toggle, bool):
+            return "high" if toggle else "none"
+
+    chat_template_kwargs = extra_body.get("chat_template_kwargs")
+    if isinstance(chat_template_kwargs, dict):
+        toggle = chat_template_kwargs.get("enable_thinking")
+        if isinstance(toggle, bool):
+            return "high" if toggle else "none"
+
+    return None
+
+
+def _resolve_mistral_reasoning_effort(reasoning_config: dict | None) -> str | None:
+    """Map Hermes reasoning config onto Mistral's supported values.
+
+    Mistral Small 4 accepts only ``none`` and ``high`` for
+    ``reasoning_effort``. Hermes' wider scale is treated as a toggle:
+    disabled/none -> ``none``; any enabled effort -> ``high``.
+    """
+    if not isinstance(reasoning_config, dict):
+        return None
+
+    if reasoning_config.get("enabled") is False:
+        return "none"
+
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    if effort in {"none", "off", "disabled", "false"}:
+        return "none"
+    if effort in {"minimal", "low", "medium", "high", "xhigh", "max", "on", "enabled", "true", ""}:
+        return "high"
+
+    return "high"
+
+
+def _strip_mistral_unsupported_extra_body(extra_body: dict[str, Any] | None) -> dict[str, Any]:
+    """Drop custom-provider thinking toggles Mistral chat-completions rejects."""
+    if not isinstance(extra_body, dict) or not extra_body:
+        return {}
+
+    return {
+        k: v
+        for k, v in extra_body.items()
+        if k not in {"chat_template_kwargs", "enable_thinking", "reasoning_effort"}
+    }
+
+
 class ChatCompletionsTransport(ProviderTransport):
     """Transport for api_mode='chat_completions'.
 
@@ -377,6 +453,11 @@ class ChatCompletionsTransport(ProviderTransport):
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
 
+        if _uses_mistral_reasoning_effort(model) and "reasoning_effort" not in api_kwargs:
+            _mistral_effort = _resolve_mistral_reasoning_effort(reasoning_config)
+            if _mistral_effort is not None:
+                api_kwargs["reasoning_effort"] = _mistral_effort
+
         # extra_body assembly
         extra_body: dict[str, Any] = {}
 
@@ -450,6 +531,16 @@ class ChatCompletionsTransport(ProviderTransport):
         overrides = params.get("request_overrides")
         if overrides:
             api_kwargs.update(overrides)
+            if _uses_mistral_reasoning_effort(model):
+                override_extra = api_kwargs.get("extra_body")
+                inferred_effort = _mistral_reasoning_effort_from_extra_body(override_extra)
+                if inferred_effort is not None and "reasoning_effort" not in api_kwargs:
+                    api_kwargs["reasoning_effort"] = inferred_effort
+                cleaned_extra = _strip_mistral_unsupported_extra_body(override_extra)
+                if cleaned_extra:
+                    api_kwargs["extra_body"] = cleaned_extra
+                else:
+                    api_kwargs.pop("extra_body", None)
 
         return api_kwargs
 
@@ -535,6 +626,10 @@ class ChatCompletionsTransport(ProviderTransport):
             )
         )
         api_kwargs.update(top_level_from_profile)
+        if _uses_mistral_reasoning_effort(model) and "reasoning_effort" not in api_kwargs:
+            _mistral_effort = _resolve_mistral_reasoning_effort(reasoning_config)
+            if _mistral_effort is not None:
+                api_kwargs["reasoning_effort"] = _mistral_effort
 
         # extra_body assembly
         extra_body: dict[str, Any] = {}
@@ -590,6 +685,11 @@ class ChatCompletionsTransport(ProviderTransport):
                     k: v for k, v in extra_body.items()
                     if k in ("thinking_config", "thinkingConfig")
                 }
+            elif _uses_mistral_reasoning_effort(model):
+                inferred_effort = _mistral_reasoning_effort_from_extra_body(extra_body)
+                if inferred_effort is not None and "reasoning_effort" not in api_kwargs:
+                    api_kwargs["reasoning_effort"] = inferred_effort
+                extra_body = _strip_mistral_unsupported_extra_body(extra_body)
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
 
