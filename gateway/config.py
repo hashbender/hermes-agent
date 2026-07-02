@@ -325,47 +325,13 @@ class SessionResetPolicy:
 
 
 @dataclass
-class ChannelOverride:
-    """
-    Per-channel override for model, provider, and system prompt.
-
-    Used in config under platforms.<name>.channel_overrides[channel_id].
-    Enables different channels (e.g. Discord #daily vs #dev) to use different
-    models and personas without running separate gateway instances.
-    """
-    model: Optional[str] = None
-    provider: Optional[str] = None
-    system_prompt: Optional[str] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
-        if self.model is not None:
-            out["model"] = self.model
-        if self.provider is not None:
-            out["provider"] = self.provider
-        if self.system_prompt is not None:
-            out["system_prompt"] = self.system_prompt
-        return out
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ChannelOverride":
-        if not data:
-            return cls()
-        return cls(
-            model=data.get("model"),
-            provider=data.get("provider"),
-            system_prompt=data.get("system_prompt"),
-        )
-
-
-@dataclass
 class PlatformConfig:
     """Configuration for a single messaging platform."""
     enabled: bool = False
     token: Optional[str] = None  # Bot token (Telegram, Discord)
     api_key: Optional[str] = None  # API key if different from token
     home_channel: Optional[HomeChannel] = None
-
+    
     # Reply threading mode (Telegram/Slack)
     # - "off": Never thread replies to original message
     # - "first": Only first chunk threads to user's message (default)
@@ -388,9 +354,6 @@ class PlatformConfig:
     # gateway/platforms/base.py.
     typing_indicator: bool = True
 
-    # Per-channel model/provider/system_prompt overrides (channel_id -> ChannelOverride)
-    channel_overrides: Dict[str, ChannelOverride] = field(default_factory=dict)
-
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -408,10 +371,6 @@ class PlatformConfig:
             result["api_key"] = self.api_key
         if self.home_channel:
             result["home_channel"] = self.home_channel.to_dict()
-        if self.channel_overrides:
-            result["channel_overrides"] = {
-                cid: ov.to_dict() for cid, ov in self.channel_overrides.items()
-            }
         return result
 
     @classmethod
@@ -435,13 +394,6 @@ class PlatformConfig:
         if _typing is None:
             _typing = data.get("extra", {}).get("typing_indicator")
 
-        channel_overrides: Dict[str, ChannelOverride] = {}
-        raw_overrides = data.get("channel_overrides") or {}
-        if isinstance(raw_overrides, dict):
-            for cid, ov_data in raw_overrides.items():
-                if isinstance(ov_data, dict):
-                    channel_overrides[str(cid)] = ChannelOverride.from_dict(ov_data)
-
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
             token=data.get("token"),
@@ -450,7 +402,6 @@ class PlatformConfig:
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
             typing_indicator=_coerce_bool(_typing, True),
-            channel_overrides=channel_overrides,
             extra=data.get("extra", {}),
         )
 
@@ -628,6 +579,12 @@ class GatewayConfig:
     # months.  Pruning is invisible to users — if they resume, they get a
     # fresh session exactly as if the reset policy had fired.  0 = disabled.
     session_store_max_age_days: int = 90
+
+    # External dispatcher: forward certain slash commands to a Unix socket
+    # service instead of handling them in the gateway. Disabled when
+    # dispatcher_socket is empty or dispatcher_commands is empty.
+    dispatcher_socket: Optional[str] = None
+    dispatcher_commands: List[str] = field(default_factory=list)
 
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
@@ -822,6 +779,8 @@ class GatewayConfig:
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
+            dispatcher_socket=data.get("dispatcher_socket"),
+            dispatcher_commands=data.get("dispatcher_commands") or [],
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -937,6 +896,35 @@ def load_gateway_config() -> GatewayConfig:
 
             if "max_concurrent_sessions" in yaml_cfg:
                 gw_data["max_concurrent_sessions"] = yaml_cfg["max_concurrent_sessions"]
+
+            # External dispatcher: forward slash commands to a Unix socket.
+            dispatcher_cfg = yaml_cfg.get("dispatcher")
+            if dispatcher_cfg is not None and not isinstance(dispatcher_cfg, dict):
+                logger.warning(
+                    "Ignoring dispatcher config in config.yaml: "
+                    "expected mapping, got %s",
+                    type(dispatcher_cfg).__name__,
+                )
+            if isinstance(dispatcher_cfg, dict):
+                ds = dispatcher_cfg.get("socket")
+                if ds and isinstance(ds, str):
+                    gw_data["dispatcher_socket"] = ds
+                dc = dispatcher_cfg.get("commands")
+                if isinstance(dc, list):
+                    valid = [
+                        c.strip() for c in dc
+                        if isinstance(c, str) and c.strip()
+                    ]
+                    if len(valid) < len(dc):
+                        logger.warning(
+                            "Ignoring %d non-string or empty "
+                            "dispatcher_commands entries in config.yaml "
+                            "(%d valid of %d total)",
+                            len(dc) - len(valid),
+                            len(valid),
+                            len(dc),
+                        )
+                    gw_data["dispatcher_commands"] = valid
 
             streaming_cfg = yaml_cfg.get("streaming")
             if not isinstance(streaming_cfg, dict):
@@ -1057,8 +1045,6 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["reply_prefix"] = platform_cfg["reply_prefix"]
                 if "reply_in_thread" in platform_cfg:
                     bridged["reply_in_thread"] = platform_cfg["reply_in_thread"]
-                if "cron_continuable_surface" in platform_cfg:
-                    bridged["cron_continuable_surface"] = platform_cfg["cron_continuable_surface"]
                 if "require_mention" in platform_cfg:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if plat == Platform.TELEGRAM and "allowed_chats" in platform_cfg:
@@ -1103,20 +1089,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
                 if "typing_indicator" in platform_cfg:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
-                has_channel_overrides = "channel_overrides" in platform_cfg
-                if has_channel_overrides:
-                    raw_overrides = platform_cfg.get("channel_overrides")
-                    if isinstance(raw_overrides, dict):
-                        plat_data, _extra = _ensure_platform_extra_dict(
-                            platforms_data, plat.value
-                        )
-                        plat_data["channel_overrides"] = {
-                            str(cid): ov_data
-                            for cid, ov_data in raw_overrides.items()
-                            if isinstance(ov_data, dict)
-                        }
                 enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg
-                if not bridged and not enabled_was_explicit and not has_channel_overrides:
+                if not bridged and not enabled_was_explicit:
                     continue
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
                 if enabled_was_explicit:
@@ -2154,6 +2128,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     if relay_url_val:
         relay_config = _enable_from_env(Platform.RELAY)
         relay_config.extra["relay_url"] = relay_url_val.rstrip("/")
+
+    # External dispatcher env overrides
+    dispatcher_socket_env = os.getenv("DISPATCHER_SOCKET_PATH", "").strip()
+    if dispatcher_socket_env:
+        config.dispatcher_socket = dispatcher_socket_env
+    dispatcher_commands_env = os.getenv("DISPATCHER_FORWARD_COMMANDS", "").strip()
+    if dispatcher_commands_env:
+        config.dispatcher_commands = [
+            c.strip() for c in dispatcher_commands_env.split(",") if c.strip()
+        ]
 
     for platform_config in config.platforms.values():
         platform_config.extra.pop("_enabled_explicit", None)
