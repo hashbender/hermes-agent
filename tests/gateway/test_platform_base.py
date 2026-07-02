@@ -6,10 +6,12 @@ from unittest.mock import patch
 
 import pytest
 
+from gateway.config import Platform
 from gateway.platforms.base import (
     BasePlatformAdapter,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
+    _auto_tts_tool_kwargs,
     cache_audio_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
@@ -19,6 +21,18 @@ from gateway.platforms.base import (
     _log_safe_path,
     _prefix_within_utf16_limit,
 )
+
+
+class TestAutoTTSOutputPath:
+    def test_telegram_requests_ogg_for_voice_bubble(self):
+        kwargs = _auto_tts_tool_kwargs(Platform.TELEGRAM, "hello")
+
+        assert kwargs["text"] == "hello"
+        assert kwargs["output_path"].endswith(".ogg")
+        assert "auto_tts_" in kwargs["output_path"]
+
+    def test_non_telegram_uses_tts_tool_default(self):
+        assert _auto_tts_tool_kwargs(Platform.DISCORD, "hello") == {"text": "hello"}
 
 
 class TestInboundMediaSizeCap:
@@ -990,6 +1004,38 @@ class TestMediaDeliveryDefaultMode:
         )
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(env_file)) is None
+
+    @pytest.mark.parametrize(
+        "rel",
+        [
+            "mcp-tokens/github.json",
+            "mcp-tokens/github.client.json",
+            "mcp-tokens/github.meta.json",
+        ],
+    )
+    def test_denylist_blocks_mcp_oauth_tokens(self, tmp_path, monkeypatch, rel):
+        """Live MCP OAuth tokens/client creds under ~/.hermes/mcp-tokens/ must
+        never deliver as native media — same exfil class as auth.json/.env.
+        Sibling to the pairing/ directory denylist entry.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_dir = fake_home / ".hermes"
+        (hermes_dir / "mcp-tokens").mkdir(parents=True)
+        secret = hermes_dir / rel
+        secret.write_text('{"access_token": "live-bearer-abc123"}')
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_HOME",
+            hermes_dir,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_ROOT",
+            hermes_dir,
+        )
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
 
     def test_denylist_blocks_hermes_config_in_active_profile(self, tmp_path, monkeypatch):
         """The active profile config stays blocked in default mode."""
