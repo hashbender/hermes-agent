@@ -474,6 +474,106 @@ class TestBuildSkillsSystemPrompt:
         full = build_skills_system_prompt()
         assert "Write threads" in full
 
+    def test_tiered_skills_render_hot_warm_and_omit_cold(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from agent import skill_utils
+        skill_utils._external_dirs_cache_clear()
+
+        (tmp_path / "config.yaml").write_text(
+            """
+skills:
+  tiers:
+    enabled: true
+    hot:
+      - hermes-agent
+    warm:
+      - obsidian-memory-graph-protocol
+    cold:
+      - godmode
+""".strip(),
+            encoding="utf-8",
+        )
+        specs = [
+            ("autonomous-ai-agents", "hermes-agent", "Hermes config help"),
+            ("note-taking", "obsidian-memory-graph-protocol", "Graph receipts"),
+            ("red-teaming", "godmode", "Red team prompts"),
+            ("creative", "pixel-art", "Pixel art workflows"),
+        ]
+        for cat, name, desc in specs:
+            d = tmp_path / "skills" / cat / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {desc}\n---\n",
+                encoding="utf-8",
+            )
+
+        result = build_skills_system_prompt()
+
+        assert "## Skills (tiered)" in result
+        assert "hermes-agent: Hermes config help" in result
+        assert "<warm_skills>" in result
+        assert "obsidian-memory-graph-protocol: Graph receipts" in result
+        # Unknown/unlisted enabled skills default warm, not cold.
+        assert "pixel-art: Pixel art workflows" in result
+        assert "godmode" not in result
+        assert "Red team prompts" not in result
+        assert "Cold skills are omitted" in result
+        assert "skills_list" in result and "skill_view" in result
+
+    def test_skill_tiers_disabled_preserves_full_index(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from agent import skill_utils
+        skill_utils._external_dirs_cache_clear()
+
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  tiers:\n    enabled: false\n    cold: [godmode]\n",
+            encoding="utf-8",
+        )
+        d = tmp_path / "skills" / "red-teaming" / "godmode"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: godmode\ndescription: Red team prompts\n---\n",
+            encoding="utf-8",
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "## Skills (mandatory)" in result
+        assert "godmode: Red team prompts" in result
+        assert "## Skills (tiered)" not in result
+
+    def test_skill_tier_config_is_part_of_prompt_cache_key(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from agent import skill_utils
+        skill_utils._external_dirs_cache_clear()
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "skills:\n  tiers:\n    enabled: true\n    hot: [hermes-agent]\n",
+            encoding="utf-8",
+        )
+        d = tmp_path / "skills" / "autonomous-ai-agents" / "hermes-agent"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: hermes-agent\ndescription: Hermes config help\n---\n",
+            encoding="utf-8",
+        )
+
+        hot = build_skills_system_prompt()
+        assert "hermes-agent: Hermes config help" in hot
+        assert "<warm_skills>" not in hot
+
+        config_path.write_text(
+            "skills:\n  tiers:\n    enabled: true\n    warm: [hermes-agent]\n",
+            encoding="utf-8",
+        )
+        import os
+        os.utime(config_path, None)
+
+        warm = build_skills_system_prompt()
+        assert "<warm_skills>" in warm
+        assert "- hermes-agent: Hermes config help" in warm
+
     def test_excludes_incompatible_platform_skills(self, monkeypatch, tmp_path):
         """Skills with platforms: [macos] should not appear on Linux."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1299,7 +1399,7 @@ class TestEnvironmentHints:
     def test_remote_backend_list_covers_known_sandboxes(self):
         """Regression guard: if someone adds a remote backend, they must list it here."""
         import agent.prompt_builder as _pb
-        for backend in ("docker", "singularity", "modal", "daytona", "tenki", "ssh"):
+        for backend in ("docker", "singularity", "modal", "daytona", "ssh"):
             assert backend in _pb._REMOTE_TERMINAL_BACKENDS, (
                 f"{backend!r} must be in _REMOTE_TERMINAL_BACKENDS so its host "
                 f"info is suppressed in the system prompt"
@@ -1644,4 +1744,5 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
+
 
