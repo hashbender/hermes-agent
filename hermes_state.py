@@ -4096,10 +4096,27 @@ class SessionDB:
         sanitized = re.sub(r"\*+", "*", sanitized)
         sanitized = re.sub(r"(^|\s)\*", r"\1", sanitized)
 
-        # Step 4: Remove dangling boolean operators at start/end that would
-        # cause syntax errors (e.g. "hello AND" or "OR world")
-        sanitized = re.sub(r"(?i)^(AND|OR|NOT)\b\s*", "", sanitized.strip())
-        sanitized = re.sub(r"(?i)\s+(AND|OR|NOT)\s*$", "", sanitized.strip())
+        # Step 4: Normalize bare boolean operators.  FTS5 rejects leading,
+        # trailing, and adjacent boolean operators (``a AND OR b``, ``AND NOT
+        # x``).  Keep valid infix operators, drop leading/trailing runs, and
+        # collapse adjacent runs to the last operator so surrounding search
+        # terms are still used instead of silently returning no matches.
+        tokens = sanitized.strip().split()
+        normalized_tokens: list[str] = []
+        for token in tokens:
+            if re.fullmatch(r"(?i)AND|OR|NOT", token):
+                op = token.upper()
+                if not normalized_tokens:
+                    continue
+                if re.fullmatch(r"(?i)AND|OR|NOT", normalized_tokens[-1]):
+                    normalized_tokens[-1] = op
+                else:
+                    normalized_tokens.append(op)
+            else:
+                normalized_tokens.append(token)
+        while normalized_tokens and re.fullmatch(r"(?i)AND|OR|NOT", normalized_tokens[-1]):
+            normalized_tokens.pop()
+        sanitized = " ".join(normalized_tokens)
 
         # Step 5: Wrap unquoted dotted and/or hyphenated terms in double
         # quotes.  FTS5's tokenizer splits on dots and hyphens, turning

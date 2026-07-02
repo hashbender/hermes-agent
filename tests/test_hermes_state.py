@@ -1273,6 +1273,20 @@ class TestFTS5Search:
             results = db.search_messages(query)
             assert isinstance(results, list), f"Query {query!r} did not return a list"
 
+    def test_search_stacked_boolean_operators_still_find_content(self, db):
+        """Stacked/adjacent FTS5 boolean operators should not degrade to silent empty results."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="docker kubernetes deployment notes")
+
+        for query in [
+            "docker AND OR kubernetes",
+            "docker AND AND kubernetes",
+            "AND NOT docker",
+        ]:
+            results = db.search_messages(query)
+            assert isinstance(results, list)
+            assert len(results) >= 1, f"Query {query!r} should still find indexed terms"
+
     def test_search_sanitized_query_still_finds_content(self, db):
         """Sanitization must not break normal keyword search."""
         db.create_session(session_id="s1", source="cli")
@@ -1351,9 +1365,13 @@ class TestFTS5Search:
         assert '"' not in s('"unterminated')
         assert '(' not in s('(problem')
         assert '{' not in s('{test}')
-        # Dangling operators removed
+        # Dangling and adjacent operators normalized
         assert s('hello AND') == 'hello'
         assert s('OR world') == 'world'
+        assert s('AND NOT docker') == 'docker'
+        assert s('docker AND OR kubernetes') == 'docker OR kubernetes'
+        assert s('docker AND AND kubernetes') == 'docker AND kubernetes'
+        assert s('docker AND NOT kubernetes') == 'docker NOT kubernetes'
         # Leading bare * removed
         assert s('***') == ''
         # Valid prefix kept
