@@ -472,16 +472,38 @@ class TestEventBridge:
         assert len(b._queue) == 500
         assert b._cursor == 500
 
-    def test_approvals_lifecycle(self):
+    def test_approvals_lifecycle(self, tmp_path):
+        # Since #21563 approvals are backed by the gateway's cross-process
+        # mirror under <HERMES_HOME>/approvals/pending — not a bridge-local
+        # dict — so the lifecycle runs against real handshake files. The
+        # autouse fixture points HERMES_HOME at tmp_path.
+        import time as _time
+
         from mcp_serve import EventBridge
+        pending_dir = tmp_path / "approvals" / "pending"
+        pending_dir.mkdir(parents=True)
+        (pending_dir / "a1.json").write_text(json.dumps({
+            "id": "a1", "description": "rm -rf /tmp",
+            "session_key": "test", "created_at": _time.time(),
+            "expires_at": _time.time() + 300,
+        }))
         b = EventBridge()
-        b._pending_approvals["a1"] = {
-            "id": "a1", "kind": "exec",
-            "description": "rm -rf /tmp",
-            "session_key": "test", "created_at": "2026-03-29T12:00:00",
-        }
         assert len(b.list_pending_approvals()) == 1
+
+        def _gateway_consumes():
+            response = tmp_path / "approvals" / "responses" / "a1.json"
+            deadline = _time.monotonic() + 3
+            while _time.monotonic() < deadline:
+                if response.exists():
+                    response.unlink()
+                    (pending_dir / "a1.json").unlink()
+                    return
+                _time.sleep(0.02)
+
+        consumer = threading.Thread(target=_gateway_consumes, daemon=True)
+        consumer.start()
         result = b.respond_to_approval("a1", "deny")
+        consumer.join(timeout=4)
         assert result["resolved"] is True
         assert len(b.list_pending_approvals()) == 0
 
@@ -868,46 +890,82 @@ class TestE2EChannelsList:
         assert result["channels"][0]["target"] == "discord:789"
 
 
+def _place_pending_approval(home, approval_id, **overrides):
+    """Drop a pending-approval record into the #21563 handshake dir."""
+    record = {
+        "id": approval_id, "session_key": "test",
+        "command": "sudo rm -rf /", "description": "sudo rm -rf /",
+        "pattern_keys": ["rm_rf"], "surface": "gateway",
+        "created_at": time.time(), "expires_at": time.time() + 300,
+    }
+    record.update(overrides)
+    pending = home / "approvals" / "pending"
+    pending.mkdir(parents=True, exist_ok=True)
+    (pending / f"{approval_id}.json").write_text(json.dumps(record))
+    return record
+
+
+def _consume_approval_like_gateway(home, approval_id, timeout=3.0):
+    """Background thread mimicking the gateway wait loop's consumption."""
+    def _consume():
+        response = home / "approvals" / "responses" / f"{approval_id}.json"
+        pending = home / "approvals" / "pending" / f"{approval_id}.json"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if response.exists():
+                response.unlink()
+                pending.unlink()
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=_consume, daemon=True)
+    t.start()
+    return t
+
+
 class TestE2EPermissions:
+    # Since #21563, approvals are backed by the gateway's cross-process
+    # mirror under <HERMES_HOME>/approvals/ (isolated to tmp_path by the
+    # autouse fixture) instead of a bridge-local dict, and the tool reports
+    # the gateway-native decision it delivered.
     def test_list_empty(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e
         result = _run_tool(server, "permissions_list_open")
         assert result["count"] == 0
         assert result["approvals"] == []
 
-    def test_list_with_approvals(self, mcp_server_e2e, _event_loop):
-        server, bridge = mcp_server_e2e
-        bridge._pending_approvals["a1"] = {
-            "id": "a1", "kind": "exec",
-            "description": "sudo rm -rf /",
-            "session_key": "test",
-            "created_at": "2026-03-29T12:00:00",
-        }
+    def test_list_with_approvals(self, mcp_server_e2e, _event_loop, tmp_path):
+        server, _ = mcp_server_e2e
+        _place_pending_approval(tmp_path, "a1")
         result = _run_tool(server, "permissions_list_open")
         assert result["count"] == 1
         assert result["approvals"][0]["id"] == "a1"
+        assert result["approvals"][0]["command"] == "sudo rm -rf /"
 
-    def test_respond_allow(self, mcp_server_e2e, _event_loop):
-        server, bridge = mcp_server_e2e
-        bridge._pending_approvals["a1"] = {"id": "a1", "kind": "exec"}
+    def test_respond_allow(self, mcp_server_e2e, _event_loop, tmp_path):
+        server, _ = mcp_server_e2e
+        _place_pending_approval(tmp_path, "a1")
+        consumer = _consume_approval_like_gateway(tmp_path, "a1")
         result = _run_tool(server, "permissions_respond",
                           {"id": "a1", "decision": "allow-once"})
+        consumer.join(timeout=4)
         assert result["resolved"] is True
-        assert result["decision"] == "allow-once"
+        assert result["decision"] == "once"  # gateway-native choice
         # Should be gone now
         check = _run_tool(server, "permissions_list_open")
         assert check["count"] == 0
 
-    def test_respond_deny(self, mcp_server_e2e, _event_loop):
-        server, bridge = mcp_server_e2e
-        bridge._pending_approvals["a2"] = {"id": "a2", "kind": "plugin"}
+    def test_respond_deny(self, mcp_server_e2e, _event_loop, tmp_path):
+        server, _ = mcp_server_e2e
+        _place_pending_approval(tmp_path, "a2")
+        consumer = _consume_approval_like_gateway(tmp_path, "a2")
         result = _run_tool(server, "permissions_respond",
                           {"id": "a2", "decision": "deny"})
+        consumer.join(timeout=4)
         assert result["resolved"] is True
 
     def test_respond_invalid_decision(self, mcp_server_e2e, _event_loop):
-        server, bridge = mcp_server_e2e
-        bridge._pending_approvals["a3"] = {"id": "a3", "kind": "exec"}
+        server, _ = mcp_server_e2e
         result = _run_tool(server, "permissions_respond",
                           {"id": "a3", "decision": "maybe"})
         assert "error" in result
@@ -1231,6 +1289,63 @@ class TestEventBridgePollE2E:
         r2 = bridge.poll_events(after_cursor=r1["next_cursor"])
         assert len(r2["events"]) == 1
         assert r2["events"][0]["content"] == "New reply!"
+
+    def test_poll_picks_up_new_conversation_when_only_sessions_json_changed(
+        self, tmp_path, monkeypatch
+    ):
+        """A conversation registered in sessions.json *after* its first message
+        already landed in state.db must still be picked up, even when state.db's
+        mtime did not move on this tick.
+
+        Regression guard: the skip-when-unchanged check must compare against the
+        sessions.json mtime seen on the *previous* poll. If it instead compares
+        against the just-refreshed value, the sessions.json term is always true,
+        the guard collapses to a db-only check, and a sessions.json-only change
+        is silently dropped — the new chat's messages never reach MCP clients.
+        """
+        import mcp_serve
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+
+        # _poll_once reads <HERMES_HOME>/state.db for its mtime gate; the autouse
+        # fixture points HERMES_HOME at tmp_path.
+        db_path = tmp_path / "state.db"
+        db_path.write_text("placeholder")
+
+        session_id = "20260329_150000_late_register"
+        sessions_json = sessions_dir / "sessions.json"
+        sessions_json.write_text(json.dumps({
+            "agent:main:telegram:dm:late": {
+                "session_id": session_id,
+                "platform": "telegram",
+                "origin": {"platform": "telegram", "chat_id": "late"},
+            }
+        }))
+
+        class DB:
+            def get_messages(self, sid):
+                return [{
+                    "id": 1, "role": "user",
+                    "content": "Hello from a freshly-registered conversation",
+                    "timestamp": "2026-03-29T15:00:00",
+                }]
+
+        bridge = mcp_serve.EventBridge()
+        # Simulate the boundary state: state.db has NOT changed since the last
+        # poll (its message landed on an earlier tick), but sessions.json was
+        # only updated with this conversation now — the bridge has not yet seen
+        # the current sessions.json content.
+        bridge._state_db_mtime = db_path.stat().st_mtime
+        bridge._sessions_json_mtime = 0.0
+
+        bridge._poll_once(DB())
+
+        result = bridge.poll_events(after_cursor=0)
+        assert len(result["events"]) == 1
+        assert result["events"][0]["session_key"] == "agent:main:telegram:dm:late"
+        assert result["events"][0]["content"].startswith("Hello from a freshly")
 
     def test_poll_interval_is_200ms(self):
         """Verify the poll interval constant."""
