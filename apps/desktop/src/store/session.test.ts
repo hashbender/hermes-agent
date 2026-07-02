@@ -10,6 +10,7 @@ import {
   $workingSessionIds,
   applyConfiguredDefaultProjectDir,
   getRecentlySettledSessionIds,
+  isDelegateSubagentSession,
   mergeSessionPage,
   sessionPinId,
   setCurrentCwd,
@@ -74,6 +75,27 @@ describe('sessionPinId', () => {
     // After auto-compression the entry surfaces under a fresh tip id but keeps
     // the original root — pinning on the root keeps the pin stable.
     expect(sessionPinId(session({ id: 'tip', _lineage_root_id: 'root' }))).toBe('root')
+  })
+})
+
+describe('isDelegateSubagentSession', () => {
+  it('returns true for subagent sessions', () => {
+    expect(isDelegateSubagentSession(session({ source: 'subagent' }))).toBe(true)
+  })
+
+  it('returns false for normal user sessions', () => {
+    expect(isDelegateSubagentSession(session({ source: 'tui' }))).toBe(false)
+    expect(isDelegateSubagentSession(session({ source: 'cli' }))).toBe(false)
+    expect(isDelegateSubagentSession(session({ source: null }))).toBe(false)
+  })
+
+  it('returns false for branch sessions (source=tui with parent_session_id)', () => {
+    // Branch sessions have parent_session_id but source is NOT 'subagent'
+    expect(isDelegateSubagentSession(session({ source: 'tui', parent_session_id: 'parent-1' }))).toBe(false)
+  })
+
+  it('returns false for undefined (session not found in list)', () => {
+    expect(isDelegateSubagentSession(undefined)).toBe(false)
   })
 })
 

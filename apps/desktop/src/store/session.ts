@@ -125,6 +125,13 @@ function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
 export const sessionPinId = (session: Pick<SessionInfo, '_lineage_root_id' | 'id'>): string =>
   session._lineage_root_id ?? session.id
 
+/** True when the session is a delegate subagent — a transient child created by
+ *  `delegate_task` that should never be the cold-start resume target.
+ *  Matches the filter used by `list_sessions_rich` to hide these from the
+ *  sidebar (`_LISTABLE_CHILD_SQL` + `_delegate_from_json`). */
+export const isDelegateSubagentSession = (session: SessionInfo | undefined): boolean =>
+  session?.source === 'subagent'
+
 /** Merge a fresh server session page into the in-memory list, keeping any
  *  row the server omitted that we still want visible — both still-"working"
  *  sessions and pinned sessions.
