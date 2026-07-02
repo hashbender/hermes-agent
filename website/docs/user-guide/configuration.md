@@ -915,19 +915,16 @@ For Claude on **native Anthropic**, **OpenRouter**, and **Nous Portal**, Hermes 
 
 The Qwen Cloud (Alibaba DashScope) upstream caps cache TTL at 5 minutes, so Hermes uses the 5-minute breakpoint TTL there instead. Other Claude-via-third-party paths (AWS Bedrock, Azure Foundry) fall back to the provider's own caching defaults. xAI Grok uses a separate session-pinned conversation-id mechanism — see [xAI prompt caching](/integrations/providers#xai-grok--responses-api--prompt-caching).
 
-Caching is on by default and saves money even on single-turn conversations because the system prompt alone is a meaningful fraction of the input token count. It can be turned off entirely with the `enabled` knob below when a strict provider rejects `cache_control` markers.
+No knob exists to disable this — caching is always-on and saves money even on single-turn conversations because the system prompt alone is a meaningful fraction of the input token count.
 
-The explicit knobs are whether caching runs at all and the cache TTL tier Hermes requests on Anthropic-style breakpoints:
+The one explicit knob is the cache TTL tier Hermes requests on Anthropic-style breakpoints:
 
 ```yaml
 prompt_caching:
-  enabled: true    # set false to stop sending cache_control markers entirely
   cache_ttl: "5m"   # "5m" or "1h" (Anthropic-supported tiers); other values are ignored
 ```
 
 `cache_ttl` selects the breakpoint TTL Hermes attaches for Claude via the native Anthropic API, OpenRouter, and Nous Portal. Only the two Anthropic-supported tiers (`"5m"`, `"1h"`) are honored — any other value is ignored. Providers with their own caps (e.g. Qwen Cloud, which maxes at 5 minutes) still clamp to what the upstream allows.
-
-`enabled` defaults to `true`. Set it to `false` as an escape hatch for strict Anthropic-compatible proxies that inject their own `cache_control` markers server-side — stacking those on top of Hermes' breakpoints can exceed Anthropic's 4-breakpoint limit and return HTTP 400 `"A maximum of 4 blocks with cache_control may be provided"`. Disabling caching on that setup passes requests through without client-side markers so the proxy manages its own.
 
 ## Auxiliary Models
 
@@ -1625,7 +1622,7 @@ The master `streaming.enabled` switch is `false` by default — nothing streams 
 
 ## Group Chat Session Isolation
 
-Limit how many chat sessions can actively be open across CLI, TUI/dashboard,
+Limit how many chat sessions can be active at once across CLI, TUI/dashboard,
 and messaging gateway:
 
 ```yaml
@@ -1634,6 +1631,21 @@ max_concurrent_sessions: null  # null/0 = unlimited; positive integer = active s
 
 When the cap is reached, Hermes returns a direct limit message for new sessions.
 Existing active sessions keep their normal behavior.
+
+What counts as "active" is surface-specific:
+
+- **CLI**: an interactive `hermes` process holds a slot for its lifetime.
+- **Messaging gateway** (Telegram, Discord, …): a slot is held per in-flight
+  turn and released when the turn finishes.
+- **TUI / desktop / dashboard**: a tab claims its slot on its first message
+  (opening tabs or switching sessions is free) and keeps it while the
+  conversation is active. A tab with no activity for 30 minutes hands its
+  slot back automatically and transparently re-acquires it on the next
+  message — so open-but-idle tabs don't pin the cap overnight. If the cap is
+  full at re-acquire time, that message fails with the standard limit
+  message; retry when a slot frees up. Tune the idle window with the
+  `HERMES_TUI_LEASE_IDLE_S` environment variable (seconds; `0` keeps slots
+  held until the tab closes).
 
 The canonical key is top-level `max_concurrent_sessions`. Hermes also accepts
 `gateway.max_concurrent_sessions` as a fallback, but the top-level key wins when
