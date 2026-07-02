@@ -617,6 +617,36 @@ STEER_CHANNEL_NOTE = (
 # message representation stays consistent ("system" everywhere).
 DEVELOPER_ROLE_MODELS = ("gpt-5", "codex")
 
+TELEGRAM_MARKDOWNV2_HINT = (
+    "You are on a text messaging communication platform, Telegram. "
+    "Standard Markdown is automatically converted to Telegram MarkdownV2 "
+    "formatting. Supported: **bold**, *italic*, ~~strikethrough~~, "
+    "||spoiler||, `inline code`, ```code blocks```, [links](url), "
+    "## headers, bullet lists, and numbered lists. Avoid rich-only "
+    "constructs such as Markdown tables, task lists, collapsible details, "
+    "footnotes/references, math/formulas, underline, subscript/superscript, "
+    "marked text, and anchors unless rich Telegram messages are explicitly "
+    "enabled; they may render as raw text or fail in Telegram Web. Prefer "
+    "plain bullet lists or labeled key:value pairs for structured data. "
+    "You can send media files natively: to deliver a file to the user, "
+    "include MEDIA:/absolute/path/to/file in your response. Images "
+    "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
+    "bubbles, and videos (.mp4) play inline. You can also include image "
+    "URLs in markdown format ![alt](url) and they will be sent as native photos."
+)
+
+TELEGRAM_RICH_MARKDOWN_EXTENSION = (
+    "Telegram rich messages are enabled for this chat, so lean into rich "
+    "Markdown when it makes the answer clearer or easier to scan: actively "
+    "reach for real Markdown tables (pipe `| col | col |` syntax), bullet "
+    "and numbered lists, task lists (`- [ ]` / `- [x]`), headings, nested "
+    "blockquotes, collapsible details, footnotes/references, math/formulas "
+    "(`$...$`, `$$...$$`), underline, subscript/superscript, marked "
+    "(highlighted) text, and anchors. Default to structured formatting over "
+    "dense paragraphs for any comparison, set of steps, key/value summary, "
+    "or tabular data."
+)
+
 PLATFORM_HINTS = {
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "
@@ -650,30 +680,7 @@ PLATFORM_HINTS = {
         "(error 131047). This rarely matters for live chat, but is worth "
         "knowing if you're scheduling a delayed message."
     ),
-    "telegram": (
-        "You are on a text messaging communication platform, Telegram. "
-        "Standard Markdown is automatically converted to Telegram formatting. "
-        "Supported: **bold**, *italic*, ~~strikethrough~~, ||spoiler||, "
-        "`inline code`, ```code blocks```, [links](url), and ## headers. "
-        "Telegram now supports rich Markdown, so lean into it: whenever it "
-        "makes the answer clearer or easier to scan, actively reach for real "
-        "Markdown tables (pipe `| col | col |` syntax), bullet and numbered "
-        "lists, task lists (`- [ ]` / `- [x]`), headings, nested blockquotes, "
-        "collapsible details, footnotes/references, math/formulas (`$...$`, "
-        "`$$...$$`), underline, subscript/superscript, marked (highlighted) "
-        "text, and anchors. Default to structured formatting over dense "
-        "paragraphs for any comparison, set of steps, key/value summary, or "
-        "tabular data. Prefer real Markdown tables and task lists over "
-        "hand-built bullet substitutes when presenting structured data; these "
-        "degrade gracefully (tables become readable bullet groups) when rich "
-        "rendering is unavailable, but advanced constructs like math and "
-        "collapsible details may render as plain source text in that case. "
-        "You can send media files natively: to deliver a file to the user, "
-        "include MEDIA:/absolute/path/to/file in your response. Images "
-        "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
-        "bubbles, and videos (.mp4) play inline. You can also include image "
-        "URLs in markdown format ![alt](url) and they will be sent as native photos."
-    ),
+    "telegram": TELEGRAM_MARKDOWNV2_HINT,
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
@@ -874,7 +881,7 @@ WSL_ENVIRONMENT_HINT = (
 # runs. For these backends, host info (Windows/Linux/macOS, $HOME, cwd) is
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
-    "docker", "singularity", "modal", "daytona", "tenki", "ssh",
+    "docker", "singularity", "modal", "daytona", "ssh",
     "managed_modal",
 })
 
@@ -889,7 +896,6 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "modal": "a Modal sandbox (Linux)",
     "managed_modal": "a managed Modal sandbox (Linux)",
     "daytona": "a Daytona workspace (Linux)",
-    "tenki": "a Tenki sandbox (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
 }
 
@@ -950,8 +956,6 @@ def _probe_remote_backend(env_type: str) -> str | None:
             image = config.get("modal_image", "")
         elif env_type == "daytona":
             image = config.get("daytona_image", "")
-        elif env_type == "tenki":
-            image = config.get("tenki_image", "")
         else:
             image = ""
 
@@ -966,7 +970,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
             }
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "tenki"}:
+        if env_type in {"docker", "singularity", "modal", "daytona"}:
             container_config = {
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
@@ -981,15 +985,6 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "docker_extra_args": config.get("docker_extra_args", []),
                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                "tenki_project_id": config.get("tenki_project_id", ""),
-                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
             }
 
         env = _create_environment(
@@ -1065,7 +1060,7 @@ def build_environment_hints() -> str:
       and a Windows-only note that `terminal` shells out to bash, not
       PowerShell).
     - For **remote / sandbox** terminal backends (docker, singularity,
-      modal, daytona, tenki, ssh): host info is **suppressed**
+      modal, daytona, ssh): host info is **suppressed**
       because the agent's tools can't touch the host — only the backend
       matters. A live probe inside the backend reports its OS, user, $HOME,
       and cwd. Falls back to a static summary if the probe fails.
