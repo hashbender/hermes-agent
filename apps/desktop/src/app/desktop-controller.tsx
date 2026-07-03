@@ -65,6 +65,7 @@ import {
   $selectedStoredSessionId,
   $sessions,
   getRememberedSessionId,
+  isDelegateSubagentSession,
   sessionPinId,
   setAwaitingResponse,
   setBusy,
@@ -238,8 +239,14 @@ export function DesktopController() {
   }, [])
 
   // Remember the open chat so a relaunch reopens it instead of an empty new-chat.
+  // Skip delegate subagent sessions — they're transient children that should
+  // never be the cold-start target.  (#56983)
   useEffect(() => {
     if (routedSessionId) {
+      if (isDelegateSubagentSession($sessions.get().find(s => s.id === routedSessionId))) {
+        return
+      }
+
       setRememberedSessionId(routedSessionId)
     }
   }, [routedSessionId])
