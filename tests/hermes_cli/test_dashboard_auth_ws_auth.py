@@ -465,9 +465,9 @@ class TestWsHostOriginGuardOrigins:
     match-checked against the bound host.
     """
 
-    def _ws(self, *, origin, host):
+    def _ws(self, *, origin, host, **headers):
         ws = _fake_ws(query={}, path="/api/ws")
-        ws.headers = {"host": host, "origin": origin}
+        ws.headers = {"host": host, "origin": origin, **headers}
         return ws
 
     def test_loopback_file_origin_allowed(self, loopback_app):
@@ -491,6 +491,26 @@ class TestWsHostOriginGuardOrigins:
         # DNS-rebinding / cross-site: a real web attacker can only present an
         # http(s) origin, and that must still be rejected.
         ws = self._ws(origin="http://evil.test", host="127.0.0.1:8080")
+        assert web_server._ws_host_origin_is_allowed(ws) is False
+
+    def test_loopback_tunnel_forwarded_origin_allowed(self, loopback_app):
+        # Reverse proxies/tunnels often rewrite Host to the local bind address
+        # while the browser keeps the immutable public Origin.  If the proxy
+        # supplies the forwarded public host, allow that exact Origin host so
+        # the dashboard PTY websocket works through Cloudflare/Tailscale/ngrok.
+        ws = self._ws(
+            origin="https://dashboard.example.com",
+            host="127.0.0.1:8080",
+            **{"x-forwarded-host": "dashboard.example.com"},
+        )
+        assert web_server._ws_host_origin_is_allowed(ws) is True
+
+    def test_loopback_tunnel_unrelated_origin_rejected(self, loopback_app):
+        ws = self._ws(
+            origin="https://evil.test",
+            host="127.0.0.1:8080",
+            **{"x-forwarded-host": "dashboard.example.com"},
+        )
         assert web_server._ws_host_origin_is_allowed(ws) is False
 
     def test_explicit_non_loopback_file_origin_allowed(self, insecure_explicit_host_app):
