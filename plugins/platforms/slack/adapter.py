@@ -427,6 +427,14 @@ class SlackAdapter(BasePlatformAdapter):
     # the prefix that works everywhere — instruction text must show it.
     typed_command_prefix = "!"
 
+    # Slack has both halves the ``in_channel`` continuable-cron surface needs:
+    # a flat-reply outbound gate (``reply_in_thread: false`` → ``_resolve_thread_ts``
+    # returns None for top-level channel messages) AND a whole-channel inbound
+    # session bucket keyed ``(platform, channel_id, None)`` (the same
+    # ``reply_in_thread: false`` path in ``_handle_slack_message``).  So a
+    # continuable cron delivered flat here continues in-context on a plain reply.
+    supports_inchannel_continuable = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
         self._app: Optional[Any] = None
@@ -1073,6 +1081,7 @@ class SlackAdapter(BasePlatformAdapter):
 
                 self._warn_if_missing_group_dm_scopes(auth_response, team_name)
                 self._warn_if_not_bot_token(auth_response, team_name)
+                self._warn_if_inchannel_without_flat_reply(team_name)
 
             # Register message event handler
             @self._app.event("message")
@@ -1398,7 +1407,21 @@ class SlackAdapter(BasePlatformAdapter):
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
-                last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                try:
+                    last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                except Exception as e:
+                    if kwargs.get("blocks") and self._is_block_payload_rejection(e):
+                        retry_kwargs = dict(kwargs)
+                        retry_kwargs.pop("blocks", None)
+                        logger.info(
+                            "[Slack] Block Kit payload rejected; retrying send without blocks: %s",
+                            e,
+                        )
+                        last_result = await self._get_client(chat_id).chat_postMessage(
+                            **retry_kwargs
+                        )
+                    else:
+                        raise
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -1489,7 +1512,22 @@ class SlackAdapter(BasePlatformAdapter):
                 blocks = self._maybe_blocks(content)
                 if blocks:
                     update_kwargs["blocks"] = blocks
-            await self._get_client(chat_id).chat_update(**update_kwargs)
+            try:
+                await self._get_client(chat_id).chat_update(**update_kwargs)
+            except Exception as e:
+                if update_kwargs.get("blocks") and self._is_block_payload_rejection(e):
+                    retry_kwargs = dict(update_kwargs)
+                    # Explicitly clear any stale blocks when falling back to the
+                    # flat text update path; otherwise Slack can preserve the
+                    # prior block layout for an edited message.
+                    retry_kwargs["blocks"] = []
+                    logger.info(
+                        "[Slack] Block Kit payload rejected; retrying edit without blocks: %s",
+                        e,
+                    )
+                    await self._get_client(chat_id).chat_update(**retry_kwargs)
+                else:
+                    raise
             if finalize:
                 await self.stop_typing(chat_id)
             return SendResult(success=True, message_id=message_id)
@@ -1561,6 +1599,62 @@ class SlackAdapter(BasePlatformAdapter):
         if raw is None:
             return True  # default: each DM thread is its own session
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _cron_continuable_surface(self) -> str:
+        """Resolve the continuable-cron delivery surface for this platform.
+
+        Values: ``"thread"`` (default — today's behaviour: a continuable cron
+        job opens a dedicated hidden thread and seeds it) or ``"in_channel"``
+        (deliver FLAT into the channel timeline; the shared-channel session
+        ``(slack, channel_id, None)`` is the continuation surface).  Set
+        ``platforms.slack.extra.cron_continuable_surface: in_channel`` in
+        config.yaml.  Pair with ``reply_in_thread: false`` so the user's reply
+        is answered flat in the channel and keyed to the same shared session —
+        see ``_warn_if_inchannel_without_flat_reply``.  Any unrecognised value
+        coerces to ``"thread"`` (fail safe).
+        """
+        raw = self.config.extra.get("cron_continuable_surface")
+        if raw is None:
+            return "thread"
+        val = str(raw).strip().lower()
+        return "in_channel" if val == "in_channel" else "thread"
+
+    def _warn_if_inchannel_without_flat_reply(self, team_name: str) -> None:
+        """Warn when ``in_channel`` is set without the required ``reply_in_thread: false`` pairing.
+
+        The two knobs are orthogonal (D4/D5): ``cron_continuable_surface:
+        in_channel`` skips thread creation on delivery, and ``reply_in_thread:
+        false`` makes the bot answer inbound channel messages flat and key them
+        to the whole-channel session ``(slack, channel_id, None)``.  For a
+        continuable in-channel cron to actually continue on a plain reply, BOTH
+        must hold: the seed lands in the shared-channel session, and the reply
+        must resolve to (and be answered in) that same flat session.
+
+        Enforcement is WARN, not hard-require (D5): the misconfiguration fails
+        SAFE — ``in_channel`` without ``reply_in_thread: false`` yields a
+        threaded continuation (≈ today's behaviour), never a dropped/orphaned
+        session — so a config-load rejection would be heavier than warranted
+        and would make the two knobs non-orthogonal.  Mirrors the existing
+        connect-time warning pattern (``_warn_if_missing_group_dm_scopes``,
+        ``_warn_if_not_bot_token``).
+        """
+        try:
+            if self._cron_continuable_surface() != "in_channel":
+                return
+            # reply_in_thread defaults True (legacy: reply in a thread).
+            if self.config.extra.get("reply_in_thread", True):
+                logger.warning(
+                    "[Slack] %s: cron_continuable_surface=in_channel is set "
+                    "WITHOUT reply_in_thread=false. A continuable in-channel "
+                    "cron job will deliver flat, but the bot will still reply "
+                    "to your continuation in a thread — so it falls back to a "
+                    "threaded continuation (\u2248 default behaviour), not the "
+                    "flat channel session you asked for. Set "
+                    "platforms.slack.extra.reply_in_thread: false to pair them.",
+                    team_name,
+                )
+        except Exception:
+            pass
 
     def _resolve_thread_ts(
         self,
@@ -1804,6 +1898,31 @@ class SlackAdapter(BasePlatformAdapter):
         return self._is_retryable_error(body)
 
     # ----- Markdown → mrkdwn conversion -----
+
+    @staticmethod
+    def _is_block_payload_rejection(error: BaseException) -> bool:
+        """Return True for Slack errors recoverable by removing ``blocks``.
+
+        Rich Block Kit output is a progressive enhancement over the plain
+        ``text`` fallback. If Slack rejects the structured payload as invalid
+        or too large, retrying the same content without blocks is safe and
+        prevents a formatting bug from dropping the whole response.
+        """
+        recoverable_codes = {
+            "invalid_blocks",
+            "msg_too_long",
+            "too_many_blocks",
+        }
+        response = getattr(error, "response", None)
+        response_get = getattr(response, "get", None)
+        if callable(response_get):
+            try:
+                if response_get("error") in recoverable_codes:
+                    return True
+            except Exception:
+                pass
+        message = str(error)
+        return any(code in message for code in recoverable_codes)
 
     def _rich_blocks_enabled(self) -> bool:
         """Whether to render outbound agent messages as Slack Block Kit blocks.
