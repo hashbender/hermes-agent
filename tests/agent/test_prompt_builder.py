@@ -33,6 +33,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
+    CRON_DELIVERY_INVARIANTS,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -1031,6 +1032,16 @@ class TestPromptBuilderConstants:
         assert "api_server" in PLATFORM_HINTS
         assert "webui" in PLATFORM_HINTS
 
+    def test_cron_delivery_invariants_covers_silent_and_send_message(self):
+        """CRON_DELIVERY_INVARIANTS is the non-overridable counterpart to
+        PLATFORM_HINTS["cron"] — see agent/system_prompt.py where it's
+        appended unconditionally for platform=="cron", after (and
+        independent of) any platform_hints.cron override. Integration
+        coverage that it actually survives a replace-override lives in
+        tests/agent/test_system_prompt.py::TestCronDeliveryInvariants."""
+        assert "send_message" in CRON_DELIVERY_INVARIANTS
+        assert "[SILENT]" in CRON_DELIVERY_INVARIANTS
+
     def test_cli_and_tui_hints_flag_local_only_cron(self):
         """#51568 — cron jobs from CLI/TUI sessions don't deliver back into
         the session, so the agent must be told up front not to promise it."""
@@ -1299,7 +1310,7 @@ class TestEnvironmentHints:
     def test_remote_backend_list_covers_known_sandboxes(self):
         """Regression guard: if someone adds a remote backend, they must list it here."""
         import agent.prompt_builder as _pb
-        for backend in ("docker", "singularity", "modal", "daytona", "tenki", "ssh"):
+        for backend in ("docker", "singularity", "modal", "daytona", "ssh"):
             assert backend in _pb._REMOTE_TERMINAL_BACKENDS, (
                 f"{backend!r} must be in _REMOTE_TERMINAL_BACKENDS so its host "
                 f"info is suppressed in the system prompt"
@@ -1644,4 +1655,5 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
+
 

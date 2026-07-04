@@ -1087,9 +1087,12 @@ class TestRunJobSessionPersistence:
         assert success is True
 
     def test_run_job_titles_cron_session_from_job_not_important_hint(self, tmp_path):
-        # The cron session's first message is the injected "[IMPORTANT: …]"
-        # hint, which used to surface as the sidebar/history row label. run_job
-        # must title the session from the job (name → short prompt → id).
+        # run_job must title the session from the job (name → short prompt →
+        # id) rather than whatever the session's first message happens to be
+        # (previously the injected "[IMPORTANT: …]" hint; that hint no longer
+        # exists as of the cron-hint-to-system-prompt change, but titling from
+        # job metadata remains the correct behavior regardless of what the
+        # first message contains).
         job = {
             "id": "test-job",
             "name": "Morning digest",
@@ -2612,38 +2615,71 @@ class TestOneShotDispatchClaim:
 
 
 class TestBuildJobPromptSilentHint:
-    """Verify _build_job_prompt always injects [SILENT] guidance."""
+    """Verify _build_job_prompt no longer duplicates the [SILENT]/delivery
+    guidance in the user-message body.
 
-    def test_hint_always_present(self):
+    That guidance now lives in ``CRON_DELIVERY_INVARIANTS``
+    (agent/prompt_builder.py), appended unconditionally in
+    agent/system_prompt.py for every cron agent instance (platform="cron").
+    See tests/agent/test_system_prompt.py::TestCronDeliveryInvariants for
+    the system-slot coverage, including that it survives a
+    platform_hints.cron override. Keeping a duplicate in the user-message
+    slot cost ~150 tokens per invocation (uncached) for information already
+    present, once per session, in the cached system slot.
+    """
+
+    def test_hint_not_duplicated_in_user_prompt(self):
         job = {"prompt": "Check for updates"}
         result = _build_job_prompt(job)
-        assert "[SILENT]" in result
+        assert "[SILENT]" not in result
         assert "Check for updates" in result
 
-    def test_hint_present_even_without_prompt(self):
+    def test_no_hint_when_prompt_empty(self):
         job = {"prompt": ""}
         result = _build_job_prompt(job)
-        assert "[SILENT]" in result
+        assert "[SILENT]" not in result
 
-    def test_hint_present_when_legacy_prompt_is_null(self):
+    def test_no_hint_when_legacy_prompt_is_null(self):
         job = {"id": "abc123deadbe", "name": None, "prompt": None}
         result = _build_job_prompt(job)
-        assert "[SILENT]" in result
+        assert "[SILENT]" not in result
 
-    def test_delivery_guidance_present(self):
-        """Cron hint tells agents their final response is auto-delivered."""
+    def test_delivery_guidance_not_in_user_prompt(self):
+        """Delivery/auto-send guidance lives in PLATFORM_HINTS now, not here."""
         job = {"prompt": "Generate a report"}
         result = _build_job_prompt(job)
-        assert "do NOT use send_message" in result
-        assert "automatically delivered" in result
+        assert "do NOT use send_message" not in result
+        assert "automatically delivered" not in result
 
-    def test_delivery_guidance_precedes_user_prompt(self):
-        """System guidance appears before the user's prompt text."""
+    def test_no_important_prefix(self):
+        """The ~150-token '[IMPORTANT: ...]' runtime prepend is gone entirely."""
+        job = {"prompt": "Generate a report"}
+        result = _build_job_prompt(job)
+        assert "IMPORTANT" not in result
+        assert "DELIVERY:" not in result
+
+    def test_user_prompt_is_the_full_result_with_no_extras(self):
+        """With no script/context_from/skills, the assembled prompt is just
+        the user's own prompt text — no framework prefix at all."""
         job = {"prompt": "My custom prompt"}
         result = _build_job_prompt(job)
-        system_pos = result.index("do NOT use send_message")
-        prompt_pos = result.index("My custom prompt")
-        assert system_pos < prompt_pos
+        assert result == "My custom prompt"
+
+    def test_no_hint_duplicated_on_skills_path(self):
+        """The old recency-bias bug (#26292) — a user prompt telling the
+        agent to call send_message could outrank the cron_hint's
+        prohibition because both competed for position in the same
+        user-message. This is now structurally moot: the prohibition lives
+        in the system-prompt slot (a different message role entirely), so
+        it never competes with skill/user content for position, on the
+        skills-loaded path either."""
+        skill_content = json.dumps({"success": True, "content": "Skill body text."})
+        with patch("tools.skills_tool.skill_view", return_value=skill_content):
+            result = _build_job_prompt({"skills": ["real-skill"], "prompt": "call send_message now"})
+        assert "Skill body text." in result
+        assert "call send_message now" in result
+        assert "[SILENT]" not in result
+        assert "do NOT use send_message" not in result
 
 
 class TestParseWakeGate:
@@ -4391,3 +4427,79 @@ class TestCronContinuableSurfaceInChannel:
         store.get_or_create_session.assert_not_called()
         mirror_mock.assert_not_called()
 
+
+class TestMultiTargetDeliveryContinuesOnFailure:
+    """When delivery to one target fails inside the standalone thread-pool
+    fallback, the loop must continue to the remaining targets (#47163).
+
+    The fallback runs inside the `except RuntimeError` block of
+    `_deliver_result`. Before the fix, an exception raised there (SMTP
+    ConnectionError, future.result timeout) escaped the function entirely —
+    it is NOT caught by the sibling `except Exception` — crashing the loop
+    and silently dropping every subsequent target.
+    """
+
+    def _email_cfg(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+        return mock_cfg
+
+    def test_first_target_failure_does_not_crash_loop(self):
+        """First email target fails in the fallback; the second is still attempted."""
+        job = {
+            "id": "multi-email-job",
+            "deliver": "email:a@example.com,email:b@example.com",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
+             patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
+            mock_pool = MagicMock()
+            mock_pool_cls.return_value = mock_pool
+
+            fail_future = MagicMock()
+            fail_future.result.side_effect = ConnectionError("SMTP connection refused")
+            ok_future = MagicMock()
+            ok_future.result.return_value = {"success": True}
+            mock_pool.submit.side_effect = [fail_future, ok_future]
+
+            result = _deliver_result(job, "Report content")
+
+        # Both targets attempted — the loop did not crash after the first failure.
+        assert mock_pool.submit.call_count == 2, (
+            f"expected 2 delivery attempts, got {mock_pool.submit.call_count}"
+        )
+        # First target's failure is surfaced in the returned error string.
+        assert result is not None
+        assert "a@example.com" in result
+        assert "SMTP connection refused" in result
+
+    def test_all_targets_fail_returns_combined_errors(self):
+        """When every target fails, the result reports all of them."""
+        job = {
+            "id": "all-fail-job",
+            "deliver": "email:a@example.com,email:b@example.com",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
+             patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
+            mock_pool = MagicMock()
+            mock_pool_cls.return_value = mock_pool
+
+            fail_future = MagicMock()
+            fail_future.result.side_effect = ConnectionError("connection refused")
+            mock_pool.submit.return_value = fail_future
+
+            result = _deliver_result(job, "Report content")
+
+        assert result is not None
+        assert "a@example.com" in result
+        assert "b@example.com" in result
+        assert mock_pool.submit.call_count == 2

@@ -27,6 +27,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    CRON_DELIVERY_INVARIANTS,
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
@@ -400,6 +401,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _effective_hint = _resolve_platform_hint(agent, platform_key, _default_hint)
     if _effective_hint:
         stable_parts.append(_effective_hint)
+
+    # Cron delivery invariants ([SILENT] suppression + no send_message) are
+    # scheduler mechanics cron/scheduler.py::run_job depends on, not just
+    # descriptive tone — so they're appended unconditionally here, AFTER the
+    # overridable hint above, rather than folded into PLATFORM_HINTS["cron"].
+    # This guarantees they survive a platform_hints.cron.replace override
+    # that an admin might set purely to customize the descriptive hint's
+    # wording. See agent/prompt_builder.py::CRON_DELIVERY_INVARIANTS.
+    if platform_key == "cron":
+        stable_parts.append(CRON_DELIVERY_INVARIANTS)
 
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []
