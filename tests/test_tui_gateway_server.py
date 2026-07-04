@@ -3249,6 +3249,32 @@ def test_config_set_model_uses_live_switch_path(monkeypatch):
     assert seen["args"] == ("sid", "session-key", "new/model")
 
 
+def test_config_set_model_rejects_missing_session_id(monkeypatch):
+    server._sessions.pop("missing", None)
+    monkeypatch.setattr(
+        server,
+        "_apply_model_switch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("missing session must not fall back to global model switch")
+        ),
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.set",
+            "params": {
+                "session_id": "missing",
+                "key": "model",
+                "value": "new/model",
+            },
+        }
+    )
+
+    assert resp["error"]["code"] == 4001
+    assert resp["error"]["message"] == "session not found"
+
+
 def test_config_set_model_requires_confirmation_for_expensive_model(monkeypatch):
     class _Agent:
         provider = "openrouter"
