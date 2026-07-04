@@ -1055,6 +1055,7 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
+    override_request_overrides: Optional[Dict[str, Any]] = None,
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1200,6 +1201,18 @@ def _build_child_agent(
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
     effective_api_key = override_api_key or parent_api_key
+    parent_request_overrides = getattr(parent_agent, "request_overrides", None)
+    if override_request_overrides is not None:
+        effective_request_overrides = dict(override_request_overrides or {})
+    elif override_provider or override_base_url or override_api_mode:
+        # A configured delegation target is a distinct runtime route; do not
+        # leak parent provider-specific request overrides into it.
+        effective_request_overrides = {}
+    else:
+        # Normal delegation inherits the parent's resolved runtime route.  This
+        # must include request_overrides so provider-specific request settings
+        # survive into subagents instead of reverting to SDK defaults.
+        effective_request_overrides = dict(parent_request_overrides or {})
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -1327,6 +1340,7 @@ def _build_child_agent(
         provider_sort=child_provider_sort,
         openrouter_min_coding_score=child_openrouter_min_coding_score,
         tool_progress_callback=child_progress_cb,
+        request_overrides=effective_request_overrides,
         iteration_budget=None,  # fresh budget per subagent
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
@@ -2502,6 +2516,7 @@ def delegate_task(
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
+                override_request_overrides=creds.get("request_overrides"),
                 override_acp_command=t.get("acp_command")
                 or acp_command
                 or creds.get("command"),
@@ -3062,6 +3077,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "request_overrides": {},
         }
 
     if not configured_provider:
@@ -3072,6 +3088,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": None,
             "api_key": None,
             "api_mode": None,
+            "request_overrides": None,
         }
 
     # Provider is configured — resolve full credentials
@@ -3100,6 +3117,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
+        "request_overrides": dict(runtime.get("request_overrides") or {}),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }
