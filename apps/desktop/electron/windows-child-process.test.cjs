@@ -92,9 +92,28 @@ test('desktop backend teardown tree-kills Windows backend descendants', () => {
 
   const quitIndex = source.indexOf("app.on('before-quit'")
   assert.notEqual(quitIndex, -1, 'missing before-quit handler')
-  const quitSnippet = source.slice(quitIndex, quitIndex + 900)
+  const quitSnippet = source.slice(quitIndex, quitIndex + 1300)
   assert.match(quitSnippet, /stopBackendChild\(hermesProcess\)/)
   assert.doesNotMatch(quitSnippet, /hermesProcess\.kill\('SIGTERM'\)/)
+})
+
+test('pet overlay quit close preserves popped-out preference', () => {
+  const source = readElectronFile('main.cjs')
+
+  const overlayStartIndex = source.indexOf('function spawnPetOverlayWindow(bounds)')
+  assert.notEqual(overlayStartIndex, -1, 'missing pet overlay window factory')
+  const overlayCloseIndex = source.indexOf("win.on('closed', () => {", overlayStartIndex)
+  assert.notEqual(overlayCloseIndex, -1, 'missing pet overlay closed handler')
+  const overlayCloseSnippet = source.slice(overlayCloseIndex, overlayCloseIndex + 500)
+  assert.match(overlayCloseSnippet, /!closingPetOverlayForAppQuit/)
+  assert.match(overlayCloseSnippet, /hermes:pet-overlay:control/)
+  assert.match(overlayCloseSnippet, /type: 'pop-in'/)
+
+  const quitIndex = source.indexOf("app.on('before-quit'")
+  assert.notEqual(quitIndex, -1, 'missing before-quit handler')
+  const quitSnippet = source.slice(quitIndex, quitIndex + 500)
+  assert.match(quitSnippet, /closingPetOverlayForAppQuit = true/)
+  assert.match(quitSnippet, /closePetOverlay\(\)/)
 })
 
 test('intentional or interactive desktop child processes stay documented', () => {
