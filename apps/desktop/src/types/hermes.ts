@@ -153,6 +153,7 @@ export interface MemoryProviderConfig {
 
 export interface MessagingEnvVarInfo {
   advanced: boolean
+  default_value?: null | string
   description: string
   is_password: boolean
   is_set: boolean
@@ -160,7 +161,10 @@ export interface MessagingEnvVarInfo {
   prompt: string
   redacted_value: null | string
   required: boolean
+  options?: Array<{ label: string; value: string }>
   url: null | string
+  value?: null | string
+  visible_when?: null | { key: string; values: string[] }
 }
 
 export interface MessagingHomeChannel {
