@@ -574,11 +574,19 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
     """
-    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+    from agent.skill_utils import (
+        get_all_skills_dirs,
+        is_excluded_skill_path,
+        iter_skill_index_files,
+    )
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
-        for skill_md in skills_dir.rglob("SKILL.md"):
+        # Path.rglob does NOT descend into symlinked directories, so skills
+        # installed as symlinks (common in multi-profile setups) are invisible
+        # to skill_manage. iter_skill_index_files uses os.walk(followlinks=True),
+        # matching the behaviour of the skill loader (agent/skill_utils.py).
+        for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
             if is_excluded_skill_path(skill_md):
                 continue
             if skill_md.parent.name == name:
@@ -598,7 +606,10 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
     matches: List[Tuple[str, Path]] = []
     try:
         from hermes_constants import get_default_hermes_root
-        from agent.skill_utils import is_excluded_skill_path
+        from agent.skill_utils import (
+            is_excluded_skill_path,
+            iter_skill_index_files,
+        )
     except Exception:
         return matches
 
@@ -641,7 +652,9 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
         if not skills_dir.is_dir():
             continue
         try:
-            for skill_md in skills_dir.rglob("SKILL.md"):
+            # Same symlink fix as _find_skill — rglob doesn't follow
+            # symlinked directories, but iter_skill_index_files does.
+            for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
                 if is_excluded_skill_path(skill_md):
                     continue
                 if skill_md.parent.name == name:
