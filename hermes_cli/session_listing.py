@@ -5,6 +5,27 @@ from __future__ import annotations
 from typing import Any
 
 
+def is_empty_session_placeholder(row: dict[str, Any]) -> bool:
+    """Return True for non-conversational placeholder rows.
+
+    These rows can be created by session lifecycle edge cases and should not
+    appear in user-facing resume/list pickers. Keep the predicate narrow so
+    titled or preview-bearing zero-message rows remain visible to management
+    surfaces that intentionally show them.
+    """
+    if "message_count" not in row:
+        return False
+    try:
+        message_count = int(row.get("message_count") or 0)
+    except (TypeError, ValueError):
+        message_count = 0
+    if message_count > 0:
+        return False
+    title = str(row.get("title") or "").strip()
+    preview = str(row.get("preview") or "").strip()
+    return not title and not preview
+
+
 def parse_session_listing_args(raw_args: str) -> tuple[bool, bool, str]:
     """Parse `/sessions`-style args into listing flags plus a resume target.
 
@@ -58,6 +79,8 @@ def query_session_listing(
     )
     result: list[dict[str, Any]] = []
     for row in rows:
+        if is_empty_session_placeholder(row):
+            continue
         if current_session_id and row.get("id") == current_session_id:
             continue
         if not include_unnamed and not row.get("title"):

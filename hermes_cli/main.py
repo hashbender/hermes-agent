@@ -616,6 +616,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_stepfun,
     _model_flow_bedrock_api_key,
     _model_flow_bedrock,
+    _model_flow_vertex,
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
@@ -3109,6 +3110,8 @@ def select_provider_and_model(args=None):
         _model_flow_stepfun(config, current_model)
     elif selected_provider == "bedrock":
         _model_flow_bedrock(config, current_model)
+    elif selected_provider == "vertex":
+        _model_flow_vertex(config, current_model)
     elif selected_provider == "azure-foundry":
         _model_flow_azure_foundry(config, current_model)
     elif selected_provider in {
@@ -11902,7 +11905,7 @@ def _build_provider_choices() -> list[str]:
         # Fallback: static list guarantees the CLI always works
         return [
             "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
-            "anthropic", "gemini", "xai", "bedrock", "azure-foundry",
+            "anthropic", "gemini", "vertex", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
             "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
@@ -13258,11 +13261,13 @@ def main():
         # Hide third-party tool sessions by default, but honour explicit --source
         _source = getattr(args, "source", None)
         _exclude = None if _source else ["tool"]
+        from hermes_cli.session_listing import is_empty_session_placeholder
 
         if action == "list":
             sessions = db.list_sessions_rich(
                 source=args.source, exclude_sources=_exclude, limit=args.limit
             )
+            sessions = [s for s in sessions if not is_empty_session_placeholder(s)]
             if not sessions:
                 print("No sessions found.")
                 return
@@ -13371,6 +13376,7 @@ def main():
             sessions = db.list_sessions_rich(
                 source=source, exclude_sources=_browse_exclude, limit=limit
             )
+            sessions = [s for s in sessions if not is_empty_session_placeholder(s)]
             db.close()
             if not sessions:
                 print("No sessions found.")
