@@ -18,6 +18,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from utils import is_truthy_value
@@ -540,7 +541,42 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
         tg_name = _sanitize_telegram_name(name)
         if tg_name:
             result.append((tg_name, description))
+    for name, description in _iter_quick_command_entries():
+        tg_name = _sanitize_telegram_name(name)
+        if tg_name:
+            result.append((tg_name, description))
     return result
+
+
+def _iter_quick_command_entries() -> list[tuple[str, str]]:
+    """Return user-configured quick commands for menu surfaces.
+
+    Quick commands are configured in ``~/.hermes/config.yaml`` and dispatch in
+    both CLI and gateway without an agent turn. They should be discoverable in
+    Telegram's command menu alongside built-ins and plugin commands.
+    """
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return []
+    try:
+        config_path = Path(os.environ.get("HERMES_CONFIG") or Path.home() / ".hermes" / "config.yaml")
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    quick_commands = raw.get("quick_commands") if isinstance(raw, dict) else None
+    if not isinstance(quick_commands, dict):
+        return []
+    entries: list[tuple[str, str]] = []
+    for name, meta in quick_commands.items():
+        if not isinstance(name, str) or not isinstance(meta, dict):
+            continue
+        qtype = str(meta.get("type") or "").strip()
+        if qtype not in {"exec", "alias"}:
+            continue
+        desc = str(meta.get("description") or f"Run /{name}").strip()
+        entries.append((name, desc[:80] or f"Run /{name}"))
+    return entries
 
 
 # Telegram allows up to 100 BotCommands. Hermes ships ~50 built-in commands;
