@@ -1,29 +1,19 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $sidebarAgentsGrouped } from '@/store/layout'
 
 import {
   $activeProjectId,
   $projectScope,
-  $projectsRpcAvailable,
   $worktreeRefreshToken,
   ALL_PROJECTS,
   createProject,
   enterProject,
   exitProjectScope,
-  openProjectCreate,
   pickProjectFolder,
-  refreshProjects,
+  revealPath,
   refreshWorktrees
 } from './projects'
-
-vi.mock('@/i18n', () => ({
-  translateNow: (key: string) => key
-}))
-
-vi.mock('@/store/notifications', () => ({
-  notify: vi.fn()
-}))
 
 vi.mock('@/lib/desktop-fs', () => ({
   desktopDefaultCwd: vi.fn(),
@@ -44,8 +34,6 @@ const selectDesktopPaths = vi.mocked(fs.selectDesktopPaths)
 
 const gw = await import('@/store/gateway')
 const activeGateway = vi.mocked(gw.activeGateway)
-const notifications = await import('@/store/notifications')
-const notify = vi.mocked(notifications.notify)
 
 describe('project scope', () => {
   beforeEach(() => {
@@ -89,6 +77,38 @@ describe('worktree refresh', () => {
   })
 })
 
+describe('revealPath', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    Reflect.deleteProperty(window, 'hermesDesktop')
+  })
+
+  it('uses the local desktop bridge in local mode', async () => {
+    const reveal = vi.fn().mockResolvedValue(true)
+
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { revealPath: reveal } })
+    isDesktopFsRemoteMode.mockReturnValue(false)
+
+    await revealPath('/local/repo')
+
+    expect(reveal).toHaveBeenCalledWith('/local/repo')
+  })
+
+  it('does not call the local desktop bridge in remote mode', async () => {
+    const reveal = vi.fn().mockResolvedValue(true)
+
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { revealPath: reveal } })
+    isDesktopFsRemoteMode.mockReturnValue(true)
+
+    await revealPath('/backend/repo')
+
+    expect(reveal).not.toHaveBeenCalled()
+  })
+})
+
 describe('pickProjectFolder', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -128,7 +148,6 @@ describe('createProject', () => {
     vi.clearAllMocks()
     $sidebarAgentsGrouped.set(false)
     $activeProjectId.set(null)
-    $projectsRpcAvailable.set(null)
   })
 
   it('creates the project and flips into the grouped view so a blank slate shows it', async () => {
@@ -152,45 +171,5 @@ describe('createProject', () => {
     expect(request).toHaveBeenCalledWith('projects.create', expect.objectContaining({ name: 'Demo' }))
     expect($sidebarAgentsGrouped.get()).toBe(true)
     expect($activeProjectId.get()).toBe('p_new')
-  })
-
-  it('marks the backend stale and surfaces a friendly error when projects.create is missing', async () => {
-    activeGateway.mockReturnValue({
-      connectionState: 'open',
-      request: vi.fn().mockRejectedValue(new Error('unknown method: projects.create'))
-    } as never)
-
-    await expect(createProject({ folders: ['/srv/demo'], name: 'Demo' })).rejects.toThrow(
-      'sidebar.projects.staleBackend'
-    )
-    expect($projectsRpcAvailable.get()).toBe(false)
-  })
-})
-
-describe('projects RPC capability', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    $projectsRpcAvailable.set(null)
-  })
-
-  it('marks the backend stale when projects.list is missing', async () => {
-    activeGateway.mockReturnValue({
-      connectionState: 'open',
-      request: vi.fn().mockRejectedValue(new Error('unknown method: projects.list'))
-    } as never)
-
-    await refreshProjects()
-
-    expect($projectsRpcAvailable.get()).toBe(false)
-  })
-
-  it('blocks opening the create dialog once the backend is known stale', () => {
-    $projectsRpcAvailable.set(false)
-
-    openProjectCreate()
-
-    expect(notify).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'warning', message: 'sidebar.projects.staleBackend' })
-    )
   })
 })

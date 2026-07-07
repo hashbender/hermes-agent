@@ -11,15 +11,13 @@ declare global {
   interface Window {
     hermesDesktop: {
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
-      // the window's backend; pass a named profile to lazily spawn/reuse that
-      // profile's backend from the pool.
+      // the active remote gateway; pass a named profile to resolve that
+      // profile's remote descriptor.
       getConnection: (profile?: string | null) => Promise<HermesConnection>
-      // Reconnect-after-wake recovery: liveness-probe the cached PRIMARY backend
-      // and drop it if a remote one has gone unreachable, so the next
+      // Reconnect-after-wake recovery: liveness-probe the cached PRIMARY
+      // remote and drop it if it has gone unreachable, so the next
       // getConnection() rebuilds a reachable descriptor instead of the renderer
-      // re-dialing a dead remote forever. No-op for local backends (they
-      // self-heal via the child 'exit' handler). `rebuilt` is true when a stale
-      // remote cache was dropped.
+      // re-dialing a dead remote forever.
       revalidateConnection: () => Promise<{ ok: boolean; rebuilt: boolean }>
       // Keepalive: mark a pool profile backend as recently used so the idle
       // reaper spares it while its chat is active.
@@ -57,9 +55,8 @@ declare global {
       oauthLogoutConnectionConfig: (remoteUrl?: string) => Promise<DesktopOauthLogoutResult>
       profile: {
         get: () => Promise<DesktopActiveProfile>
-        // Persists the desktop's profile choice and relaunches the local
-        // backend under the new HERMES_HOME (reloads the window). Pass null to
-        // clear the preference.
+        // Persists the desktop's remote profile choice and reloads the window.
+        // Pass null to clear the preference.
         set: (name: string | null) => Promise<DesktopActiveProfile>
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
@@ -169,11 +166,6 @@ declare global {
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
       onPowerResume?: (callback: () => void) => () => void
       onBootProgress: (callback: (payload: DesktopBootProgress) => void) => () => void
-      getBootstrapState: () => Promise<DesktopBootstrapState>
-      resetBootstrap: () => Promise<{ ok: boolean }>
-      repairBootstrap: () => Promise<{ ok: boolean }>
-      cancelBootstrap: () => Promise<{ ok: boolean; cancelled: boolean }>
-      onBootstrapEvent: (callback: (payload: DesktopBootstrapEvent) => void) => () => void
       getVersion: () => Promise<DesktopVersionInfo>
       getRemoteDisplayReason?: () => Promise<string | null>
       updates: {
@@ -237,17 +229,15 @@ export interface DesktopVersionInfo {
   electronVersion: string
   nodeVersion: string
   platform: string
-  hermesRoot: string
+  hermesRoot: null | string
 }
 
-export type DesktopUninstallMode = 'full' | 'gui' | 'lite'
+export type DesktopUninstallMode = 'app'
 
 export interface DesktopUninstallSummary {
-  hermes_home: string
-  agent_installed: boolean
+  app_installed: boolean
+  backend_managed: false
   gui_installed: boolean
-  source_built_artifacts: string[]
-  packaged_app_paths: string[]
   userdata_dir: string
   userdata_exists: boolean
   platform: string
@@ -298,11 +288,11 @@ export interface DesktopUpdateApplyResult {
   branch?: string
   error?: string
   message?: string
-  /** True when no staged updater exists (CLI install) and the user should run
-   *  `hermes update` themselves. `command` is the exact line to run. */
+  /** True when a client update must be completed outside the app. `command`
+   *  carries a displayable hint when available. */
   manual?: boolean
   command?: string
-  hermesRoot?: string
+  hermesRoot?: null | string
   /** True when the backend was updated but the GUI couldn't be relaunched in
    *  place (AppImage / dev run): the new version loads on next launch. */
   backendUpdated?: boolean
@@ -452,66 +442,6 @@ export interface DesktopBootProgress {
   running: boolean
   timestamp: number
 }
-
-// First-launch install ("bootstrap") event types -- emitted by
-// electron/bootstrap-runner.cjs and observed by the renderer install overlay.
-// Mirrors the event shapes emitted by runBootstrap()'s onEvent callback.
-
-export interface DesktopBootstrapStageDescriptor {
-  name: string
-  title?: string
-  category?: string
-  needs_user_input?: boolean
-}
-
-export type DesktopBootstrapStageState = 'pending' | 'running' | 'succeeded' | 'skipped' | 'failed'
-
-export interface DesktopBootstrapStageResult {
-  state: DesktopBootstrapStageState
-  durationMs: number | null
-  startedAt: number | null
-  json: { ok: boolean; skipped?: boolean; reason?: string | null; stage: string } | null
-  error: string | null
-}
-
-export interface DesktopBootstrapUnsupportedPlatform {
-  platform: string
-  activeRoot: string
-  installCommand: string
-  docsUrl: string
-}
-
-export interface DesktopBootstrapState {
-  active: boolean
-  manifest: { type: 'manifest'; stages: DesktopBootstrapStageDescriptor[]; protocolVersion: number | null } | null
-  stages: Record<string, DesktopBootstrapStageResult>
-  error: string | null
-  log: Array<{ ts: number; stage: string | null; line: string; stream?: 'stdout' | 'stderr' }>
-  startedAt: number | null
-  completedAt: number | null
-  unsupportedPlatform: DesktopBootstrapUnsupportedPlatform | null
-}
-
-export type DesktopBootstrapEvent =
-  | { type: 'manifest'; stages: DesktopBootstrapStageDescriptor[]; protocolVersion: number | null }
-  | {
-      type: 'stage'
-      name: string
-      state: DesktopBootstrapStageState
-      durationMs?: number
-      json?: DesktopBootstrapStageResult['json']
-      error?: string | null
-    }
-  | { type: 'log'; stage?: string | null; line: string; stream?: 'stdout' | 'stderr' }
-  | { type: 'complete'; marker: Record<string, unknown> }
-  | { type: 'failed'; stage?: string | null; error: string }
-  | {
-      type: 'unsupported-platform'
-      platform: string
-      activeRoot: string
-      installCommand: string
-      docsUrl: string
-    }
 
 export interface HermesApiRequest {
   path: string

@@ -414,6 +414,10 @@
     --theme-neutral-chrome: #0d0d0e;
     --theme-neutral-sidebar: #0a0a0b;
     --theme-neutral-card: #161618;
+    --theme-row-hover-accent-mix: 8%;
+    --theme-row-active-accent-mix: 14%;
+    --theme-control-hover-accent-mix: 9%;
+    --theme-control-active-accent-mix: 13%;
 
     /* Dark-only accent palette overrides. */
     --ui-red: #e75e78;
@@ -426,7 +430,8 @@
     /* Dark mode: a dark card needs a stronger black inset to show the recess. */
     --dt-input-inset: inset 0 1px 1px color-mix(in srgb, #000 38%, transparent);
     /* Dark needs a lighter resting border than light mode. */
-    --dt-input-border: 4%;
+    --dt-input-border: 8%;
+    --dt-input-bg: 18%;
 
     --ui-inline-code-background: color-mix(in srgb, #ffffff 7%, transparent);
     --ui-inline-code-foreground: color-mix(in srgb, #ffffff 88%, transparent);

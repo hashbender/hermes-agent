@@ -2,13 +2,10 @@ import { atom } from 'nanostores'
 
 import { liveSessionProjectId, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import type { HermesGitBranch } from '@/global'
-import { desktopDefaultCwd, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
+import { desktopDefaultCwd, isDesktopFsRemoteMode, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
 import { desktopGit } from '@/lib/desktop-git'
-import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { persistentAtom } from '@/lib/persisted'
-import { translateNow } from '@/i18n'
 import { activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
-import { notify } from '@/store/notifications'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { requestFreshSession } from '@/store/profile'
 import { $selectedStoredSessionId, $sessions, workspaceCwdForNewSession } from '@/store/session'
@@ -28,24 +25,6 @@ export const $activeProjectId = atom<null | string>(null)
 // source of project membership — the desktop no longer derives it.
 export const $projectTree = atom<SidebarProjectTree[]>([])
 export const $projectTreeLoading = atom(false)
-
-// False when the connected backend predates the projects.* JSON-RPC surface
-// (same semver label, older install). Null until the first probe.
-export const $projectsRpcAvailable = atom<boolean | null>(null)
-
-function markProjectsRpcSuccess(): void {
-  $projectsRpcAvailable.set(true)
-}
-
-function markProjectsRpcFailure(err: unknown): void {
-  if (isMissingRpcMethod(err)) {
-    $projectsRpcAvailable.set(false)
-  }
-}
-
-function projectsStaleBackendError(): Error {
-  return new Error(translateNow('sidebar.projects.staleBackend'))
-}
 
 // Client-side cache eviction (Apollo-style optimistic layer): ids the user just
 // deleted/archived. The backend tree is a snapshot that still lists them until
@@ -237,9 +216,7 @@ function applyPayload(payload: ProjectsPayload): void {
 export async function refreshProjects(): Promise<void> {
   try {
     applyPayload(await gatewayRequest<ProjectsPayload>('projects.list'))
-    markProjectsRpcSuccess()
-  } catch (err) {
-    markProjectsRpcFailure(err)
+  } catch {
     // Backend may not be ready; keep the last known list.
   }
 }
@@ -277,10 +254,7 @@ export async function refreshProjectTree(): Promise<void> {
         $removedSessionIds.set(pending)
       }
     }
-
-    markProjectsRpcSuccess()
-  } catch (err) {
-    markProjectsRpcFailure(err)
+  } catch {
     // Backend may not be ready; keep the last known tree.
   } finally {
     $projectTreeLoading.set(false)
@@ -436,34 +410,17 @@ function projectInfoToTreeNode(project: ProjectInfo): SidebarProjectTree {
 }
 
 export async function createProject(input: CreateProjectInput): Promise<ProjectInfo | null> {
-  if ($projectsRpcAvailable.get() === false) {
-    throw projectsStaleBackendError()
-  }
-
-  let res: { project: ProjectInfo | null }
-
-  try {
-    res = await gatewayRequest<{ project: ProjectInfo | null }>('projects.create', {
-      name: input.name,
-      folders: input.folders ?? [],
-      primary_path: input.primaryPath,
-      slug: input.slug,
-      description: input.description,
-      icon: input.icon,
-      color: input.color,
-      board_slug: input.boardSlug,
-      use: input.use ?? false
-    })
-  } catch (err) {
-    if (isMissingRpcMethod(err)) {
-      $projectsRpcAvailable.set(false)
-      throw projectsStaleBackendError()
-    }
-
-    throw err
-  }
-
-  markProjectsRpcSuccess()
+  const res = await gatewayRequest<{ project: ProjectInfo | null }>('projects.create', {
+    name: input.name,
+    folders: input.folders ?? [],
+    primary_path: input.primaryPath,
+    slug: input.slug,
+    description: input.description,
+    icon: input.icon,
+    color: input.color,
+    board_slug: input.boardSlug,
+    use: input.use ?? false
+  })
 
   // Not optimistic (the create awaits the RPC first, so there's nothing to roll
   // back): apply the server's row into the cached list + tree at once, so it
@@ -636,15 +593,6 @@ export interface ProjectDialogState {
 export const $projectDialog = atom<null | ProjectDialogState>(null)
 
 export function openProjectCreate(): void {
-  if ($projectsRpcAvailable.get() === false) {
-    notify({
-      kind: 'warning',
-      message: translateNow('sidebar.projects.staleBackend')
-    })
-
-    return
-  }
-
   $projectDialog.set({ mode: 'create' })
 }
 
@@ -775,7 +723,7 @@ export async function removeWorktreePath(
 
 // Reveal a project/worktree path in the OS file manager (git-GUI standard).
 export async function revealPath(path: null | string): Promise<void> {
-  if (path) {
+  if (path && !isDesktopFsRemoteMode()) {
     await window.hermesDesktop?.revealPath?.(path)
   }
 }

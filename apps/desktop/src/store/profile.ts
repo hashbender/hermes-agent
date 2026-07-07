@@ -13,7 +13,6 @@ import {
 } from '@/lib/storage'
 import { $gateway, ensureGatewayForProfile } from '@/store/gateway'
 import { setConnection } from '@/store/session'
-import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
 // Canonical key for a profile: trimmed, empty → "default". Used everywhere we
@@ -24,10 +23,9 @@ export function normalizeProfileKey(name: string | null | undefined): string {
   return value || 'default'
 }
 
-// The profile the running local backend is actually scoped to (mirrors
-// /api/profiles/active `current`). "default" is the root ~/.hermes. This is the
-// display source of truth for the statusbar pill; the desktop's *stored*
-// preference (which may be unset) lives in the Electron main process.
+// The remote profile currently selected by the connected gateway (mirrors
+// /api/profiles/active `current`). This is the display source of truth for the
+// statusbar pill; the desktop's stored preference lives in Electron userData.
 export const $activeProfile = atom<string>('default')
 
 // Cached profile list for the picker. Refreshed lazily; the dropdown also
@@ -118,10 +116,9 @@ export async function refreshActiveProfile(): Promise<void> {
   }
 }
 
-// Persist the choice and relaunch the backend under the new HERMES_HOME. The
-// main process reloads the window, so this normally never returns to the caller
-// (the renderer is torn down). We optimistically reflect the selection first so
-// the pill updates instantly if the reload is delayed.
+// Persist the choice and reload the window so the primary remote descriptor is
+// resolved against that profile. We optimistically reflect the selection first
+// so the pill updates instantly if the reload is delayed.
 export async function switchProfile(name: string): Promise<void> {
   if (!name || name === $activeProfile.get()) {
     return
@@ -133,9 +130,9 @@ export async function switchProfile(name: string): Promise<void> {
 
 // ── Swap-minimal gateway routing ──────────────────────────────────────────
 // One live gateway at a time. When the user opens/sends a session whose profile
-// differs from the gateway's current profile, we lazily reconnect the single
-// gateway to that profile's backend (spawned on demand by the Electron pool).
-// A single-profile user never triggers a swap, so their path is unchanged.
+// differs from the gateway's current profile, we lazily reconnect to that
+// profile's configured remote gateway. A single-profile user never triggers a
+// swap, so their path is unchanged.
 
 // The profile the live gateway WebSocket is currently connected to. Initialized
 // to the primary (window) backend's profile on boot.
@@ -169,7 +166,6 @@ $activeGatewayProfile.subscribe(value => {
   if (_lastRoutedProfile !== null && _lastRoutedProfile !== key) {
     // Profile-scoped settings + the unified session list are now stale.
     void queryClient.invalidateQueries()
-    resetStarmapGraph()
   }
 
   _lastRoutedProfile = key
@@ -343,7 +339,7 @@ function orderedProfileKeys(): string[] {
   return hasDefault ? ['default', ...named] : named
 }
 
-// Switch to the default (root ~/.hermes) profile — bound to ⌘1.
+// Switch to the default remote profile — bound to ⌘1.
 export function switchToDefaultProfile(): void {
   const def = $profiles.get().find(profile => profile.is_default)
 
