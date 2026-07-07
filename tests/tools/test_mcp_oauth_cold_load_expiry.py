@@ -352,6 +352,81 @@ async def test_initialize_flags_expired_token_as_invalid(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_initialize_headless_expired_token_without_refresh_fails_fast(
+    tmp_path, monkeypatch
+):
+    """Headless startup must not fall into a browser OAuth flow it cannot finish.
+
+    If the cached access token is expired and the token file has no
+    ``refresh_token``, the SDK's default path sends an unauthenticated request,
+    receives 401, then starts an authorization-code browser flow. In a gateway
+    or cron context that blocks until the callback timeout and gets reported as
+    a generic transport failure. Hermes should fail fast with an auth-specific
+    error so callers can surface ``needs_reauth`` instead.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata
+    from pydantic import AnyUrl
+
+    from tools.mcp_oauth import (
+        HermesTokenStorage,
+        OAuthNonInteractiveError,
+        _get_token_dir,
+        suppress_interactive_oauth,
+    )
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    assert _HERMES_PROVIDER_CLS is not None
+    reset_manager_for_tests()
+
+    token_dir = _get_token_dir()
+    token_dir.mkdir(parents=True, exist_ok=True)
+    (token_dir / "srv.json").write_text(
+        json.dumps(
+            {
+                "access_token": "stale",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "expires_at": time.time() - 60,
+                # No refresh_token: this credential cannot recover headlessly.
+            }
+        )
+    )
+
+    storage = HermesTokenStorage("srv")
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="test-client",
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+        )
+    )
+
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="srv",
+        server_url="https://example.com/mcp",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            client_name="Hermes Agent",
+        ),
+        storage=storage,
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+
+    with suppress_interactive_oauth():
+        with pytest.raises(OAuthNonInteractiveError) as exc_info:
+            await provider._initialize()
+
+    message = str(exc_info.value)
+    assert "requires re-authentication" in message
+    assert "no refresh_token" in message
+    assert "hermes mcp login srv" in message
+
+
 async def _noop_redirect(_url: str) -> None:
     return None
 
