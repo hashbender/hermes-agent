@@ -8,7 +8,6 @@ import os
 import sys
 import subprocess
 import shutil
-import importlib.util
 from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
@@ -788,10 +787,14 @@ def run_doctor(args):
                 if catalog_provider is not None:
                     provider_ids_to_accept.add(catalog_provider)
 
+            provider_is_known = bool(provider_ids_to_accept & valid_provider_ids)
             if provider and provider != "auto":
-                if catalog_provider is None or (
-                    known_providers
-                    and not (provider_ids_to_accept & valid_provider_ids)
+                # Local runtime aliases such as ollama/vllm/llamacpp resolve
+                # through hermes_cli.auth to "custom" without a catalog
+                # ProviderDef. Treat that runtime match as valid so doctor
+                # stays consistent with actual agent routing.
+                if (known_providers and not provider_is_known) or (
+                    not known_providers and catalog_provider is None
                 ):
                     known_list = ", ".join(sorted(known_providers)) if known_providers else "(unavailable)"
                     _fail_and_issue(
@@ -1516,51 +1519,6 @@ def run_doctor(args):
                 "daytona SDK not installed",
                 "(pip install daytona)",
                 "Install daytona SDK: pip install daytona",
-                issues,
-            )
-
-    # Tenki (if using tenki backend)
-    if terminal_env == "tenki":
-        try:
-            from tools.tenki_config import (
-                has_tenki_auth,
-                resolve_tenki_project_id,
-                resolve_tenki_workspace_id,
-            )
-        except Exception:
-            has_tenki_auth = lambda: False  # noqa: E731
-            resolve_tenki_project_id = lambda _explicit="": ""  # noqa: E731
-            resolve_tenki_workspace_id = lambda _explicit="": ""  # noqa: E731
-
-        if has_tenki_auth():
-            check_ok("Tenki auth", "(configured)")
-        else:
-            _fail_and_issue(
-                "Tenki auth not found",
-                "(required for TERMINAL_ENV=tenki)",
-                "Run tenki login or set TENKI_AUTH_TOKEN/TENKI_API_KEY",
-                issues,
-            )
-
-        workspace_id = resolve_tenki_workspace_id(os.getenv("TERMINAL_TENKI_WORKSPACE_ID", ""))
-        project_id = resolve_tenki_project_id(os.getenv("TERMINAL_TENKI_PROJECT_ID", ""))
-        if workspace_id and project_id:
-            check_ok("Tenki workspace/project", "(configured)")
-        else:
-            _fail_and_issue(
-                "Tenki workspace/project not configured",
-                "(required for TERMINAL_ENV=tenki)",
-                "Run tenki login or set terminal.tenki_workspace_id and terminal.tenki_project_id",
-                issues,
-            )
-
-        if importlib.util.find_spec("tenki_sandbox") is not None:
-            check_ok("tenki-sandbox SDK", "(installed)")
-        else:
-            _fail_and_issue(
-                "tenki-sandbox SDK not installed",
-                "(pip install tenki-sandbox==0.1.1)",
-                "Install Tenki SDK: pip install tenki-sandbox==0.1.1",
                 issues,
             )
 
