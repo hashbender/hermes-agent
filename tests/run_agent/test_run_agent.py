@@ -3663,6 +3663,7 @@ class TestHandleMaxIterations:
         assert isinstance(result, str)
         assert "error" in result.lower()
         assert "API down" in result
+        assert messages[-1] == {"role": "assistant", "content": result}
 
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
