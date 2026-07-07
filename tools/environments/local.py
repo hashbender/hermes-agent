@@ -343,6 +343,22 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+def _inject_windows_msys_env(env: dict) -> None:
+    """Disable MSYS argv path conversion for Windows terminal subprocesses.
+
+    Hermes runs local Windows terminal commands through Git Bash so the same
+    bash-wrapped command machinery works cross-platform. Git Bash/MSYS applies
+    automatic argv path conversion to child native Windows executables, which
+    turns flags like ``/FO`` and ``/TN`` (``tasklist /FO CSV``,
+    ``schtasks /Create /TN ...``) into bogus filesystem paths. Setting
+    ``MSYS_NO_PATHCONV=1`` preserves native Windows command arguments while
+    still letting bash itself run Hermes' wrapper script. Respect an explicit
+    caller value so advanced users can opt back into MSYS conversion.
+    """
+    if _IS_WINDOWS:
+        env.setdefault("MSYS_NO_PATHCONV", "1")
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -382,6 +398,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
+
+    _inject_windows_msys_env(sanitized)
 
     return sanitized
 
@@ -803,6 +821,8 @@ def _make_run_env(env: dict) -> dict:
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
+
+    _inject_windows_msys_env(run_env)
 
     return run_env
 
