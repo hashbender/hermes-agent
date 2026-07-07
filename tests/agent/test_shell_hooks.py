@@ -9,7 +9,10 @@ covered in ``test_shell_hooks_consent.py``.
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
+from typing import Any, Dict
 
 import pytest
 
@@ -84,6 +87,18 @@ class TestParseResponse:
         )
         assert r == {"context": "today is Friday"}
 
+    def test_transform_llm_output_response_text_passthrough(self):
+        r = shell_hooks._parse_response(
+            "transform_llm_output", '{"response_text": "updated final"}',
+        )
+        assert r == "updated final"
+
+    def test_transform_llm_output_empty_text_ignored(self):
+        r = shell_hooks._parse_response(
+            "transform_llm_output", '{"response_text": ""}',
+        )
+        assert r is None
+
     def test_subagent_stop_context_passthrough(self):
         r = shell_hooks._parse_response(
             "subagent_stop", '{"context": "child role=leaf"}',
@@ -96,24 +111,6 @@ class TestParseResponse:
             "pre_llm_call", '{"decision": "block", "reason": "no"}',
         )
         assert r is None
-
-    def test_pre_verify_continue_canonical(self):
-        r = shell_hooks._parse_response(
-            "pre_verify", '{"action": "continue", "message": "run checks"}',
-        )
-        assert r == {"action": "continue", "message": "run checks"}
-
-    def test_pre_verify_block_is_continue_claude_style(self):
-        # Claude-Code Stop hooks: block the stop == keep going; reason → message.
-        r = shell_hooks._parse_response(
-            "pre_verify", '{"decision": "block", "reason": "run the formatter"}',
-        )
-        assert r == {"action": "continue", "message": "run the formatter"}
-
-    def test_pre_verify_without_message_is_noop(self):
-        # A continue with nothing to tell the model lets the turn finish.
-        assert shell_hooks._parse_response("pre_verify", '{"action": "continue"}') is None
-        assert shell_hooks._parse_response("pre_verify", '{"decision": "allow"}') is None
 
     def test_block_action_without_message_uses_default(self):
         """Block is honored even when message/reason is absent."""
