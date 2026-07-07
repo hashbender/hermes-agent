@@ -740,16 +740,32 @@ def _rmtree_writable(path: Path) -> None:
     # stale path in scope — this guard turns the resulting
     # ``shutil.rmtree(~/.hermes)`` into a loud, recoverable ``ValueError``
     # instead of silently destroying the user's install.
-    target = Path(path).resolve()
-    skills_root = SKILLS_DIR.resolve()
-    # Every legitimate caller passes a skill directory or its ``.bak``
-    # sibling — always a strict child of the skills root. The skills root
-    # itself must never be removed: a ``dest`` that collapses to
-    # ``SKILLS_DIR`` (e.g. a relative path resolving to ``.``) would wipe
-    # every installed skill, and its ``.bak`` sibling lands one level up in
-    # ``HERMES_HOME``. Require a strict-child relationship so both escape
-    # into the skills root and out of it are refused.
-    if skills_root not in target.parents:
+    # Compare the *logical* path the caller passed (symlinks NOT followed)
+    # against the skills root. The earlier ``Path.resolve()`` check followed a
+    # symlinked skills sub-tree all the way out to its real location (e.g.
+    # ``~/.hermes/skills/email -> ~/.cc-switch/skills/email``), so a dest/.bak
+    # behind that symlink resolved outside SKILLS_DIR and the guard refused a
+    # routine backup cleanup — raising an uncaught ValueError that aborted the
+    # whole per-profile sync (surfacing as ``default: sync failed``).
+    #
+    # The catastrophic case #48200 guards against is a ``dest`` that collapses
+    # to SKILLS_DIR itself or escapes *upward* into ~/.hermes (and beyond) via
+    # a bad join / missing default / ``..`` — all detectable on the lexical
+    # path without following links. Operating on a path that merely resolves
+    # *downward* through a user-created symlink is the user's intent: they
+    # linked that tree into skills precisely so bundled updates flow into it.
+    # (``shutil.rmtree`` itself still refuses to follow a top-level directory
+    # symlink on CPython 3.x — it raises internally and our ``_on_error``
+    # swallows that, leaving both the link and its target untouched. So
+    # ``ln -s ~/somewhere skills/cat`` is not a silent-erase footgun. The
+    # regression test ``test_symlink_to_dir_does_not_wipe_target`` locks this
+    # invariant empirically so a future Python behavior change is caught.)
+    target = Path(os.path.abspath(str(path)))
+    skills_root = Path(os.path.abspath(str(SKILLS_DIR)))
+    # Require a strict-child relationship: the skills root itself, and anything
+    # at or above it, must be refused (a dest collapsing to SKILLS_DIR would
+    # wipe every installed skill; its ``.bak`` sibling lands in HERMES_HOME).
+    if target == skills_root or skills_root not in target.parents:
         raise ValueError(
             f"refusing to rmtree {target!r}: not strictly under {skills_root!r} "
             f"(scope guard — see #48200)"
