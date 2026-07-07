@@ -548,7 +548,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "terminal.backend": {
         "type": "select",
         "description": "Terminal execution backend",
-        "options": ["local", "docker", "ssh", "modal", "daytona", "tenki", "singularity"],
+        "options": ["local", "docker", "ssh", "modal", "daytona", "singularity"],
     },
     "terminal.modal_mode": {
         "type": "select",
@@ -2450,70 +2450,6 @@ async def run_curator():
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to run curator: {exc}")
     return {"ok": True, "pid": proc.pid, "name": "curator-run"}
-
-
-@app.get("/api/learning/graph")
-async def get_learning_graph(profile: Optional[str] = None):
-    """Learning graph payload for the desktop panel.
-
-    Profile-scoped view of learned, non-base skills plus memory chunks, with
-    graph links derived from skill relations and memory-skill overlap.
-    """
-    try:
-        from agent.learning_graph import build_learning_graph
-
-        with _profile_scope(profile):
-            return build_learning_graph()
-    except Exception:
-        _log.exception("GET /api/learning/graph failed")
-        raise HTTPException(status_code=500, detail="Failed to build learning graph")
-
-
-class LearningNodeRef(BaseModel):
-    id: str
-    profile: Optional[str] = None
-
-
-class LearningNodeEdit(BaseModel):
-    id: str
-    content: str
-    profile: Optional[str] = None
-
-
-@app.get("/api/learning/node")
-async def get_learning_node(id: str, profile: Optional[str] = None):
-    """Current content of a journey node (skill SKILL.md or memory chunk), for an edit prefill."""
-    from agent.learning_mutations import node_detail
-
-    with _profile_scope(profile):
-        res = node_detail(id)
-    if not res.get("ok"):
-        raise HTTPException(status_code=404, detail=res.get("message", "not found"))
-    return res
-
-
-@app.delete("/api/learning/node")
-async def delete_learning_node(body: LearningNodeRef):
-    """Delete a journey node — skills are archived (restorable), memories removed."""
-    from agent.learning_mutations import delete_node
-
-    with _profile_scope(body.profile):
-        res = delete_node(body.id)
-    if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("message", "delete failed"))
-    return res
-
-
-@app.put("/api/learning/node")
-async def update_learning_node(body: LearningNodeEdit):
-    """Rewrite a journey node's content (SKILL.md or memory chunk)."""
-    from agent.learning_mutations import edit_node
-
-    with _profile_scope(body.profile):
-        res = edit_node(body.id, body.content)
-    if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("message", "edit failed"))
-    return res
 
 
 def _safe_call(mod, fn_name: str, default):
@@ -12509,6 +12445,548 @@ def _ws_close_reason(text: str) -> str:
     return encoded[:120].decode("utf-8", "ignore") + "..."
 
 
+# ---------------------------------------------------------------------------
+# /api/console — safe Hermes Console command WebSocket.
+#
+# Unlike /api/pty, this endpoint never spawns a PTY, shell, or full Hermes CLI
+# subprocess. It runs the curated console engine in-process and exchanges
+# structured JSON frames with the dashboard xterm overlay.
+# ---------------------------------------------------------------------------
+
+_CONSOLE_PROMPT = "hermes> "
+_CONSOLE_COMMAND_TIMEOUT_SECONDS = 60.0
+_CONSOLE_OUTPUT_LIMIT = 50000
+
+
+def _dashboard_console_context() -> str:
+    """Choose local vs hosted command policy for the dashboard console."""
+    return "hosted" if _default_hermes_root_is_opt_data() else "local"
+
+
+def _console_profile_from_ws(ws: WebSocket) -> Optional[str]:
+    profile = (ws.query_params.get("profile") or "").strip()
+    return profile or None
+
+
+def _execute_console_line(
+    engine: Any,
+    line: str,
+    *,
+    confirmed: bool,
+    profile: Optional[str],
+) -> Any:
+    # _profile_scope swaps process-global skill module paths; keep it inside
+    # the worker thread and never hold it across awaits.
+    with _profile_scope(profile):
+        return engine.execute(line, confirmed=confirmed)
+
+
+async def _console_send(
+    ws: WebSocket,
+    send_lock: asyncio.Lock,
+    payload: Dict[str, Any],
+) -> None:
+    async with send_lock:
+        await ws.send_json(payload)
+
+
+async def _console_send_result(
+    ws: WebSocket,
+    send_lock: asyncio.Lock,
+    result: Any,
+    *,
+    command_id: int,
+) -> None:
+    command = result.command or ""
+    status = result.status
+    if status == "ok":
+        if result.output:
+            await _console_send(
+                ws,
+                send_lock,
+                {
+                    "type": "output",
+                    "id": command_id,
+                    "stream": "stdout",
+                    "data": result.output,
+                    "command": command,
+                },
+            )
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "complete",
+                "id": command_id,
+                "status": "ok",
+                "command": command,
+                "prompt": _CONSOLE_PROMPT,
+            },
+        )
+        return
+
+    if status == "error":
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "error",
+                "id": command_id,
+                "message": result.output or "Command failed.",
+                "command": command,
+            },
+        )
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "complete",
+                "id": command_id,
+                "status": "error",
+                "command": command,
+                "prompt": _CONSOLE_PROMPT,
+            },
+        )
+        return
+
+    if status == "confirm_required":
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "confirm_required",
+                "id": command_id,
+                "command": command,
+                "message": result.confirmation_message or f"Run `{command}`?",
+                "prompt": _CONSOLE_PROMPT,
+            },
+        )
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "complete",
+                "id": command_id,
+                "status": "confirm_required",
+                "command": command,
+                "prompt": _CONSOLE_PROMPT,
+            },
+        )
+        return
+
+    if status == "clear":
+        await _console_send(ws, send_lock, {"type": "clear", "id": command_id})
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "complete",
+                "id": command_id,
+                "status": "clear",
+                "command": command,
+                "prompt": _CONSOLE_PROMPT,
+            },
+        )
+        return
+
+    if status == "exit":
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "complete",
+                "id": command_id,
+                "status": "exit",
+                "command": command,
+                "prompt": "",
+            },
+        )
+        return
+
+    await _console_send(
+        ws,
+        send_lock,
+        {
+            "type": "error",
+            "id": command_id,
+            "message": f"Unknown console result status: {status}",
+            "command": command,
+        },
+    )
+
+
+def _console_json_payload(msg: Any) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    raw: str | bytes | None = msg.get("text")
+    if raw is None:
+        raw = msg.get("bytes")
+    if raw is None:
+        return None, None
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "Console frames must be UTF-8 JSON."
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "Console frames must be JSON objects."
+    if not isinstance(payload, dict):
+        return None, "Console frames must be JSON objects."
+    return payload, None
+
+
+@app.websocket("/api/console")
+async def console_ws(ws: WebSocket) -> None:
+    peer = ws.client.host if ws.client else "?"
+
+    if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
+        _log.info("console refused: embedded chat disabled peer=%s", peer)
+        await ws.close(code=4404, reason="embedded chat disabled")
+        return
+
+    auth_reason, cred = _ws_auth_reason(ws)
+    mode = _ws_auth_mode()
+    if auth_reason is not None:
+        _log.warning(
+            "console auth rejected reason=%s mode=%s cred=%s peer=%s",
+            auth_reason, mode, cred, peer,
+        )
+        await ws.close(code=4401, reason=_ws_close_reason(f"auth: {auth_reason}"))
+        return
+
+    host_origin_reason = _ws_host_origin_reason(ws)
+    if host_origin_reason is not None:
+        _log.warning("console refused: %s peer=%s", host_origin_reason, peer)
+        await ws.close(code=4403, reason=_ws_close_reason(host_origin_reason))
+        return
+
+    client_reason = _ws_client_reason(ws)
+    if client_reason is not None:
+        _log.warning("console refused: %s", client_reason)
+        await ws.close(code=4408, reason=_ws_close_reason(client_reason))
+        return
+
+    await ws.accept()
+
+    profile = _console_profile_from_ws(ws)
+    context = _dashboard_console_context()
+    send_lock = asyncio.Lock()
+
+    try:
+        from hermes_cli.console_engine import HermesConsoleEngine
+
+        engine = HermesConsoleEngine(
+            output_limit=_CONSOLE_OUTPUT_LIMIT,
+            context=context,  # type: ignore[arg-type]
+        )
+        if profile and profile.lower() != "current":
+            _resolve_profile_dir(profile)
+    except HTTPException as exc:
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "error",
+                "message": str(exc.detail),
+                "prompt": "",
+            },
+        )
+        await ws.close(code=4400, reason=_ws_close_reason(str(exc.detail)))
+        return
+    except Exception as exc:
+        _log.exception("console failed to initialize")
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "error",
+                "message": f"Console unavailable: {exc}",
+                "prompt": "",
+            },
+        )
+        await ws.close(code=1011)
+        return
+
+    _log.info(
+        "console accepted peer=%s mode=%s cred=%s context=%s profile=%s",
+        peer,
+        mode,
+        cred,
+        context,
+        profile or "current",
+    )
+    await _console_send(
+        ws,
+        send_lock,
+        {
+            "type": "ready",
+            "context": context,
+            "profile": profile or "current",
+            "prompt": _CONSOLE_PROMPT,
+        },
+    )
+
+    active_task: asyncio.Task | None = None
+    pending_confirmation: Optional[str] = None
+    command_generation = 0
+
+    async def run_command(line: str, *, confirmed: bool, command_id: int) -> None:
+        nonlocal active_task, pending_confirmation, command_generation
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _execute_console_line,
+                    engine,
+                    line,
+                    confirmed=confirmed,
+                    profile=profile,
+                ),
+                timeout=_CONSOLE_COMMAND_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            if command_id == command_generation:
+                pending_confirmation = None
+                await _console_send(
+                    ws,
+                    send_lock,
+                    {
+                        "type": "error",
+                        "id": command_id,
+                        "message": (
+                            "Command timed out. Hermes Console returned to the prompt."
+                        ),
+                        "command": line,
+                    },
+                )
+                await _console_send(
+                    ws,
+                    send_lock,
+                    {
+                        "type": "complete",
+                        "id": command_id,
+                        "status": "timeout",
+                        "command": line,
+                        "prompt": _CONSOLE_PROMPT,
+                    },
+                )
+        except Exception as exc:
+            if command_id == command_generation:
+                pending_confirmation = None
+                _log.exception("console command failed")
+                await _console_send(
+                    ws,
+                    send_lock,
+                    {
+                        "type": "error",
+                        "id": command_id,
+                        "message": str(exc) or exc.__class__.__name__,
+                        "command": line,
+                    },
+                )
+                await _console_send(
+                    ws,
+                    send_lock,
+                    {
+                        "type": "complete",
+                        "id": command_id,
+                        "status": "error",
+                        "command": line,
+                        "prompt": _CONSOLE_PROMPT,
+                    },
+                )
+        else:
+            if command_id != command_generation:
+                return
+            pending_confirmation = (
+                result.command if result.status == "confirm_required" else None
+            )
+            await _console_send_result(
+                ws,
+                send_lock,
+                result,
+                command_id=command_id,
+            )
+            if result.status == "exit":
+                await ws.close(code=1000)
+        finally:
+            if command_id == command_generation:
+                active_task = None
+
+    async def start_command(line: str, *, confirmed: bool = False) -> None:
+        nonlocal active_task, command_generation
+        command_generation += 1
+        command_id = command_generation
+        active_task = asyncio.create_task(
+            run_command(line, confirmed=confirmed, command_id=command_id)
+        )
+
+    try:
+        while True:
+            try:
+                msg = await ws.receive()
+            except RuntimeError:
+                break
+            msg_type = msg.get("type")
+            if msg_type == "websocket.disconnect":
+                break
+
+            payload, error = _console_json_payload(msg)
+            if error:
+                await _console_send(
+                    ws,
+                    send_lock,
+                    {
+                        "type": "error",
+                        "message": error,
+                        "prompt": _CONSOLE_PROMPT,
+                    },
+                )
+                continue
+            if payload is None:
+                continue
+
+            frame_type = str(payload.get("type") or "").strip().lower()
+            if frame_type == "ping":
+                await _console_send(
+                    ws,
+                    send_lock,
+                    {
+                        "type": "pong",
+                        "prompt": _CONSOLE_PROMPT,
+                    },
+                )
+                continue
+
+            if frame_type == "cancel":
+                if active_task and not active_task.done():
+                    command_generation += 1
+                    active_task.cancel()
+                    active_task = None
+                    pending_confirmation = None
+                    await _console_send(
+                        ws,
+                        send_lock,
+                        {
+                            "type": "complete",
+                            "status": "cancelled",
+                            "prompt": _CONSOLE_PROMPT,
+                        },
+                    )
+                elif pending_confirmation:
+                    pending_confirmation = None
+                    await _console_send(
+                        ws,
+                        send_lock,
+                        {
+                            "type": "complete",
+                            "status": "cancelled",
+                            "prompt": _CONSOLE_PROMPT,
+                        },
+                    )
+                else:
+                    await _console_send(
+                        ws,
+                        send_lock,
+                        {
+                            "type": "complete",
+                            "status": "idle",
+                            "prompt": _CONSOLE_PROMPT,
+                        },
+                    )
+                continue
+
+            if active_task and not active_task.done():
+                await _console_send(
+                    ws,
+                    send_lock,
+                    {
+                        "type": "error",
+                        "message": "A console command is already running.",
+                        "prompt": _CONSOLE_PROMPT,
+                    },
+                )
+                continue
+
+            if frame_type == "confirm":
+                command = str(payload.get("command") or pending_confirmation or "").strip()
+                if not pending_confirmation:
+                    await _console_send(
+                        ws,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "No command is waiting for confirmation.",
+                            "prompt": _CONSOLE_PROMPT,
+                        },
+                    )
+                    continue
+                if command != pending_confirmation:
+                    await _console_send(
+                        ws,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "Confirmation does not match the pending command.",
+                            "prompt": _CONSOLE_PROMPT,
+                        },
+                    )
+                    continue
+                pending_confirmation = None
+                await start_command(command, confirmed=True)
+                continue
+
+            if frame_type in {"input", "command"}:
+                line = str(payload.get("line") or payload.get("command") or "").strip()
+                if not line:
+                    await _console_send(
+                        ws,
+                        send_lock,
+                        {
+                            "type": "complete",
+                            "status": "ok",
+                            "prompt": _CONSOLE_PROMPT,
+                        },
+                    )
+                    continue
+                if pending_confirmation:
+                    await _console_send(
+                        ws,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": (
+                                "Confirm or cancel the pending command before "
+                                "running another one."
+                            ),
+                            "prompt": _CONSOLE_PROMPT,
+                        },
+                    )
+                    continue
+                await start_command(line)
+                continue
+
+            await _console_send(
+                ws,
+                send_lock,
+                {
+                    "type": "error",
+                    "message": f"Unsupported console frame: {frame_type or '?'}",
+                    "prompt": _CONSOLE_PROMPT,
+                },
+            )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if active_task and not active_task.done():
+            active_task.cancel()
+            try:
+                await active_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
@@ -14107,15 +14585,6 @@ def start_server(
     # For explicit non-zero ports, if the port is taken uvicorn catches
     # OSError inside create_server() and exits with a clear error — no
     # separate preflight probe needed.
-    # Loopback binds are the Desktop case: a single local client, no reverse
-    # proxy in front. A GIL-heavy agent turn can stall the event loop past 20s,
-    # and uvicorn's ws keepalive ping runs on that same starved loop — so a
-    # 20s ping timeout kills an otherwise-healthy local connection over a
-    # recoverable stall (QW-1). Give loopback a longer 60s timeout / 30s
-    # interval to ride out those stalls. Non-loopback binds sit behind a
-    # Cloudflare Tunnel (idle timeout ~100s), so keep them at 20/20 to detect
-    # half-open connections promptly and stay under the tunnel's idle window.
-    _is_loopback = host in ("127.0.0.1", "localhost", "::1")
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
@@ -14129,9 +14598,9 @@ def start_server(
         # Detect half-open WS connections (reverse-proxy 524, dropped
         # tunnels) within ~20-40s so WebSocketDisconnect fires the
         # disconnect→reap path.  20s stays under Cloudflare Tunnel's idle
-        # timeout, keeping it warm.  Loopback gets a longer window (see above).
-        ws_ping_interval=30.0 if _is_loopback else 20.0,
-        ws_ping_timeout=60.0 if _is_loopback else 20.0,
+        # timeout, keeping it warm.
+        ws_ping_interval=20.0,
+        ws_ping_timeout=20.0,
     )
     server = uvicorn.Server(config)
 
@@ -14166,35 +14635,6 @@ def start_server(
                 install_loop_noise_filter(asyncio.get_running_loop())
             except Exception as exc:  # pragma: no cover - best-effort
                 _log.debug("loop noise filter install skipped: %s", exc)
-
-            # ── Loop heartbeat watchdog (CF-1) ───────────────────────────
-            # Confirm the GIL-pressure hypothesis in production. Re-arm a 2s
-            # tick and measure the drift between when it *should* fire and
-            # when it actually does: a healthy loop drifts ~0, but a turn that
-            # holds the GIL blocks the loop and the next tick fires late by the
-            # stall duration. We log that so a stalled-loop WS drop is
-            # diagnosable from the gateway log. Uses loop.time() (monotonic)
-            # for drift, and call_later (not a task) so it dies with the loop —
-            # nothing to cancel on shutdown.
-            _hb_interval = 2.0
-            _hb_stall_threshold = 5.0
-            _hb_loop = asyncio.get_running_loop()
-
-            def _loop_heartbeat(expected: float) -> None:
-                now = _hb_loop.time()
-                drift = now - expected
-                if drift > _hb_stall_threshold:
-                    _log.warning(
-                        "event loop stalled %.1fs (GIL pressure suspected)",
-                        drift,
-                    )
-                _hb_loop.call_later(
-                    _hb_interval, _loop_heartbeat, now + _hb_interval
-                )
-
-            _hb_loop.call_later(
-                _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
-            )
 
             await server.main_loop()
             if server.started:
