@@ -13,6 +13,8 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
+    cleanup_screenshot_cache,
+    cleanup_video_cache,
     safe_url_for_log,
     utf16_len,
     validate_inbound_media_size,
@@ -70,6 +72,42 @@ class TestInboundMediaSizeCap:
         validate_inbound_media_size(100, media_type="image", max_bytes=200)  # ok
         with pytest.raises(ValueError, match="too large"):
             validate_inbound_media_size(300, media_type="image", max_bytes=200)
+
+
+class TestCacheCleanup:
+    def test_video_cache_cleanup_removes_only_stale_files(self, tmp_path, monkeypatch):
+        import gateway.platforms.base as base
+
+        cache_dir = tmp_path / "videos"
+        monkeypatch.setattr(base, "VIDEO_CACHE_DIR", cache_dir)
+        old_file = cache_dir / "video_old.mp4"
+        fresh_file = cache_dir / "video_fresh.mp4"
+        old_file.parent.mkdir(parents=True)
+        old_file.write_bytes(b"old")
+        fresh_file.write_bytes(b"fresh")
+        old_mtime = time.time() - (25 * 3600)
+        os.utime(old_file, (old_mtime, old_mtime))
+
+        assert cleanup_video_cache(max_age_hours=24) == 1
+        assert not old_file.exists()
+        assert fresh_file.exists()
+
+    def test_screenshot_cache_cleanup_removes_only_stale_files(self, tmp_path, monkeypatch):
+        import gateway.platforms.base as base
+
+        cache_dir = tmp_path / "screenshots"
+        monkeypatch.setattr(base, "SCREENSHOT_CACHE_DIR", cache_dir)
+        old_file = cache_dir / "browser_screenshot_old.png"
+        fresh_file = cache_dir / "browser_screenshot_fresh.png"
+        old_file.parent.mkdir(parents=True)
+        old_file.write_bytes(b"old")
+        fresh_file.write_bytes(b"fresh")
+        old_mtime = time.time() - (25 * 3600)
+        os.utime(old_file, (old_mtime, old_mtime))
+
+        assert cleanup_screenshot_cache(max_age_hours=24) == 1
+        assert not old_file.exists()
+        assert fresh_file.exists()
 
 
 class TestSecretCaptureGuidance:
@@ -990,6 +1028,38 @@ class TestMediaDeliveryDefaultMode:
         )
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(env_file)) is None
+
+    @pytest.mark.parametrize(
+        "rel",
+        [
+            "mcp-tokens/github.json",
+            "mcp-tokens/github.client.json",
+            "mcp-tokens/github.meta.json",
+        ],
+    )
+    def test_denylist_blocks_mcp_oauth_tokens(self, tmp_path, monkeypatch, rel):
+        """Live MCP OAuth tokens/client creds under ~/.hermes/mcp-tokens/ must
+        never deliver as native media — same exfil class as auth.json/.env.
+        Sibling to the pairing/ directory denylist entry.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_dir = fake_home / ".hermes"
+        (hermes_dir / "mcp-tokens").mkdir(parents=True)
+        secret = hermes_dir / rel
+        secret.write_text('{"access_token": "live-bearer-abc123"}')
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_HOME",
+            hermes_dir,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_ROOT",
+            hermes_dir,
+        )
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
 
     def test_denylist_blocks_hermes_config_in_active_profile(self, tmp_path, monkeypatch):
         """The active profile config stays blocked in default mode."""
