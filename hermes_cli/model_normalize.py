@@ -12,6 +12,8 @@ Different LLM providers expect model identifiers in different formats:
   model IDs, but Claude still uses hyphenated native names like
   ``claude-sonnet-4-6``.
 - **OpenCode Go** preserves dots in model names: ``minimax-m2.7``.
+- **Vertex AI** requires the OpenAI-compatible publisher prefix for Google
+  models: ``google/gemini-3.5-flash``.
 - **DeepSeek** accepts ``deepseek-chat`` (V3), ``deepseek-reasoner``
   (R1-family), and the first-class V-series IDs (``deepseek-v4-pro``,
   ``deepseek-v4-flash``, and any future ``deepseek-v<N>-*``).  Older
@@ -320,6 +322,22 @@ def _prepend_vendor(model_name: str) -> str:
     return model_name
 
 
+def _prepend_vertex_publisher(model_name: str) -> str:
+    """Prepend Vertex AI's mandatory publisher prefix for Google models.
+
+    Vertex's OpenAI-compatible endpoint does not accept bare Gemini/Gemma IDs;
+    the request must use the publisher-qualified form (for example,
+    ``google/gemini-3.5-flash``). Preserve already-qualified model IDs and
+    leave unknown/custom IDs untouched so non-Google publisher namespaces are
+    not guessed incorrectly.
+    """
+    if "/" in model_name:
+        return model_name
+    if detect_vendor(model_name) == "google":
+        return f"google/{model_name}"
+    return model_name
+
+
 # ---------------------------------------------------------------------------
 # Main normalisation entry point
 # ---------------------------------------------------------------------------
@@ -392,6 +410,10 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
     # --- Aggregators: need vendor/model format ---
     if provider in _AGGREGATOR_PROVIDERS:
         return _prepend_vendor(name)
+
+    # --- Vertex AI: OpenAI-compatible endpoint requires publisher/model ---
+    if provider == "vertex":
+        return _prepend_vertex_publisher(name)
 
     # --- OpenCode Zen / OpenCode Go: flat-namespace resellers.
     #     Their /v1/models API returns bare IDs only (no vendor prefix), and
