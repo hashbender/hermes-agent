@@ -548,7 +548,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "terminal.backend": {
         "type": "select",
         "description": "Terminal execution backend",
-        "options": ["local", "docker", "ssh", "modal", "daytona", "tenki", "singularity"],
+        "options": ["local", "docker", "ssh", "modal", "daytona", "singularity"],
     },
     "terminal.modal_mode": {
         "type": "select",
@@ -774,6 +774,26 @@ class EnvVarReveal(BaseModel):
 
 class MemoryProviderConfigUpdate(BaseModel):
     values: Dict[str, str] = {}
+
+
+class OpenVikingSetupUpdate(BaseModel):
+    values: Dict[str, str] = {}
+    save_mode: str = "profile"
+    profile_name: str = ""
+    profile_path: str = ""
+    profile: Optional[str] = None
+
+
+class OpenVikingValidateRequest(BaseModel):
+    values: Dict[str, str] = {}
+    require_api_key: Optional[bool] = None
+    profile_path: str = ""
+    profile: Optional[str] = None
+
+
+class OpenVikingStartLocalRequest(BaseModel):
+    url: str
+    profile: Optional[str] = None
 
 
 class MessagingPlatformUpdate(BaseModel):
@@ -2452,70 +2472,6 @@ async def run_curator():
     return {"ok": True, "pid": proc.pid, "name": "curator-run"}
 
 
-@app.get("/api/learning/graph")
-async def get_learning_graph(profile: Optional[str] = None):
-    """Learning graph payload for the desktop panel.
-
-    Profile-scoped view of learned, non-base skills plus memory chunks, with
-    graph links derived from skill relations and memory-skill overlap.
-    """
-    try:
-        from agent.learning_graph import build_learning_graph
-
-        with _profile_scope(profile):
-            return build_learning_graph()
-    except Exception:
-        _log.exception("GET /api/learning/graph failed")
-        raise HTTPException(status_code=500, detail="Failed to build learning graph")
-
-
-class LearningNodeRef(BaseModel):
-    id: str
-    profile: Optional[str] = None
-
-
-class LearningNodeEdit(BaseModel):
-    id: str
-    content: str
-    profile: Optional[str] = None
-
-
-@app.get("/api/learning/node")
-async def get_learning_node(id: str, profile: Optional[str] = None):
-    """Current content of a journey node (skill SKILL.md or memory chunk), for an edit prefill."""
-    from agent.learning_mutations import node_detail
-
-    with _profile_scope(profile):
-        res = node_detail(id)
-    if not res.get("ok"):
-        raise HTTPException(status_code=404, detail=res.get("message", "not found"))
-    return res
-
-
-@app.delete("/api/learning/node")
-async def delete_learning_node(body: LearningNodeRef):
-    """Delete a journey node — skills are archived (restorable), memories removed."""
-    from agent.learning_mutations import delete_node
-
-    with _profile_scope(body.profile):
-        res = delete_node(body.id)
-    if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("message", "delete failed"))
-    return res
-
-
-@app.put("/api/learning/node")
-async def update_learning_node(body: LearningNodeEdit):
-    """Rewrite a journey node's content (SKILL.md or memory chunk)."""
-    from agent.learning_mutations import edit_node
-
-    with _profile_scope(body.profile):
-        res = edit_node(body.id, body.content)
-    if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("message", "edit failed"))
-    return res
-
-
 def _safe_call(mod, fn_name: str, default):
     try:
         fn = getattr(mod, fn_name, None)
@@ -3958,6 +3914,92 @@ async def update_memory_provider_config(name: str, body: MemoryProviderConfigUpd
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
         _log.exception("PUT /api/memory/providers/%s/config failed", name)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/memory/providers/openviking/setup")
+async def get_openviking_setup(profile: Optional[str] = None):
+    try:
+        import plugins.memory.openviking as openviking
+
+        with _config_profile_scope(profile):
+            config = load_config()
+            memory_config = config.get("memory") if isinstance(config, dict) else {}
+            provider_config = (
+                memory_config.get("openviking", {})
+                if isinstance(memory_config, dict)
+                else {}
+            )
+            return openviking.get_desktop_openviking_setup(provider_config)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("GET /api/memory/providers/openviking/setup failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/memory/providers/openviking/validate")
+async def validate_openviking_setup(body: OpenVikingValidateRequest, profile: Optional[str] = None):
+    try:
+        import plugins.memory.openviking as openviking
+
+        with _config_profile_scope(body.profile or profile):
+            return openviking.validate_desktop_openviking_setup(
+                body.values,
+                require_api_key=body.require_api_key,
+                profile_path=body.profile_path,
+            )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        _log.exception("POST /api/memory/providers/openviking/validate failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.put("/api/memory/providers/openviking/setup")
+async def update_openviking_setup(body: OpenVikingSetupUpdate, profile: Optional[str] = None):
+    try:
+        import plugins.memory.openviking as openviking
+
+        with _config_profile_scope(body.profile or profile):
+            config = load_config()
+            result = openviking.save_desktop_openviking_setup(
+                config=config,
+                hermes_home=get_hermes_home(),
+                values=body.values,
+                save_mode=body.save_mode,
+                profile_name=body.profile_name,
+                profile_path=body.profile_path,
+            )
+            save_config(config)
+            from hermes_cli.config import reload_env
+
+            reload_env()
+            return result
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        _log.exception("PUT /api/memory/providers/openviking/setup failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/memory/providers/openviking/start-local")
+async def start_openviking_local(body: OpenVikingStartLocalRequest, profile: Optional[str] = None):
+    try:
+        import plugins.memory.openviking as openviking
+
+        with _config_profile_scope(body.profile or profile):
+            return openviking.start_desktop_openviking_local(body.url)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        _log.exception("POST /api/memory/providers/openviking/start-local failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -14107,15 +14149,6 @@ def start_server(
     # For explicit non-zero ports, if the port is taken uvicorn catches
     # OSError inside create_server() and exits with a clear error — no
     # separate preflight probe needed.
-    # Loopback binds are the Desktop case: a single local client, no reverse
-    # proxy in front. A GIL-heavy agent turn can stall the event loop past 20s,
-    # and uvicorn's ws keepalive ping runs on that same starved loop — so a
-    # 20s ping timeout kills an otherwise-healthy local connection over a
-    # recoverable stall (QW-1). Give loopback a longer 60s timeout / 30s
-    # interval to ride out those stalls. Non-loopback binds sit behind a
-    # Cloudflare Tunnel (idle timeout ~100s), so keep them at 20/20 to detect
-    # half-open connections promptly and stay under the tunnel's idle window.
-    _is_loopback = host in ("127.0.0.1", "localhost", "::1")
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
@@ -14129,9 +14162,9 @@ def start_server(
         # Detect half-open WS connections (reverse-proxy 524, dropped
         # tunnels) within ~20-40s so WebSocketDisconnect fires the
         # disconnect→reap path.  20s stays under Cloudflare Tunnel's idle
-        # timeout, keeping it warm.  Loopback gets a longer window (see above).
-        ws_ping_interval=30.0 if _is_loopback else 20.0,
-        ws_ping_timeout=60.0 if _is_loopback else 20.0,
+        # timeout, keeping it warm.
+        ws_ping_interval=20.0,
+        ws_ping_timeout=20.0,
     )
     server = uvicorn.Server(config)
 
@@ -14166,35 +14199,6 @@ def start_server(
                 install_loop_noise_filter(asyncio.get_running_loop())
             except Exception as exc:  # pragma: no cover - best-effort
                 _log.debug("loop noise filter install skipped: %s", exc)
-
-            # ── Loop heartbeat watchdog (CF-1) ───────────────────────────
-            # Confirm the GIL-pressure hypothesis in production. Re-arm a 2s
-            # tick and measure the drift between when it *should* fire and
-            # when it actually does: a healthy loop drifts ~0, but a turn that
-            # holds the GIL blocks the loop and the next tick fires late by the
-            # stall duration. We log that so a stalled-loop WS drop is
-            # diagnosable from the gateway log. Uses loop.time() (monotonic)
-            # for drift, and call_later (not a task) so it dies with the loop —
-            # nothing to cancel on shutdown.
-            _hb_interval = 2.0
-            _hb_stall_threshold = 5.0
-            _hb_loop = asyncio.get_running_loop()
-
-            def _loop_heartbeat(expected: float) -> None:
-                now = _hb_loop.time()
-                drift = now - expected
-                if drift > _hb_stall_threshold:
-                    _log.warning(
-                        "event loop stalled %.1fs (GIL pressure suspected)",
-                        drift,
-                    )
-                _hb_loop.call_later(
-                    _hb_interval, _loop_heartbeat, now + _hb_interval
-                )
-
-            _hb_loop.call_later(
-                _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
-            )
 
             await server.main_loop()
             if server.started:
