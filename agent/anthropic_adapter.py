@@ -2617,14 +2617,15 @@ def build_anthropic_kwargs(
     # "thinking is enabled but reasoning_content is missing in assistant
     # tool call message at index N".  Kimi's reasoning is driven server-side
     # on the /coding route, so skip Anthropic's thinking parameter entirely
-    # for that host.  (Kimi on chat_completions enables thinking via
-    # extra_body in the ChatCompletionsTransport — see #13503.)
+    # for that host.  Non-/coding Kimi endpoints (chat_completions) handle
+    # thinking via ``extra_body`` in the ChatCompletionsTransport (#13503)
+    # and are not affected by this guard.  See #56727.
     #
     # On 4.7+ the `thinking.display` field defaults to "omitted", which
     # silently hides reasoning text that Hermes surfaces in its CLI. We
     # request "summarized" so the reasoning blocks stay populated — matching
     # 4.6 behavior and preserving the activity-feed UX during long tool runs.
-    _is_kimi_coding = _is_kimi_family_endpoint(base_url, model)
+    _is_kimi_coding = _is_kimi_coding_endpoint(base_url)
     if reasoning_config and isinstance(reasoning_config, dict) and not _is_kimi_coding:
         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()
