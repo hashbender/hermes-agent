@@ -22,7 +22,19 @@ type ApprovalKey = {
   upArrow?: boolean
 }
 
-type ApprovalAction = { kind: 'choose'; choice: ApprovalChoice } | { kind: 'move'; delta: -1 | 1 } | { kind: 'noop' }
+type ApprovalAction =
+  | { kind: 'choose'; choice: ApprovalChoice }
+  | { kind: 'move'; delta: -1 | 1 }
+  | { kind: 'noop' }
+  | { kind: 'toggleFull' }
+
+export function approvalOverflowMessage(overflow: number) {
+  return `… +${overflow} more line${overflow === 1 ? '' : 's'} hidden - select View full payload to review here`
+}
+
+export function approvalFullReviewMessage() {
+  return 'Full payload shown in this prompt'
+}
 
 /**
  * Pure key-dispatch for the approval prompt — exported so the regression
@@ -39,10 +51,15 @@ export function approvalAction(
   ch: string,
   key: ApprovalKey,
   sel: number,
-  opts: readonly ApprovalChoice[] = APPROVAL_OPTS
+  opts: readonly ApprovalChoice[] = APPROVAL_OPTS,
+  hasFullReview = false
 ): ApprovalAction {
   if (key.escape) {
     return { kind: 'choose', choice: 'deny' }
+  }
+
+  if (hasFullReview && ch.toLowerCase() === 'v') {
+    return { kind: 'toggleFull' }
   }
 
   const n = parseInt(ch, 10)
@@ -51,15 +68,25 @@ export function approvalAction(
     return { kind: 'choose', choice: opts[n - 1]! }
   }
 
-  if (key.return) {
-    return { kind: 'choose', choice: opts[sel]! }
+  if (hasFullReview && n === opts.length + 1) {
+    return { kind: 'toggleFull' }
   }
+
+  if (key.return) {
+    if (hasFullReview && sel === opts.length) {
+      return { kind: 'toggleFull' }
+    }
+
+    return { kind: 'choose', choice: opts[Math.min(sel, opts.length - 1)]! }
+  }
+
+  const rowCount = opts.length + (hasFullReview ? 1 : 0)
 
   if (key.upArrow && sel > 0) {
     return { kind: 'move', delta: -1 }
   }
 
-  if (key.downArrow && sel < opts.length - 1) {
+  if (key.downArrow && sel < rowCount - 1) {
     return { kind: 'move', delta: 1 }
   }
 
@@ -68,17 +95,8 @@ export function approvalAction(
 
 export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptProps) {
   const [sel, setSel] = useState(0)
+  const [showFull, setShowFull] = useState(false)
   const opts = req.allowPermanent === false ? APPROVAL_OPTS_NO_ALWAYS : APPROVAL_OPTS
-
-  useInput((ch, key) => {
-    const action = approvalAction(ch, key, sel, opts)
-
-    if (action.kind === 'choose') {
-      onChoice(action.choice)
-    } else if (action.kind === 'move') {
-      setSel(s => s + action.delta)
-    }
-  })
 
   // Wrap long single-line commands to the panel width instead of clipping the
   // tail (mirrors the CLI approval panel fix — the full command must be
@@ -89,8 +107,22 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
     .split('\n')
     .flatMap(line => wrapAnsi(line, innerWidth, { hard: true, trim: false }).split('\n'))
 
-  const shown = rawLines.slice(0, CMD_PREVIEW_LINES)
-  const overflow = rawLines.length - shown.length
+  const previewLines = rawLines.slice(0, CMD_PREVIEW_LINES)
+  const overflow = rawLines.length - previewLines.length
+  const hasFullReview = overflow > 0
+  const shown = showFull && hasFullReview ? rawLines : previewLines
+
+  useInput((ch, key) => {
+    const action = approvalAction(ch, key, sel, opts, hasFullReview)
+
+    if (action.kind === 'choose') {
+      onChoice(action.choice)
+    } else if (action.kind === 'move') {
+      setSel(s => s + action.delta)
+    } else if (action.kind === 'toggleFull') {
+      setShowFull(v => !v)
+    }
+  })
 
   return (
     <Box borderColor={t.color.warn} borderStyle="double" flexDirection="column" paddingX={1}>
@@ -105,11 +137,11 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
           </Text>
         ))}
 
-        {overflow > 0 ? (
-          <Text color={t.color.muted}>
-            … +{overflow} more line{overflow === 1 ? '' : 's'} (full text above)
-          </Text>
+        {hasFullReview && !showFull ? (
+          <Text color={t.color.muted}>{approvalOverflowMessage(overflow)}</Text>
         ) : null}
+
+        {hasFullReview && showFull ? <Text color={t.color.muted}>{approvalFullReviewMessage()}</Text> : null}
       </Box>
 
       <Text />
@@ -123,7 +155,23 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
         </Text>
       ))}
 
-      <Text color={t.color.muted}>↑/↓ select · Enter confirm · 1-{opts.length} quick pick · Esc/Ctrl+C deny</Text>
+      {hasFullReview ? (
+        <Text>
+          <Text
+            bold={sel === opts.length}
+            color={sel === opts.length ? t.color.warn : t.color.muted}
+            inverse={sel === opts.length}
+          >
+            {sel === opts.length ? '▸ ' : '  '}
+            {opts.length + 1}. {showFull ? 'Return to preview' : 'View full payload'}
+          </Text>
+        </Text>
+      ) : null}
+
+      <Text color={t.color.muted}>
+        ↑/↓ select · Enter confirm · 1-{opts.length + (hasFullReview ? 1 : 0)} quick pick
+        {hasFullReview ? ' · v view' : ''} · Esc/Ctrl+C deny
+      </Text>
     </Box>
   )
 }

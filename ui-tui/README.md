@@ -166,6 +166,7 @@ Notes:
 | --------------------------- | ------------------- | ------------------------------------------------- |
 | approval prompt             | `Up/Down`, `Enter`  | Move and confirm the selected approval choice     |
 | approval prompt             | `o`, `s`, `a`, `d`  | Quick-pick `once`, `session`, `always`, `deny`    |
+| approval prompt             | `v`                 | Toggle full payload review for truncated commands |
 | approval prompt             | `Esc`, `Ctrl+C`     | Deny                                              |
 | clarify prompt with choices | `Up/Down`, `Enter`  | Move and confirm the selected choice              |
 | clarify prompt with choices | single-digit number | Quick-pick the matching numbered choice           |
