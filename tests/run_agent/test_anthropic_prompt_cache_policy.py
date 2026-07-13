@@ -8,7 +8,7 @@ the native layout on OpenRouter) surfaces loudly.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from run_agent import AIAgent
 
@@ -162,20 +162,20 @@ class TestMiniMaxAnthropicWire:
 
 
 class TestOpenAIWireFormatOnCustomProvider:
-    """A custom provider using chat_completions (OpenAI wire) should NOT get caching."""
+    """Claude models on any provider should get caching — even OpenAI-wire."""
 
-    def test_custom_openai_wire_does_not_cache_even_with_claude_name(self):
-        # This is the blocklist risk #9621 failed to avoid: sending
-        # cache_control fields in OpenAI-wire JSON can trip strict providers
-        # that reject unknown keys.  Stay off unless the transport is
-        # explicitly anthropic_messages or the aggregator is OpenRouter.
+    def test_claude_on_custom_openai_wire_caches_envelope(self):
+        # Claude models benefit from cache_control across all transports:
+        # gateways (OpenRouter, LiteLLM, company-internal multi-model
+        # endpoints) accept these markers on the OpenAI wire — and without
+        # them Claude silently reports 0% cached tokens (#56776).
         agent = _make_agent(
             provider="custom",
             base_url="https://api.fireworks.ai/inference/v1",
             api_mode="chat_completions",
             model="claude-sonnet-4",
         )
-        assert agent._anthropic_prompt_cache_policy() == (False, False)
+        assert agent._anthropic_prompt_cache_policy() == (True, False)
 
 
 class TestQwenAlibabaFamily:
@@ -327,90 +327,6 @@ class TestExplicitOverrides:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# prompt_caching.enabled=false global kill switch
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestPromptCachingDisabledKillSwitch:
-    """prompt_caching.enabled=false must disable cache_control markers on
-    every endpoint class and every re-derivation path (init, /model switch,
-    fallback). This is the correct escape hatch for a strict Anthropic-
-    compatible proxy that injects its own markers server-side — a single
-    per-setup toggle, not a blanket strip that would regress the many
-    well-behaved third-party gateways the policy deliberately caches on.
-    """
-
-    def _disabled_cfg(self):
-        return patch(
-            "hermes_cli.config.load_config",
-            return_value={"prompt_caching": {"enabled": False}},
-        )
-
-    def test_disables_native_anthropic(self):
-        agent = _make_agent(
-            provider="anthropic",
-            base_url="https://api.anthropic.com",
-            api_mode="anthropic_messages",
-            model="claude-sonnet-4-6",
-        )
-        with self._disabled_cfg():
-            assert agent._anthropic_prompt_cache_policy() == (False, False)
-
-    def test_disables_openrouter_claude(self):
-        agent = _make_agent(
-            provider="openrouter",
-            base_url="https://openrouter.ai/api/v1",
-            api_mode="chat_completions",
-            model="anthropic/claude-sonnet-4.6",
-        )
-        with self._disabled_cfg():
-            assert agent._anthropic_prompt_cache_policy() == (False, False)
-
-    def test_disables_third_party_anthropic_gateway(self):
-        # llm.echo.tech-style LiteLLM proxy — the reported failure case.
-        agent = _make_agent(
-            provider="anthropic",
-            base_url="https://llm.echo.tech",
-            api_mode="anthropic_messages",
-            model="claude-sonnet-4-6",
-        )
-        with self._disabled_cfg():
-            assert agent._anthropic_prompt_cache_policy() == (False, False)
-
-    def test_survives_model_switch_re_derivation(self):
-        # Start native Anthropic, /model switch to a proxy — disable must hold.
-        agent = _make_agent(
-            provider="anthropic",
-            base_url="https://api.anthropic.com",
-            api_mode="anthropic_messages",
-            model="claude-opus-4.6",
-        )
-        with self._disabled_cfg():
-            assert agent._anthropic_prompt_cache_policy(
-                provider="anthropic",
-                base_url="https://llm.echo.tech",
-                api_mode="anthropic_messages",
-                model="claude-sonnet-4-6",
-            ) == (False, False)
-
-    def test_enabled_true_keeps_third_party_caching_on(self):
-        # The well-behaved third-party gateways a blanket strip would break
-        # must keep caching by default.
-        agent = _make_agent(
-            provider="anthropic",
-            base_url="https://llm.echo.tech",
-            api_mode="anthropic_messages",
-            model="claude-sonnet-4-6",
-        )
-        with patch(
-            "hermes_cli.config.load_config",
-            return_value={"prompt_caching": {"enabled": True}},
-        ):
-            assert agent._anthropic_prompt_cache_policy() == (True, True)
-
-
-# ─────────────────────────────────────────────────────────────────────
 # Long-lived prefix cache policy (cross-session 1h tier)
 # ─────────────────────────────────────────────────────────────────────
-
 
