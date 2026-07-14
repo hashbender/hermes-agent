@@ -97,7 +97,7 @@ from tools.tool_backend_helpers import (  # noqa: F401
     nous_tool_gateway_unavailable_message,
     prefers_gateway,
 )
-from tools.url_safety import async_is_safe_url, normalize_url_for_request
+from tools.url_safety import async_is_safe_url, normalize_url_for_request, sensitive_query_param_name
 import sys
 
 logger = logging.getLogger(__name__)
@@ -235,6 +235,17 @@ def _is_backend_available(backend: str) -> bool:
             return has_xai_credentials()
         except Exception:
             return False
+    # Plugin-registered backends: when the name isn't in the hardcoded
+    # whitelist above, ask the provider registry — any plugin-backed
+    # provider (crawl4ai, etc.) supplies its own is_available() check
+    # and doesn't need a per-backend entry here.
+    try:
+        from agent.web_search_registry import get_provider
+        provider = get_provider(backend)
+        if provider is not None:
+            return bool(provider.is_available())
+    except Exception:
+        pass
     return False
 
 
@@ -658,6 +669,17 @@ async def web_extract_tool(
                 "success": False,
                 "error": "Blocked: URL contains what appears to be an API key or token. "
                          "Secrets must not be sent in URLs.",
+            })
+        sensitive_query_key = sensitive_query_param_name(normalized_url)
+        if sensitive_query_key:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Blocked: URL contains a credential-like query parameter "
+                    f"({sensitive_query_key}). Web extract backends are third-party "
+                    "readers; remove the sensitive query parameter or use a local "
+                    "browser session when this access is explicitly required."
+                ),
             })
         normalized_urls.append(normalized_url)
 
