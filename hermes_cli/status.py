@@ -425,6 +425,33 @@ def show_status(args):
     elif terminal_env == "daytona":
         daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
         print(f"  Daytona Image: {daytona_image}")
+    elif terminal_env == "tenki":
+        from tools.tenki_config import (
+            resolve_tenki_api_endpoint,
+            resolve_tenki_project_id,
+            resolve_tenki_workspace_id,
+        )
+
+        tenki_image = os.getenv("TERMINAL_TENKI_IMAGE") or terminal_cfg.get("tenki_image", "")
+        tenki_endpoint = resolve_tenki_api_endpoint(
+            os.getenv("TERMINAL_TENKI_API_ENDPOINT") or terminal_cfg.get("tenki_api_endpoint", "")
+        )
+        tenki_workspace = resolve_tenki_workspace_id(
+            os.getenv("TERMINAL_TENKI_WORKSPACE_ID") or terminal_cfg.get("tenki_workspace_id", "")
+        )
+        tenki_project = resolve_tenki_project_id(
+            os.getenv("TERMINAL_TENKI_PROJECT_ID") or terminal_cfg.get("tenki_project_id", "")
+        )
+        tenki_sync_value = os.getenv("TERMINAL_TENKI_SYNC_HERMES_HOME")
+        if tenki_sync_value is None:
+            tenki_sync = bool(terminal_cfg.get("tenki_sync_hermes_home", False))
+        else:
+            tenki_sync = tenki_sync_value.lower() in {"true", "1", "yes"}
+        print(f"  Tenki Image:  {tenki_image or '(Tenki default)'}")
+        print(f"  Endpoint:     {tenki_endpoint}")
+        print(f"  Workspace:    {tenki_workspace or '(not found)'}")
+        print(f"  Project:      {tenki_project or '(not found)'}")
+        print(f"  Sync .hermes: {check_mark(tenki_sync)} {'enabled' if tenki_sync else 'disabled'}")
 
     sudo_password = os.getenv("SUDO_PASSWORD", "")
     print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
@@ -543,17 +570,39 @@ def show_status(args):
     print()
     print(color("◆ Sessions", Colors.CYAN, Colors.BOLD))
 
-    sessions_file = get_hermes_home() / "sessions" / "sessions.json"
-    if sessions_file.exists():
-        import json
+    # Gateway session count: state.db is the source of truth (#9006);
+    # fall back to sessions.json for pre-migration installs.
+    _session_count = None
+    try:
+        from hermes_state import SessionDB
+        _db = SessionDB()
         try:
-            with open(sessions_file, encoding="utf-8") as f:
-                data = json.load(f)
-                print(f"  Active:       {len(data)} session(s)")
-        except Exception:
-            print("  Active:       (error reading sessions file)")
+            _lister = getattr(_db, "list_gateway_sessions", None)
+            if callable(_lister):
+                _session_count = len(_lister(active_only=True))
+        finally:
+            _db.close()
+    except Exception:
+        _session_count = None
+
+    if _session_count is not None and _session_count > 0:
+        print(f"  Active:       {_session_count} session(s)")
     else:
-        print("  Active:       0")
+        sessions_file = get_hermes_home() / "sessions" / "sessions.json"
+        if sessions_file.exists():
+            import json
+            try:
+                with open(sessions_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                    _entries = {
+                        k: v for k, v in data.items()
+                        if not str(k).startswith("_")
+                    } if isinstance(data, dict) else {}
+                    print(f"  Active:       {len(_entries)} session(s)")
+            except Exception:
+                print("  Active:       (error reading sessions file)")
+        else:
+            print(f"  Active:       {_session_count if _session_count is not None else 0}")
 
     # =========================================================================
     # Deep checks

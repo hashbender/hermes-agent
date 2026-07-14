@@ -48,6 +48,40 @@ def _string(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _scoped_env(name: str) -> str:
+    """Read a credential env var honoring the active profile secret scope.
+
+    Under a multiplexed gateway turn a profile scope is installed, and the
+    token must come from *that* profile's secrets — never from a raw
+    ``os.environ`` read that could hold another profile's value. When no
+    multiplexing is active this behaves exactly like ``os.getenv``.
+    """
+    try:
+        from agent.secret_scope import get_secret
+
+        return _string(get_secret(name, ""))
+    except Exception:
+        # Fail closed: an unscoped read under active multiplexing (or any
+        # resolution error) must NOT silently leak a process-global value.
+        return ""
+
+
+def _global_credential_fallback_allowed() -> bool:
+    """Whether machine-global credential sources (the shared Tenki CLI login)
+    may be consulted.
+
+    Skipped whenever a profile secret scope is authoritative — a multiplexed
+    profile without its own Tenki token must not borrow the machine-global
+    ``tenki login`` credential that another profile may be relying on.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        return current_secret_scope() is None and not is_multiplex_active()
+    except Exception:
+        return True
+
+
 def _first_string(data: dict[str, Any], keys: tuple[str, ...]) -> str:
     for key in keys:
         value = _string(data.get(key))
@@ -91,49 +125,75 @@ def _find_secret_value(data: Any) -> str:
 
 
 def resolve_tenki_api_endpoint(explicit: str = "") -> str:
-    """Resolve the Tenki API endpoint from config/env/CLI defaults."""
+    """Resolve the Tenki API endpoint from config/env/CLI defaults.
+
+    Scope-aware (see :func:`_scoped_env`): under a multiplexed profile turn the
+    active profile's setting wins, and the shared machine Tenki CLI config is
+    consulted only when no profile scope is authoritative.
+    """
     explicit = _string(explicit)
     if explicit:
         return explicit
     for env_name in ("TENKI_API_ENDPOINT", "TENKI_API_URL"):
-        value = _string(os.getenv(env_name))
+        value = _scoped_env(env_name)
         if value:
             return value
-    cfg = load_tenki_cli_config()
-    return _first_string(cfg, ("api_endpoint", "api_url", "endpoint")) or TENKI_DEFAULT_API_ENDPOINT
+    if _global_credential_fallback_allowed():
+        cfg = load_tenki_cli_config()
+        endpoint = _first_string(cfg, ("api_endpoint", "api_url", "endpoint"))
+        if endpoint:
+            return endpoint
+    return TENKI_DEFAULT_API_ENDPOINT
 
 
 def resolve_tenki_workspace_id(explicit: str = "") -> str:
+    """Resolve the Tenki workspace id. Scope-aware; workspace/project decide
+    where sandboxes are created, so a multiplexed profile must not silently
+    borrow the machine-global workspace of another tenant."""
     explicit = _string(explicit)
     if explicit:
         return explicit
     for env_name in ("TENKI_WORKSPACE_ID", "TENKI_WORKSPACE"):
-        value = _string(os.getenv(env_name))
+        value = _scoped_env(env_name)
         if value:
             return value
+    if not _global_credential_fallback_allowed():
+        return ""
     return _first_string(load_tenki_cli_config(), ("current_workspace_id", "workspace_id", "workspace"))
 
 
 def resolve_tenki_project_id(explicit: str = "") -> str:
+    """Resolve the Tenki project id. Scope-aware for the same reason as
+    :func:`resolve_tenki_workspace_id`."""
     explicit = _string(explicit)
     if explicit:
         return explicit
     for env_name in ("TENKI_PROJECT_ID", "TENKI_PROJECT"):
-        value = _string(os.getenv(env_name))
+        value = _scoped_env(env_name)
         if value:
             return value
+    if not _global_credential_fallback_allowed():
+        return ""
     return _first_string(load_tenki_cli_config(), ("current_project_id", "project_id", "project"))
 
 
 def resolve_tenki_auth_token(explicit: str = "") -> str:
-    """Resolve a Tenki auth token/API key without logging or persisting it."""
+    """Resolve a Tenki auth token/API key without logging or persisting it.
+
+    Reads are profile-scope-aware (see :func:`_scoped_env`): under a
+    multiplexed gateway turn the active profile's secrets win, and the shared
+    machine ``tenki login`` credential is consulted only when no profile scope
+    is authoritative.
+    """
     explicit = _string(explicit)
     if explicit:
         return explicit
     for env_name in ("TENKI_AUTH_TOKEN", "TENKI_API_KEY"):
-        value = _string(os.getenv(env_name))
+        value = _scoped_env(env_name)
         if value:
             return value
+    if not _global_credential_fallback_allowed():
+        return ""
     return _find_secret_value(load_tenki_cli_config())
 
 

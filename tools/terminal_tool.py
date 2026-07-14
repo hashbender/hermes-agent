@@ -893,7 +893,7 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     should prepend sudo_stdin to their stdin_data and pass the merged bytes to
     Popen's stdin pipe.
 
-    Callers that cannot pipe subprocess stdin (modal, daytona, tenki) must embed
+    Callers that cannot pipe subprocess stdin (modal, daytona) must embed
     the password in the command string themselves; see their execute()
     methods for how they handle the non-None sudo_stdin case.
 
@@ -1217,6 +1217,35 @@ _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "tenki"})
 
+# Guest-home roots whose subtree is a valid container cwd even though the root
+# shares a host-looking prefix. Tenki's guest home is /home/tenki, so
+# /home/tenki/project is a real sandbox path, not a host path to discard.
+_CONTAINER_GUEST_HOME_ROOTS = {"tenki": "/home/tenki"}
+
+
+def _is_backend_guest_subpath(env_type: str, cwd: str) -> bool:
+    """True when *cwd* is the backend's guest-home root or a path beneath it."""
+    root = _CONTAINER_GUEST_HOME_ROOTS.get(env_type)
+    if not root or not cwd:
+        return False
+    return cwd == root or cwd.startswith(root.rstrip("/") + "/")
+
+
+def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
+    """Return True when *cwd* is a tilde path that the remote SSH shell must
+    expand itself, so the Hermes host/container must NOT ``expanduser`` it.
+
+    SSH ``cwd`` is interpreted by the *remote* shell (``cd ~`` / ``cd ~/x``
+    over ``ssh ... bash -c``). Expanding ``~`` locally would rewrite it to the
+    Hermes host HOME (often ``/opt/data`` under Docker) and inject a
+    nonexistent path into the remote session. Only ``~`` / ``~/...`` on the
+    ``ssh`` backend qualify; absolute remote paths still pass through
+    unchanged, and every other backend keeps expanding locally.
+    """
+    if (backend or "").strip().lower() != "ssh":
+        return False
+    return cwd == "~" or cwd.startswith("~/")
+
 
 def _is_unusable_container_cwd(cwd: str) -> bool:
     """Return True if *cwd* is a host/relative path that won't work as the
@@ -1273,6 +1302,22 @@ def _get_env_config() -> Dict[str, Any]:
         docker_env = {}
         docker_extra_args = []
 
+    # Tenki settings may be bridged from config.yaml even when the active
+    # backend is local/ssh. Do not parse their numeric/JSON payloads until the
+    # tenki backend is selected; a stale or invalid value must not make the
+    # local terminal unusable (mirrors the container_/docker_ guards above).
+    tenki_backend = env_type == "tenki"
+    if tenki_backend:
+        tenki_forward_env = _parse_env_var("TERMINAL_TENKI_FORWARD_ENV", "[]", json.loads, "valid JSON")
+        tenki_max_duration = _parse_env_var("TERMINAL_TENKI_MAX_DURATION", "3600")
+        tenki_idle_timeout = _parse_env_var("TERMINAL_TENKI_IDLE_TIMEOUT", "0")
+        tenki_pause_retention = _parse_env_var("TERMINAL_TENKI_PAUSE_RETENTION", "0")
+    else:
+        tenki_forward_env = []
+        tenki_max_duration = 3600
+        tenki_idle_timeout = 0
+        tenki_pause_retention = 0
+
     # Default cwd: local uses the host's current directory, ssh uses the
     # remote home, and everything else starts in the backend's default
     # root-like cwd.
@@ -1290,7 +1335,7 @@ def _get_env_config() -> Dict[str, Any]:
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
     cwd = os.getenv("TERMINAL_CWD", default_cwd)
-    if cwd:
+    if cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):
         cwd = os.path.expanduser(cwd)
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
@@ -1303,8 +1348,10 @@ def _get_env_config() -> Dict[str, Any]:
             host_cwd = candidate
             cwd = "/workspace"
     elif env_type in _CONTAINER_BACKENDS and cwd:
-        # Host paths and relative paths that won't work inside containers
-        if _is_unusable_container_cwd(cwd) and cwd != default_cwd:
+        # Host paths and relative paths that won't work inside containers. A
+        # path inside the backend's own guest-home subtree is valid even though
+        # it may share a host-looking prefix (see _is_backend_guest_subpath).
+        if _is_unusable_container_cwd(cwd) and not _is_backend_guest_subpath(env_type, cwd):
             logger.info("Ignoring TERMINAL_CWD=%r for %s backend "
                         "(host/relative path won't work in sandbox). Using %r instead.",
                         cwd, env_type, default_cwd)
@@ -1325,10 +1372,11 @@ def _get_env_config() -> Dict[str, Any]:
         "tenki_name_prefix": os.getenv("TERMINAL_TENKI_NAME_PREFIX", "hermes"),
         "tenki_allow_inbound": os.getenv("TERMINAL_TENKI_ALLOW_INBOUND", "false").lower() in {"true", "1", "yes"},
         "tenki_allow_outbound": os.getenv("TERMINAL_TENKI_ALLOW_OUTBOUND", "true").lower() in {"true", "1", "yes"},
-        "tenki_max_duration": _parse_env_var("TERMINAL_TENKI_MAX_DURATION", "3600"),
-        "tenki_idle_timeout": _parse_env_var("TERMINAL_TENKI_IDLE_TIMEOUT", "0"),
-        "tenki_pause_retention": _parse_env_var("TERMINAL_TENKI_PAUSE_RETENTION", "0"),
+        "tenki_max_duration": tenki_max_duration,
+        "tenki_idle_timeout": tenki_idle_timeout,
+        "tenki_pause_retention": tenki_pause_retention,
         "tenki_sync_hermes_home": os.getenv("TERMINAL_TENKI_SYNC_HERMES_HOME", "false").lower() in {"true", "1", "yes"},
+        "tenki_forward_env": tenki_forward_env,
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1359,6 +1407,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
+        "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
         "docker_extra_args": docker_extra_args,
         # Cross-process container reuse (issue #20561).  The docs claim
         # "ONE long-lived container shared across sessions" — this toggle
@@ -1386,6 +1435,37 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
         has_direct=has_direct_modal_credentials(),
         managed_ready=is_managed_tool_gateway_ready("modal"),
     )
+
+
+def _container_config_from_env_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the shared container-backend config passed to _create_environment."""
+    return {
+        "container_cpu": config.get("container_cpu", 1),
+        "container_memory": config.get("container_memory", 5120),
+        "container_disk": config.get("container_disk", 51200),
+        "container_persistent": config.get("container_persistent", True),
+        "modal_mode": config.get("modal_mode", "auto"),
+        "docker_volumes": config.get("docker_volumes", []),
+        "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+        "docker_forward_env": config.get("docker_forward_env", []),
+        "docker_env": config.get("docker_env", {}),
+        "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+        "docker_extra_args": config.get("docker_extra_args", []),
+        "docker_network": config.get("docker_network", True),
+        "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+        "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+        "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
+        "tenki_workspace_id": config.get("tenki_workspace_id", ""),
+        "tenki_project_id": config.get("tenki_project_id", ""),
+        "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
+        "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
+        "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
+        "tenki_max_duration": config.get("tenki_max_duration", 3600),
+        "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
+        "tenki_pause_retention": config.get("tenki_pause_retention", 0),
+        "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
+        "tenki_forward_env": config.get("tenki_forward_env", []),
+    }
 
 
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
@@ -1419,6 +1499,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_forward_env = cc.get("docker_forward_env", [])
     docker_env = cc.get("docker_env", {})
     docker_extra_args = cc.get("docker_extra_args", [])
+    docker_network = cc.get("docker_network", True)
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
@@ -1441,6 +1522,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             forward_env=docker_forward_env,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
+            network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
         )
@@ -1541,6 +1623,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             idle_timeout=cc.get("tenki_idle_timeout", 0),
             pause_retention=cc.get("tenki_pause_retention", 0),
             sync_hermes_home=cc.get("tenki_sync_hermes_home", False),
+            forward_env=cc.get("tenki_forward_env", []),
         )
 
     elif env_type == "ssh":
@@ -2130,7 +2213,11 @@ def terminal_tool(
         # Valid in-container override paths (RL/benchmark sandboxes that set
         # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
         # through untouched.
-        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+        if (
+            env_type in _CONTAINER_BACKENDS
+            and _is_unusable_container_cwd(cwd)
+            and not _is_backend_guest_subpath(env_type, cwd)
+        ):
             if cwd != config["cwd"]:
                 logger.info(
                     "Ignoring host/relative cwd override %r for %s backend "
@@ -2224,31 +2311,7 @@ def terminal_tool(
 
                         container_config = None
                         if env_type in _CONTAINER_BACKENDS:
-                            container_config = {
-                                "container_cpu": config.get("container_cpu", 1),
-                                "container_memory": config.get("container_memory", 5120),
-                                "container_disk": config.get("container_disk", 51200),
-                                "container_persistent": config.get("container_persistent", True),
-                                "modal_mode": config.get("modal_mode", "auto"),
-                                "docker_volumes": config.get("docker_volumes", []),
-                                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                                "docker_forward_env": config.get("docker_forward_env", []),
-                                "docker_env": config.get("docker_env", {}),
-                                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                                "docker_extra_args": config.get("docker_extra_args", []),
-                                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-                                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                                "tenki_project_id": config.get("tenki_project_id", ""),
-                                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                                "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
-                                "tenki_sync_hermes_home": config.get("tenki_sync_hermes_home", False),
-                            }
+                            container_config = _container_config_from_env_config(config)
 
                         local_config = None
                         if env_type == "local":
@@ -2307,6 +2370,11 @@ def terminal_tool(
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
+        # True when the user explicitly approved this run (or pre-confirmed via
+        # force).  Drives the clean-interrupt-slate clear before env.execute so
+        # an approved command can't be SIGINT-killed by a bit that landed during
+        # the approval-wait (see clear_current_thread_interrupt).
+        _approved_run = bool(force)
         if not force:
             approval = _check_all_guards(
                 command, env_type,
@@ -2324,6 +2392,8 @@ def terminal_tool(
                         "command": approval.get("command", command),
                         "description": approval.get("description", "command flagged"),
                         "pattern_key": approval.get("pattern_key", ""),
+                        "smart_denied": approval.get("smart_denied", False),
+                        "allow_permanent": approval.get("allow_permanent", True),
                     }, ensure_ascii=False)
                 # Command was blocked
                 desc = approval.get("description", "command flagged")
@@ -2341,6 +2411,7 @@ def terminal_tool(
             if approval.get("user_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command required approval ({desc}) and was approved by the user."
+                _approved_run = True
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
@@ -2422,6 +2493,9 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
+                # Background spawns detached and returns exit_code 0 immediately;
+                # it never inline-polls is_interrupted(), so the stale-bit kill
+                # cannot occur here and this note never co-occurs with rc=130.
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
@@ -2635,7 +2709,17 @@ def terminal_tool(
             retry_count = 0
             result = None
             command_cwd = None
-            
+
+            # Clean interrupt slate for an approved command, ONCE before the
+            # retry loop: drop a stale bit that landed on this thread during the
+            # approval-wait so it can't SIGINT the just-approved run.  Do NOT
+            # re-clear inside the loop -- a genuine interrupt arriving during the
+            # backoff sleep between retries must survive and abort the command
+            # (caught by the next attempt's _wait_for_process poll loop -> 130).
+            if _approved_run:
+                from tools.interrupt import clear_current_thread_interrupt
+                clear_current_thread_interrupt()
+
             while retry_count <= max_retries:
                 try:
                     command_cwd = _resolve_command_cwd(
@@ -2777,7 +2861,19 @@ def terminal_tool(
             except Exception:
                 logger.debug("verification evidence recording failed", exc_info=True)
             if approval_note:
-                result_dict["approval"] = approval_note
+                # Treat rc=130 as an interrupt only when the executor's marker is
+                # present.  A command can legitimately exit 130 on its own
+                # (e.g. `bash -c 'exit 130'`); _wait_for_process returns the
+                # child's natural returncode there with no marker, and that must
+                # NOT be relabelled as a user interrupt in the audit note.
+                if returncode == 130 and "[Command interrupted]" in output:
+                    # Approved command was interrupted mid-run by a genuine Stop.
+                    # Keep the audit trail but never imply success: the bare
+                    # "...approved by the user." note must not co-occur with the
+                    # interrupt exit code (satisfies the 3-part-signature DONE).
+                    result_dict["approval"] = approval_note.rstrip(".") + ", then interrupted."
+                else:
+                    result_dict["approval"] = approval_note
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
             if sudo_auth_failed:

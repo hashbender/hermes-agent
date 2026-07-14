@@ -109,7 +109,7 @@ A well-built third-party-product plugin can clear automated review and still be 
 | Requirement | Notes |
 |-------------|-------|
 | **Git** | With the `git-lfs` extension installed |
-| **Python 3.11+** | uv will install it if missing |
+| **Python 3.11–3.13** | uv will install it if missing |
 | **uv** | Fast Python package manager ([install](https://docs.astral.sh/uv/)) |
 | **Node.js 20+** | Optional — needed for browser tools and WhatsApp bridge (matches root `package.json` engines) |
 
@@ -257,7 +257,7 @@ hermes-agent/
 │   ├── skill_tools.py            # Skill search, load, manage
 │   └── environments/             # Terminal execution backends
 │       ├── base.py                   # BaseEnvironment ABC
-│       ├── local.py, docker.py, ssh.py, singularity.py, modal.py, daytona.py
+│       ├── local.py, docker.py, ssh.py, singularity.py, modal.py, daytona.py, tenki.py
 │
 ├── gateway/                  # Messaging gateway
 │   ├── run.py                    # GatewayRunner — platform lifecycle, message routing, cron

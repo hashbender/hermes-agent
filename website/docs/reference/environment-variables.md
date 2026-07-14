@@ -14,6 +14,7 @@ Hermes reads environment variables from the process environment and, for user-ma
 |----------|-------------|
 | `OPENROUTER_API_KEY` | OpenRouter API key (recommended for flexibility) |
 | `OPENROUTER_BASE_URL` | Override the OpenRouter-compatible base URL |
+| `FIREWORKS_API_KEY` | Fireworks AI API key ([app.fireworks.ai](https://app.fireworks.ai/settings/users/api-keys)). Configure endpoint overrides with `model.base_url` in `config.yaml`. |
 | `HERMES_OPENROUTER_CACHE` | Enable OpenRouter response caching (`1`/`true`/`yes`/`on`). Overrides `openrouter.response_cache` in config.yaml. See [Response Caching](https://openrouter.ai/docs/guides/features/response-caching). |
 | `HERMES_OPENROUTER_CACHE_TTL` | Cache TTL in seconds (1-86400). Overrides `openrouter.response_cache_ttl` in config.yaml. |
 | `NOUS_BASE_URL` | Override Nous Portal base URL (rarely needed; development/testing only) |
@@ -162,6 +163,10 @@ For native Anthropic auth, Hermes prefers Claude Code's own credential files whe
 | `SUPERMEMORY_API_KEY` | Semantic long-term memory with profile recall and session ingest ([supermemory.ai](https://supermemory.ai)) |
 | `DAYTONA_API_KEY` | Daytona cloud sandboxes ([daytona.io](https://daytona.io/)) |
 | `TENKI_AUTH_TOKEN` / `TENKI_API_KEY` | Tenki cloud sandboxes ([tenki.cloud](https://tenki.cloud)); alternatively run `tenki login` |
+| `TENKI_CONFIG_PATH` | Override the Tenki CLI config path Hermes reads for auth, workspace, and project defaults |
+| `TENKI_API_ENDPOINT` / `TENKI_API_URL` | Direct Tenki API endpoint override used when terminal config is blank |
+| `TENKI_WORKSPACE_ID` / `TENKI_WORKSPACE` | Direct Tenki workspace ID override used when terminal config is blank |
+| `TENKI_PROJECT_ID` / `TENKI_PROJECT` | Direct Tenki project ID override used when terminal config is blank |
 
 ### Skill API Keys
 
@@ -218,12 +223,14 @@ These variables configure the [Tool Gateway](/user-guide/features/tool-gateway) 
 | `TERMINAL_TENKI_API_ENDPOINT` | Tenki API endpoint (default: `https://api.tenki.cloud`) |
 | `TERMINAL_TENKI_WORKSPACE_ID` | Tenki workspace ID; blank falls back to Tenki CLI config |
 | `TERMINAL_TENKI_PROJECT_ID` | Tenki project ID; blank falls back to Tenki CLI config |
+| `TERMINAL_TENKI_NAME_PREFIX` | Prefix for Hermes-created Tenki sandbox names (default: `hermes`) |
 | `TERMINAL_TENKI_ALLOW_INBOUND` | Allow inbound network access in Tenki sandboxes (`true`/`false`, default: `false`) |
 | `TERMINAL_TENKI_ALLOW_OUTBOUND` | Allow outbound network access in Tenki sandboxes (`true`/`false`, default: `true`) |
 | `TERMINAL_TENKI_MAX_DURATION` | Tenki sandbox maximum duration in seconds (default: `3600`) |
 | `TERMINAL_TENKI_IDLE_TIMEOUT` | Tenki sandbox idle timeout in seconds; converted to minutes for the SDK (`0` disables explicit idle timeout) |
 | `TERMINAL_TENKI_PAUSE_RETENTION` | Tenki pause retention duration in seconds (`0` uses Tenki default) |
 | `TERMINAL_TENKI_SYNC_HERMES_HOME` | Opt-in sync of selected `~/.hermes` credentials, skills, and cache files into Tenki sandboxes (`true`/`false`, default: `false`) |
+| `TERMINAL_TENKI_FORWARD_ENV` | JSON array of env var names to explicitly forward into Tenki sandboxes. Use this for task credentials such as `GITHUB_TOKEN`; values are resolved from the shell first, then `~/.hermes/.env`. |
 | `TERMINAL_TIMEOUT` | Command timeout in seconds |
 | `TERMINAL_LIFETIME_SECONDS` | Max lifetime for terminal sessions in seconds |
 | `TERMINAL_CWD` | Deprecated direct override for gateway/cron terminal sessions. Prefer `terminal.cwd` in `config.yaml`; CLI still uses the launch directory. |
@@ -248,7 +255,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `TERMINAL_CONTAINER_CPU` | CPU cores (default: 1) |
 | `TERMINAL_CONTAINER_MEMORY` | Memory in MB (default: 5120) |
 | `TERMINAL_CONTAINER_DISK` | Disk in MB (default: 51200) |
-| `TERMINAL_CONTAINER_PERSISTENT` | Persist container filesystem across sessions (default: `true`) |
+| `TERMINAL_CONTAINER_PERSISTENT` | Persist container filesystem across sessions (default: `true`; Tenki defaults to `false` unless explicitly set) |
 | `TERMINAL_SANDBOX_DIR` | Host directory for workspaces and overlays (default: `~/.hermes/sandboxes/`) |
 
 ## Persistent Shell
@@ -683,6 +690,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | `HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS` | Grace window before flushing queued Telegram media (default: `0.6`). |
 | `HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS` | Delay before sending a follow-up after the agent finishes, to avoid racing the last stream chunk. |
 | `HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT` / `_READ_TIMEOUT` / `_WRITE_TIMEOUT` / `_POOL_TIMEOUT` | Override the underlying `python-telegram-bot` HTTP timeouts (seconds). |
+| `HERMES_TELEGRAM_INIT_TIMEOUT` | Per-attempt cap (seconds) on the Telegram `initialize()` connect chain during gateway startup, so an unreachable fallback-IP chain can't block startup indefinitely (default: `30`). |
 | `HERMES_TELEGRAM_HTTP_POOL_SIZE` | Max concurrent HTTP connections to the Telegram API. |
 | `HERMES_TELEGRAM_DISABLE_FALLBACK_IPS` | Disable the hard-coded Cloudflare fallback IPs used when DNS fails (`true`/`false`). |
 | `HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS` | Grace window before flushing a queued Discord text chunk (default: `0.6`). |
@@ -726,7 +734,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | `HERMES_ACCEPT_HOOKS` | Auto-approve any unseen shell hooks declared in `config.yaml` without a TTY prompt. Equivalent to `--accept-hooks` or `hooks_auto_accept: true`. |
 | `HERMES_IGNORE_USER_CONFIG` | Skip `~/.hermes/config.yaml` and use built-in defaults (credentials in `.env` still load). Equivalent to `--ignore-user-config`. |
 | `HERMES_IGNORE_RULES` | Skip auto-injection of `AGENTS.md`, `SOUL.md`, `.cursorrules`, memory, and preloaded skills. Equivalent to `--ignore-rules`. |
-| `HERMES_SAFE_MODE` | Troubleshooting mode: disable ALL customizations — skips plugin discovery and MCP server loading. Set automatically by `--safe-mode` (which also sets the two flags above). |
+| `HERMES_SAFE_MODE` | Troubleshooting mode: disable ALL customizations — skips plugin discovery, MCP server loading, and shell-hook registration. Set automatically by `--safe-mode` (which also sets the two flags above). |
 | `HERMES_MD_NAMES` | Comma-separated list of rules-file names to auto-inject (default: `AGENTS.md,CLAUDE.md,.cursorrules,SOUL.md`). |
 | `HERMES_TOOL_PROGRESS` | Deprecated compatibility variable for tool progress display. Prefer `display.tool_progress` in `config.yaml`. |
 | `HERMES_TOOL_PROGRESS_MODE` | Deprecated compatibility variable for tool progress mode. Prefer `display.tool_progress` in `config.yaml`. |
@@ -741,6 +749,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | `HERMES_STREAM_READ_TIMEOUT` | Streaming socket read timeout in seconds (default: `120`). Auto-increased to `HERMES_API_TIMEOUT` for local providers. Increase if local LLMs time out during long code generation. |
 | `HERMES_STREAM_STALE_TIMEOUT` | Stale stream detection timeout in seconds (default: `180`). Auto-disabled for local providers. Triggers connection kill if no chunks arrive within this window. |
 | `HERMES_STREAM_RETRIES` | Number of mid-stream reconnect attempts on transient network errors (default: `3`). |
+| `HERMES_STREAM_STALE_GIVEUP` | Cross-turn circuit breaker: after this many consecutive stale kills (streaming or non-streaming) with no completed response, abort each call immediately with an actionable error instead of re-waiting out the stale timeout (default: `5`, `0` disables). Resets on any completed response, `/model` switch, fallback activation, or turn-start primary restore. |
 | `HERMES_AGENT_TIMEOUT` | Gateway inactivity timeout for a running agent in seconds (default: `1800`, 30 minutes). Resets on every tool call and streamed token. Set to `0` to disable. |
 | `HERMES_AGENT_TIMEOUT_WARNING` | Gateway: send a warning message after this many seconds of inactivity (default: 75% of `HERMES_AGENT_TIMEOUT`). |
 | `HERMES_AGENT_NOTIFY_INTERVAL` | Gateway: interval in seconds between progress notifications on long-running agent turns. |
