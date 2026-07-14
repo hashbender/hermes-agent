@@ -1413,6 +1413,16 @@ class FeishuAdapter(BasePlatformAdapter):
     supports_code_blocks = True  # Feishu renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 
+    # Feishu gates DM/group access at intake via FEISHU_GROUP_POLICY +
+    # per-group group_rules.<chat_id>.allowlist (parsed from config.extra).
+    # The gateway's env-based FEISHU_ALLOWED_USERS check runs AFTER this; when
+    # no env allowlist is configured, the gateway consults this flag so it can
+    # honor the config-driven group_rules allowlist the adapter already
+    # enforced, instead of double-denying it. Mirrors WeCom / Weixin / Yuanbao.
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        return True
+
     MAX_MESSAGE_LENGTH = 8000
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
     CHAT_LOCK_MAX_SIZE: int = 1000
@@ -4200,6 +4210,17 @@ class FeishuAdapter(BasePlatformAdapter):
                 return "bot_not_mentioned"
 
         if not is_group:
+            if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+                return None
+            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+                return None
+            # Empty FEISHU_ALLOWED_USERS is the pairing-mode default from setup:
+            # forward DMs to gateway intake so the pairing handshake can run.
+            # Gateway auth fail-closes agent access until approval.
+            if not self._allowed_group_users:
+                return None
+            if not (sender_ids and (sender_ids & self._allowed_group_users)):
+                return "dm_policy_rejected"
             return None
 
         if not self._allow_group_message(
