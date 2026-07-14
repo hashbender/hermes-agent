@@ -99,6 +99,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "provider.anthropic": ("anthropic==0.87.0",),  # CVE-2026-34450, CVE-2026-34452
     # AWS Bedrock provider
     "provider.bedrock": ("boto3==1.42.89",),
+    # Google Vertex AI provider — OAuth2 token minting for the Gemini
+    # OpenAI-compatible endpoint. Only loaded when provider=vertex is selected;
+    # google-auth is NOT in [all] so plain installs don't carry it.
+    "provider.vertex": ("google-auth==2.55.1",),
     # Microsoft Foundry — Entra ID auth (managed identity, workload identity,
     # service principal, az login, VS Code, azd, PowerShell). Only loaded
     # when model.auth_mode=entra_id is selected; key-based azure-foundry
@@ -184,7 +188,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "qrcode==7.4.2",
     ),
     "platform.feishu": (
-        "lark-oapi==1.5.3",
+        "lark-oapi==1.6.8",
         "qrcode==7.4.2",
     ),
     # WeCom callback-mode adapter — parses untrusted XML POST bodies. Pulls
@@ -200,6 +204,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),
     "terminal.daytona": ("daytona==0.155.0",),
+    "terminal.tenki": ("tenki-sandbox==0.1.1",),
 
     # ─── Skills ────────────────────────────────────────────────────────────
     "skill.google_workspace": (
@@ -234,6 +239,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "mcp==1.26.0",
         "starlette==1.0.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
     ),
+    # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
+    "tool.trace_upload": ("huggingface-hub==1.2.3",),
 }
 
 
@@ -447,6 +454,22 @@ def _allow_lazy_installs() -> bool:
         return _lazy_install_target() is not None
 
     return True
+
+
+def _unsupported_feature_reason(feature: str) -> Optional[str]:
+    """Return why a lazy feature cannot work on this host, or ``None``.
+
+    This is a platform capability gate, not a security policy gate. It keeps
+    known-impossible installs out of both first-use lazy installation and the
+    ``hermes update`` lazy-refresh pass.
+    """
+    if sys.platform == "win32" and feature == "platform.matrix":
+        return (
+            "unsupported on Windows: Matrix E2EE depends on python-olm, "
+            "which has no Windows wheel and requires make + libolm to build "
+            "from sdist. Run Hermes under WSL to use Matrix on Windows."
+        )
+    return None
 
 
 def _spec_is_safe(spec: str) -> bool:
@@ -735,6 +758,10 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     if not missing:
         return
 
+    unsupported = _unsupported_feature_reason(feature)
+    if unsupported:
+        raise FeatureUnavailable(feature, missing, unsupported)
+
     # Validate every spec against the allowlist + safety regex. Belt and
     # braces — the keys-in-LAZY_DEPS check above already constrains this.
     for spec in missing:
@@ -865,13 +892,24 @@ def refresh_active_features(*, prompt: bool = False) -> dict[str, str]:
         if not missing:
             results[feature] = "current"
             continue
+
+        unsupported = _unsupported_feature_reason(feature)
+        if unsupported:
+            results[feature] = f"skipped: {unsupported}"
+            continue
+
         try:
             ensure(feature, prompt=prompt)
             results[feature] = "refreshed"
         except FeatureUnavailable as e:
-            # Distinguish "user opted out" from "install failed" so the
-            # update command can render the right message.
-            if "lazy installs disabled" in str(e) or "declined" in str(e):
+            # Distinguish "user opted out" or platform-incompatible features
+            # from install failures so the update command can render the
+            # right non-error message.
+            if (
+                "lazy installs disabled" in str(e)
+                or "declined" in str(e)
+                or e.reason.startswith("unsupported ")
+            ):
                 results[feature] = f"skipped: {e.reason}"
             else:
                 results[feature] = f"failed: {e.reason}"

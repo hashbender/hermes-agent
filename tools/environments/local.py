@@ -25,16 +25,24 @@ def _msys_to_windows_path(cwd: str) -> str:
     native Windows form (``C:\\Users\\x``) so ``os.path.isdir`` and
     ``subprocess.Popen(..., cwd=...)`` can find it.
 
+    Also accepts the Cygwin (``/cygdrive/c/...``) and WSL-mount
+    (``/mnt/c/...``) spellings of a drive root. Multi-segment POSIX paths
+    like ``/home/x`` or ``/tmp/foo`` are left untouched.
+
     No-ops on non-Windows hosts or for paths that aren't in MSYS form.
     Returns the input unchanged when no translation applies. This is
     idempotent — calling it on an already-Windows path returns it as-is.
     """
     if not _IS_WINDOWS or not cwd:
         return cwd
-    # Match leading "/<single letter>/" or exactly "/<letter>" (bare drive root).
-    m = re.match(r'^/([a-zA-Z])(/.*)?$', cwd)
+    # Match leading "/<single letter>/" or exactly "/<letter>" (bare drive root),
+    # plus /cygdrive/<letter>/... and /mnt/<letter>/... variants.
+    m = re.match(r'^/(?:(?:cygdrive|mnt)/)?([a-zA-Z])(/.*)?$', cwd)
     if not m:
         return cwd
+    # Reject /cygdrive or /mnt with no drive letter — the optional group above
+    # already requires the letter. Multi-char first segments (/home, /tmp)
+    # fail the single-letter capture and fall through as no-ops.
     drive = m.group(1).upper()
     tail = (m.group(2) or "").replace('/', '\\')
     return f"{drive}:{tail or chr(92)}"  # chr(92) = backslash, avoid raw-string escape
@@ -56,6 +64,35 @@ def _windows_to_msys_path(cwd: str) -> str:
     drive = m.group(1).lower()
     tail = (m.group(2) or "").replace('\\', '/').lstrip('/')
     return f"/{drive}/{tail}" if tail else f"/{drive}/"
+
+
+def _bash_safe_path(path: str) -> str:
+    """Return *path* in a form safe to embed in a Git Bash script.
+
+    Native ``C:\\Users\\x`` / ``C:/Users/x`` → ``/c/Users/x`` via
+    :func:`_windows_to_msys_path`. Mixed MSYS leftovers
+    (``/c/Users\\Alexander\\Documents``) get backslashes normalized so
+    bash does not eat ``\\U`` and trip the ``Directory \\drivers\\etc``
+    failure class. No-op off Windows and for empty input.
+
+    ``get_temp_dir`` already emits forward-slash ``C:/...`` forms for
+    Python compatibility; those still need the ``/c/...`` rewrite —
+    MSYS argument conversion treats ``C:/...`` as a Windows path and
+    can corrupt the login-shell ``drivers\\etc`` lookup.
+    """
+    if not _IS_WINDOWS or not path:
+        return path
+    path = _windows_to_msys_path(path)
+    if "\\" in path:
+        path = path.replace("\\", "/")
+    return path
+
+
+def _quote_bash_path(path: str) -> str:
+    """Quote *path* for safe interpolation into a Git Bash script on Windows."""
+    import shlex
+
+    return shlex.quote(_bash_safe_path(path))
 
 
 def _resolve_safe_cwd(cwd: str) -> str:
@@ -207,6 +244,8 @@ def _build_provider_env_blocklist() -> frozenset:
         "MODAL_TOKEN_ID",
         "MODAL_TOKEN_SECRET",
         "DAYTONA_API_KEY",
+        "TENKI_AUTH_TOKEN",
+        "TENKI_API_KEY",
         "GATEWAY_RELAY_ID",
         "GATEWAY_RELAY_SECRET",
         "GATEWAY_RELAY_DELIVERY_KEY",
@@ -383,6 +422,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
 
+    _apply_windows_msys_bash_env_defaults(sanitized)
+
     return sanitized
 
 
@@ -426,6 +467,8 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
     "DAYTONA_API_KEY",
+    "TENKI_AUTH_TOKEN",
+    "TENKI_API_KEY",
 })
 
 
@@ -492,6 +535,8 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # Active-venv markers must not clobber another project's environment.
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         env.pop(_marker, None)
+
+    _apply_windows_msys_bash_env_defaults(env)
 
     # Cross-session leak guard, same as the terminal spawn paths: this helper
     # copies os.environ, whose HERMES_SESSION_* mirror is a last-writer-wins
@@ -746,6 +791,29 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
     return ":".join(ordered_entries)
 
 
+def _apply_windows_msys_bash_env_defaults(env: dict) -> None:
+    """Disable MSYS argument path conversion for Git Bash subprocesses.
+
+    Git Bash rewrites arguments that look like Unix paths (``/FO``, ``/TN``,
+    ``/Create``) into ``C:/.../git/FO``-style paths, which breaks native
+    Windows commands such as ``tasklist``, ``schtasks``, and ``wmic``.  Hermes
+    runs terminal commands through bash on Windows, so set the standard MSYS
+    opt-out by default.  Users who need conversion can override in their env.
+    Refs #56700.
+
+    ``MSYS_NO_PATHCONV`` is honored by Git for Windows bash only.  MSYS2-proper
+    and Cygwin bash (which ``_find_bash`` can still return via the final
+    ``shutil.which`` fallback) ignore it and honor ``MSYS2_ARG_CONV_EXCL``
+    instead, so set both.  ``*`` disables all argv conversion — the semantic
+    equivalent of ``MSYS_NO_PATHCONV=1``.  Also fixes ``cmd /c`` mangling
+    (#56147).
+    """
+    if not _IS_WINDOWS:
+        return
+    env.setdefault("MSYS_NO_PATHCONV", "1")
+    env.setdefault("MSYS2_ARG_CONV_EXCL", "*")
+
+
 def _path_env_key(run_env: dict) -> str | None:
     """Return the PATH env key to update without altering Windows casing.
 
@@ -803,6 +871,8 @@ def _make_run_env(env: dict) -> dict:
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
+
+    _apply_windows_msys_bash_env_defaults(run_env)
 
     return run_env
 
@@ -956,6 +1026,10 @@ class LocalEnvironment(BaseEnvironment):
     def _quote_cwd_for_cd(cwd: str) -> str:
         """Use native paths for Python, but Git Bash-friendly paths for cd."""
         return BaseEnvironment._quote_cwd_for_cd(_windows_to_msys_path(cwd))
+
+    def _quote_shell_path(self, path: str) -> str:
+        """Rewrite native/mixed Windows paths before quoting for Git Bash."""
+        return _quote_bash_path(path)
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,

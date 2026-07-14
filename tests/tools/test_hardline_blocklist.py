@@ -150,6 +150,16 @@ _HARDLINE_ALLOW = [
     "rm -rf $HOME/tmp",
     "rm foo.txt",
     "rm -rf some/path",
+    # Literal root-level directories that only LOOK like root-collapse
+    # spellings. Each inter-slash segment must be exactly "." or ".." to
+    # count as a collapse back to "/" — "/..." is a dir literally named
+    # "..." and "/.foo" is an ordinary root dotfile. These must NOT be
+    # swept into the "recursive delete of root filesystem" hardline rule
+    # (regression guard for the collapse-spelling tightening).
+    "rm -rf /...",
+    "rm -rf /....",
+    "rm -rf /.foo",
+    "rm -rf /.config/foo",
     # A dangerous-looking command embedded as a quoted *argument* to another
     # command must not trip the floor: the path is immediately followed by a
     # closing quote with no matching opening quote of its own, so the
@@ -401,7 +411,8 @@ def test_root_collapse_pattern_leaves_real_paths_alone(clean_session):
     be pulled onto the hardline floor by the "collapse to /" broadening.
     """
     for cmd in ["rm -rf /tmp", "rm -rf /home/user/x", "rm -rf /.ssh",
-                "rm -rf /.config", "rm -rf ./build", "rm -rf /opt/foo"]:
+                "rm -rf /.config", "rm -rf ./build", "rm -rf /opt/foo",
+                "rm -rf /...", "rm -rf /....", "rm -rf /.foo"]:
         is_hl, _ = detect_hardline_command(cmd)
         assert not is_hl, f"{cmd!r} must not be hardline-blocked (over-match)"
 
@@ -502,7 +513,7 @@ def test_container_backends_still_bypass(clean_session):
 
     Hardline only protects environments with real host impact (local, ssh).
     """
-    for env in ("docker", "singularity", "modal", "daytona"):
+    for env in ("docker", "singularity", "modal", "daytona", "tenki"):
         r1 = check_dangerous_command("rm -rf /", env)
         assert r1["approved"] is True, f"container {env} should still bypass"
         r2 = check_all_command_guards("rm -rf /", env)
@@ -633,7 +644,7 @@ def test_sudo_stdin_guard_not_blocked_by_yolo(clean_session, monkeypatch):
 
 def test_sudo_stdin_guard_container_bypass(clean_session):
     """Containerized backends still bypass — they can't touch the host."""
-    for env in ("docker", "singularity", "modal", "daytona"):
+    for env in ("docker", "singularity", "modal", "daytona", "tenki"):
         for cmd in _SUDO_STDIN_BLOCK:
             result = check_all_command_guards(cmd, env)
             assert result["approved"] is True, f"container {env} should bypass sudo guard on {cmd!r}"
