@@ -151,6 +151,80 @@ export interface MemoryProviderConfig {
   name: string
 }
 
+export interface OpenVikingConnectionValues {
+  account?: string
+  actor_peer_id: string
+  api_key?: string
+  api_key_set?: boolean
+  api_key_type?: 'none' | 'root' | 'user'
+  ovcli_config_path?: string
+  root_api_key?: string
+  source?: 'hermes' | 'ovcli'
+  url: string
+  user?: string
+}
+
+export interface OpenVikingProfile {
+  account: string
+  actor_peer_id: string
+  api_key_set: boolean
+  api_key_type?: 'none' | 'root' | 'user'
+  description: string
+  display_name: string
+  is_active: boolean
+  name: string
+  path: string
+  source: 'active' | 'env' | 'saved'
+  url: string
+  user: string
+}
+
+export interface OpenVikingHealth {
+  label: string
+  message: string
+  status: 'healthy' | 'unhealthy' | 'unreachable'
+}
+
+export interface OpenVikingSetup {
+  active: OpenVikingConnectionValues
+  defaults: {
+    actor_peer_id: string
+    service_url: string
+    url: string
+  }
+  health: OpenVikingHealth
+  legacy_env_present: string[]
+  local_server?: {
+    openviking_server_path?: string
+  }
+  profiles: OpenVikingProfile[]
+}
+
+export interface OpenVikingSetupSaveRequest {
+  profile_name?: string
+  profile_path?: string
+  save_mode: 'profile'
+  values: Partial<OpenVikingConnectionValues>
+}
+
+export interface OpenVikingSetupSaveResponse {
+  mode?: 'profile'
+  ok: boolean
+  profile_path?: string
+}
+
+export interface OpenVikingSetupValidationRequest {
+  profile_path?: string
+  require_api_key?: boolean
+  values: Partial<OpenVikingConnectionValues>
+}
+
+export interface OpenVikingSetupValidationResponse {
+  message: string
+  ok: boolean
+  role: 'root' | 'user' | null
+}
+
 export interface MessagingEnvVarInfo {
   advanced: boolean
   description: string
@@ -427,47 +501,6 @@ export interface UsageStats {
   input: number
   output: number
   total: number
-}
-
-/** One graph node in the star map (learned skill or memory chunk). */
-export interface StarmapNode {
-  id: string
-  label: string
-  kind: 'memory' | 'skill'
-  memorySource?: 'memory' | 'profile'
-  timestamp?: null | number
-  category: string
-  useCount: number
-  state: string
-  createdBy: null | string
-  pinned: boolean
-}
-
-/** A declared `related_skills` link; both endpoints are guaranteed to be nodes. */
-export interface StarmapEdge {
-  source: string
-  target: string
-}
-
-export interface StarmapCluster {
-  category: string
-  count: number
-}
-
-/** Freeform memory rendered as a card — never a graph node. */
-export interface StarmapMemoryCard {
-  source: 'memory' | 'profile'
-  timestamp?: null | number
-  title: string
-  body: string
-}
-
-export interface StarmapGraph {
-  nodes: StarmapNode[]
-  edges: StarmapEdge[]
-  clusters: StarmapCluster[]
-  memory: StarmapMemoryCard[]
-  stats: Record<string, unknown>
 }
 
 export interface ContextUsageCategory {
