@@ -1792,6 +1792,18 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await self._drain_polling_connections()
 
+        # Guard against self._app being torn down by the supervisor while
+        # we were sleeping during the reconnect delay.  The stop() call
+        # above is already guarded but start_polling() was not — accessing
+        # self._app.updater when self._app is None raises AttributeError
+        # and silently kills the reconnect loop.  (#55992)
+        if not self._app or not self._app.updater:
+            logger.warning(
+                "[%s] Telegram app destroyed during reconnect delay (attempt %d) — aborting",
+                self.name, attempt,
+            )
+            return
+
         try:
             if not app:
                 raise RuntimeError("Telegram application was torn down during reconnect")
