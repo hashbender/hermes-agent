@@ -1,4 +1,6 @@
+from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from agent.usage_pricing import (
     CanonicalUsage,
@@ -322,3 +324,70 @@ def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     )
     assert result.status == "estimated"
     assert result.amount_usd is not None
+
+
+# ---------------------------------------------------------------------------
+# models.dev fallback (#56091)
+# ---------------------------------------------------------------------------
+
+
+def test_get_pricing_entry_falls_back_to_models_dev_for_unknown_provider():
+    """Providers absent from the hardcoded pricing table (e.g. Xiaomi MiMo)
+    should resolve via models.dev rather than returning None (#56091).
+    """
+    from agent.models_dev import ModelInfo
+
+    fake_info = ModelInfo(
+        id="MiMo-7B-RL",
+        name="MiMo 7B RL",
+        family="mimo",
+        provider_id="xiaomi",
+        cost_input=0.10,
+        cost_output=0.40,
+    )
+
+    with patch("agent.models_dev.get_model_info", return_value=fake_info):
+        entry = get_pricing_entry("MiMo-7B-RL", provider="xiaomi")
+
+    assert entry is not None, "Expected a PricingEntry from models.dev fallback"
+    assert entry.input_cost_per_million == Decimal("0.10")
+    assert entry.output_cost_per_million == Decimal("0.40")
+    assert entry.pricing_version == "models.dev"
+
+
+def test_get_pricing_entry_returns_none_when_models_dev_has_no_data():
+    """When models.dev also has no pricing for the model, get_pricing_entry()
+    should still return None rather than raising.
+    """
+    with patch("agent.models_dev.get_model_info", return_value=None):
+        entry = get_pricing_entry("unknown-model-xyz", provider="custom-provider")
+
+    assert entry is None
+
+
+def test_get_pricing_entry_official_docs_not_overridden_by_models_dev():
+    """Official docs snapshot entries must NOT be shadowed by the models.dev
+    fallback — the hardcoded table has higher priority.
+    """
+    from agent.models_dev import ModelInfo
+
+    # Provide a models.dev entry with different (wrong) prices to confirm it is
+    # ignored when an official-docs snapshot exists.
+    fake_info = ModelInfo(
+        id="gpt-4o",
+        name="GPT-4o",
+        family="gpt4o",
+        provider_id="openai",
+        cost_input=999.0,
+        cost_output=999.0,
+    )
+
+    with patch("agent.models_dev.get_model_info", return_value=fake_info):
+        entry = get_pricing_entry("gpt-4o", provider="openai")
+
+    assert entry is not None
+    assert entry.source == "official_docs_snapshot", (
+        "Official docs snapshot should take precedence over models.dev"
+    )
+    # Confirm we got the real price, not the fake one
+    assert entry.input_cost_per_million == Decimal("2.50")
