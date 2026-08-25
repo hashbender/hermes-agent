@@ -139,8 +139,9 @@ HERMES_AGENT_HELP_GUIDANCE = (
     "it — or when you need to understand your own features, tools, or capabilities, "
     "the documentation at https://hermes-agent.nousresearch.com/docs is your "
     "authoritative reference and always holds the latest, most up-to-date "
-    "information. Load the `hermes-agent` skill with skill_view(name='hermes-agent') "
-    "for additional guidance and proven workflows, but treat the docs as the source "
+    "information. Load the `hermes-agent` skill via the skill_view tool "
+    "(skill name: hermes-agent) for additional guidance and proven workflows, "
+    "but treat the docs as the source "
     "of truth when the two differ."
 )
 
@@ -874,7 +875,7 @@ WSL_ENVIRONMENT_HINT = (
 # runs. For these backends, host info (Windows/Linux/macOS, $HOME, cwd) is
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
-    "docker", "singularity", "modal", "daytona", "tenki", "ssh",
+    "docker", "singularity", "modal", "daytona", "ssh",
     "managed_modal",
 })
 
@@ -889,7 +890,6 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "modal": "a Modal sandbox (Linux)",
     "managed_modal": "a managed Modal sandbox (Linux)",
     "daytona": "a Daytona workspace (Linux)",
-    "tenki": "a Tenki sandbox (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
 }
 
@@ -950,8 +950,6 @@ def _probe_remote_backend(env_type: str) -> str | None:
             image = config.get("modal_image", "")
         elif env_type == "daytona":
             image = config.get("daytona_image", "")
-        elif env_type == "tenki":
-            image = config.get("tenki_image", "")
         else:
             image = ""
 
@@ -966,7 +964,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
             }
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "tenki"}:
+        if env_type in {"docker", "singularity", "modal", "daytona"}:
             container_config = {
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
@@ -981,15 +979,6 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "docker_extra_args": config.get("docker_extra_args", []),
                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                "tenki_api_endpoint": config.get("tenki_api_endpoint", ""),
-                "tenki_workspace_id": config.get("tenki_workspace_id", ""),
-                "tenki_project_id": config.get("tenki_project_id", ""),
-                "tenki_name_prefix": config.get("tenki_name_prefix", "hermes"),
-                "tenki_allow_inbound": config.get("tenki_allow_inbound", False),
-                "tenki_allow_outbound": config.get("tenki_allow_outbound", True),
-                "tenki_max_duration": config.get("tenki_max_duration", 3600),
-                "tenki_idle_timeout": config.get("tenki_idle_timeout", 0),
-                "tenki_pause_retention": config.get("tenki_pause_retention", 0),
             }
 
         env = _create_environment(
@@ -1065,7 +1054,7 @@ def build_environment_hints() -> str:
       and a Windows-only note that `terminal` shells out to bash, not
       PowerShell).
     - For **remote / sandbox** terminal backends (docker, singularity,
-      modal, daytona, tenki, ssh): host info is **suppressed**
+      modal, daytona, ssh): host info is **suppressed**
       because the agent's tools can't touch the host — only the backend
       matters. A live probe inside the backend reports its OS, user, $HOME,
       and cwd. Falls back to a static summary if the probe fails.
@@ -1627,7 +1616,7 @@ def build_skills_system_prompt(
         hidden_note = (
             "\n(Categories marked [names only] are outside the current coding "
             "context, so their descriptions are omitted — the skills work "
-            "normally and load with skill_view(name) as usual.)"
+            "normally and load via the skill_view tool (by name) as usual.)"
         )
 
     if not skills_by_category:
@@ -1658,7 +1647,7 @@ def build_skills_system_prompt(
         result = (
             "## Skills (mandatory)\n"
             "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+            "to your task, you MUST load it via the skill_view tool (by name) and follow its instructions. "
             "Err on the side of loading — it is always better to have context you don't need "
             "than to miss critical steps, pitfalls, or established workflows. "
             "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
