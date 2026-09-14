@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from tui_gateway import server
@@ -2000,6 +2002,60 @@ def test_notification_event_routing_by_session_key(monkeypatch):
     assert server._notification_event_belongs_elsewhere(mine, {"session_key": "other"}) is True
     # Owner is gone (not in _sessions) → handle as fallback so it isn't lost.
     assert server._notification_event_belongs_elsewhere(mine, {"session_key": "ghost"}) is False
+
+
+def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
+    """A negative truncate_before_user_ordinal must be rejected, not honoured.
+
+    The handler validates the upper bound (`ordinal >= len(user_indices)`) but a
+    negative ordinal would otherwise slip through and hit Python negative
+    indexing: `user_indices[-1]` selects the LAST user turn, truncating history
+    to everything before it and persisting that loss via replace_messages — an
+    unrecoverable overwrite of the session DB. Reject it on the safe 4018 path
+    and leave the in-memory history and the DB untouched.
+    """
+    replaced = []
+
+    class _FakeDB:
+        def replace_messages(self, key, messages):
+            replaced.append((key, list(messages)))
+
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "done"},
+    ]
+    server._sessions["trunc-sid"] = _session(history=list(history))
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    # If the guard ever lets a negative ordinal through, these would run and the
+    # session would be marked busy; failing here makes that regression loud.
+    monkeypatch.setattr(
+        server, "_start_agent_build", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+    monkeypatch.setattr(
+        server, "_start_inflight_turn", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "trunc-sid",
+                    "text": "next",
+                    "truncate_before_user_ordinal": -1,
+                },
+            }
+        )
+        assert resp["error"]["code"] == 4018
+        # History and the DB are left exactly as they were — no silent loss.
+        assert server._sessions["trunc-sid"]["history"] == history
+        assert server._sessions["trunc-sid"]["running"] is False
+        assert replaced == []
+    finally:
+        server._sessions.pop("trunc-sid", None)
 
 
 def test_session_create_does_not_persist_empty_row(monkeypatch):
@@ -5584,6 +5640,55 @@ def test_session_list_returns_clean_error_when_state_db_is_unavailable(monkeypat
     assert "state.db unavailable: locking protocol" in resp["error"]["message"]
 
 
+def test_session_list_skips_empty_untitled_placeholders(monkeypatch):
+    captured = {}
+
+    class _DB:
+        def list_sessions_rich(self, **kwargs):
+            captured.update(kwargs)
+            rows = [
+                {
+                    "id": "ghost",
+                    "source": "tui",
+                    "title": "",
+                    "preview": "",
+                    "message_count": 0,
+                    "started_at": 101,
+                },
+                {
+                    "id": "titled-zero",
+                    "source": "tui",
+                    "title": "Named draft",
+                    "preview": "",
+                    "message_count": 0,
+                    "started_at": 100,
+                },
+                {
+                    "id": "real",
+                    "source": "tui",
+                    "title": "",
+                    "preview": "hello",
+                    "message_count": 1,
+                    "started_at": 99,
+                },
+            ]
+            if kwargs.get("exclude_empty_untitled"):
+                rows = [
+                    row
+                    for row in rows
+                    if (row.get("message_count") or 0) > 0
+                    or str(row.get("title") or "").strip()
+                ]
+            return rows
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request({"id": "1", "method": "session.list", "params": {}})
+
+    assert captured["exclude_empty_untitled"] is True
+    assert [s["id"] for s in resp["result"]["sessions"]] == ["titled-zero", "real"]
+
+
 # --------------------------------------------------------------------------
 # session.delete — TUI resume picker `d` key
 # --------------------------------------------------------------------------
@@ -6261,7 +6366,14 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            order_by_last_active=False,
+            exclude_empty_untitled=False,
+        ):
             return [
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 99},
@@ -6278,9 +6390,57 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     assert resp["result"]["source"] == "tui"
 
 
+def test_session_most_recent_skips_empty_untitled_placeholders(monkeypatch):
+    captured = {}
+
+    class _DB:
+        def list_sessions_rich(self, **kwargs):
+            captured.update(kwargs)
+            rows = [
+                {
+                    "id": "ghost",
+                    "source": "tui",
+                    "title": "",
+                    "started_at": 100,
+                    "message_count": 0,
+                },
+                {
+                    "id": "real",
+                    "source": "tui",
+                    "title": "Real",
+                    "started_at": 99,
+                    "message_count": 1,
+                },
+            ]
+            if kwargs.get("exclude_empty_untitled"):
+                rows = [
+                    row
+                    for row in rows
+                    if (row.get("message_count") or 0) > 0
+                    or str(row.get("title") or "").strip()
+                ]
+            return rows
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.most_recent", "params": {}}
+    )
+
+    assert captured["exclude_empty_untitled"] is True
+    assert resp["result"]["session_id"] == "real"
+
+
 def test_session_most_recent_returns_null_when_only_tool_rows(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            order_by_last_active=False,
+            exclude_empty_untitled=False,
+        ):
             return [{"id": "tool-1", "source": "tool", "started_at": 1}]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -6298,7 +6458,14 @@ def test_session_most_recent_folds_db_exception_into_null_result(monkeypatch):
     'no answer' (Copilot review on #17130)."""
 
     class _BrokenDB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            order_by_last_active=False,
+            exclude_empty_untitled=False,
+        ):
             raise RuntimeError("db locked")
 
     monkeypatch.setattr(server, "_get_db", lambda: _BrokenDB())
@@ -8474,3 +8641,61 @@ class TestResolveRuntimeWithFallback:
 
         assert agent.model == "gpt-5.5"
         assert captured["provider"] == "deepseek"
+
+
+def test_get_usage_does_not_substitute_cumulative_total_for_context_used():
+    """An external context engine that does not report last_prompt_tokens must
+    not have the cumulative lifetime session_total_tokens shown as its current
+    context occupancy — that substitution produced impossible 1.9m/120k (100%)
+    status-bar readings (#50421). With no real current occupancy known,
+    context_used/percent stay unset rather than wrong."""
+    agent = types.SimpleNamespace(
+        model="test-model",
+        session_total_tokens=1_900_000,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=0,
+            context_length=120_000,
+            compression_count=0,
+        ),
+    )
+    usage = server._get_usage(agent)
+    assert usage.get("context_used") != 1_900_000
+    assert "context_used" not in usage
+    assert "context_percent" not in usage
+
+
+def test_get_usage_reports_real_current_occupancy():
+    """When the compressor reports a real current prompt size, context_used is
+    that value (not the cumulative total) and the percent is sane."""
+    agent = types.SimpleNamespace(
+        model="test-model",
+        session_total_tokens=1_900_000,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=60_000,
+            context_length=120_000,
+            compression_count=2,
+        ),
+    )
+    usage = server._get_usage(agent)
+    assert usage["context_used"] == 60_000
+    assert usage["context_max"] == 120_000
+    assert usage["context_percent"] == 50
+
+
+def test_get_usage_clamps_post_compression_sentinel():
+    """Right after a compression, last_prompt_tokens is the -1 sentinel
+    (conversation_compression sets it until the next real usage report). It is
+    truthy, so `or 0` doesn't neutralize it — the guard must clamp <0 to 0 so
+    the transitional turn emits no gauge instead of leaking context_used=-1."""
+    agent = types.SimpleNamespace(
+        model="test-model",
+        session_total_tokens=4_000_000,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=-1,
+            context_length=1_048_576,
+            compression_count=6,
+        ),
+    )
+    usage = server._get_usage(agent)
+    assert "context_used" not in usage
+    assert "context_percent" not in usage
