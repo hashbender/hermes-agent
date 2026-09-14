@@ -236,6 +236,22 @@ def _request_gateway_self_restart(pid: int) -> bool:
     return True
 
 
+def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
+    """Wait until a specific PID no longer exists."""
+    if pid <= 0:
+        return True
+
+    import time as _time
+    from gateway.status import _pid_exists
+
+    deadline = _time.monotonic() + max(timeout, 1.0)
+    while _time.monotonic() < deadline:
+        if not _pid_exists(pid):
+            return True
+        _time.sleep(0.5)
+    return not _pid_exists(pid)
+
+
 def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
     """Send SIGUSR1 to a gateway PID and wait for it to exit gracefully.
 
@@ -272,22 +288,7 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
     except (PermissionError, OSError):
         return False
 
-    import time as _time
-
-    deadline = _time.monotonic() + max(drain_timeout, 1.0)
-    # IMPORTANT Windows note: ``os.kill(pid, 0)`` is NOT a no-op on
-    # Windows — Python's implementation calls ``TerminateProcess(handle, 0)``
-    # for sig=0, hard-killing the target. Use the cross-platform
-    # ``_pid_exists`` helper in gateway.status which does OpenProcess +
-    # WaitForSingleObject on Windows.
-    from gateway.status import _pid_exists
-
-    while _time.monotonic() < deadline:
-        if not _pid_exists(pid):
-            return True
-        _time.sleep(0.5)
-    # Drain didn't finish in time.
-    return False
+    return _wait_for_pid_exit(pid, drain_timeout)
 
 
 def _get_ancestor_pids() -> set[int]:
@@ -1091,6 +1092,248 @@ def _wait_for_systemd_service_restart(
         f"  Check logs:   journalctl {'--user ' if not system else ''}-u {svc} -l --since '2 min ago'"
     )
     return False
+
+
+def _wait_for_launchd_service_restart(
+    *,
+    previous_pid: int | None = None,
+    timeout: float = 60.0,
+) -> bool:
+    """Wait for the gateway runtime to come back after a launchd restart."""
+    import time
+    from hermes_constants import display_hermes_home as _dhh
+
+    deadline = time.monotonic() + timeout
+    printed_runtime_wait = False
+
+    while time.monotonic() < deadline:
+        try:
+            from gateway.status import get_running_pid
+
+            new_pid = get_running_pid()
+        except Exception:
+            new_pid = None
+
+        if new_pid and (previous_pid is None or new_pid != previous_pid):
+            runtime_state = _gateway_runtime_status_for_pid(new_pid)
+            gateway_state = (runtime_state or {}).get("gateway_state")
+            if gateway_state == "running":
+                print(f"✓ Service restarted (PID {new_pid})")
+                return True
+            if gateway_state == "startup_failed":
+                reason = (runtime_state or {}).get("exit_reason") or "startup failed"
+                print(
+                    f"⚠ Service process restarted (PID {new_pid}), but gateway startup failed: {reason}"
+                )
+                return False
+            if not printed_runtime_wait:
+                print(
+                    f"⏳ Service process started (PID {new_pid}); waiting for gateway runtime..."
+                )
+                printed_runtime_wait = True
+
+        time.sleep(2)
+
+    print(
+        f"⚠ Service did not become ready within {int(timeout)}s.\n"
+        "  Check status: hermes gateway status\n"
+        f"  Check logs:   tail -f {_dhh()}/logs/gateway.log"
+    )
+    return False
+
+
+def _spawn_launchd_service_restart_watcher(
+    *,
+    old_pid: int,
+    label: str,
+    graceful_timeout: float,
+    relaunch_timeout: float,
+) -> bool:
+    """Detach a watcher that ensures a launchd self-restart finishes cleanly.
+
+    The in-band `hermes gateway restart` / `hermes update` path can run inside a
+    gateway-hosted terminal tool. If the gateway drain later times out, the
+    interrupt cleanup kills that tool subprocess group before it can force a
+    fallback `launchctl kickstart -k`. This detached watcher survives that
+    interrupt, waits for the old PID to exit and a fresh runtime-ready PID to
+    appear, and only forces kickstart if the graceful handoff stalls.
+    """
+    if old_pid <= 0 or not label:
+        return False
+
+    log_path = get_hermes_home() / "logs" / "launchd-restart-watcher.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    watcher = textwrap.dedent(
+        """
+        import sys
+        import time
+        from gateway.status import _pid_exists, get_running_pid, read_runtime_status
+        from hermes_cli.gateway import _kickstart_launchd_service_and_wait, _launchd_domain
+
+        old_pid = int(sys.argv[1])
+        label = sys.argv[2]
+        graceful_timeout = float(sys.argv[3])
+        relaunch_timeout = float(sys.argv[4])
+        log_path = sys.argv[5]
+
+        def _log(message):
+            try:
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S %z')}] {message}\\n"
+                    )
+            except Exception:
+                pass
+
+        def _runtime_status_for_pid(pid):
+            if not pid:
+                return None
+            try:
+                state = read_runtime_status()
+            except Exception:
+                return None
+            if not isinstance(state, dict):
+                return None
+            try:
+                state_pid = int(state.get("pid", 0) or 0)
+            except (TypeError, ValueError):
+                return None
+            return state if state_pid == pid else None
+
+        def _wait_for_old_pid_exit(timeout):
+            deadline = time.monotonic() + max(timeout, 1.0)
+            while time.monotonic() < deadline:
+                if not _pid_exists(old_pid):
+                    return True
+                time.sleep(0.5)
+            return not _pid_exists(old_pid)
+
+        def _wait_for_runtime_ready(timeout):
+            deadline = time.monotonic() + max(timeout, 1.0)
+            while time.monotonic() < deadline:
+                try:
+                    new_pid = get_running_pid()
+                except Exception:
+                    new_pid = None
+                if new_pid and new_pid != old_pid:
+                    runtime_state = _runtime_status_for_pid(new_pid) or {}
+                    gateway_state = runtime_state.get("gateway_state")
+                    if gateway_state == "running":
+                        return True
+                    if gateway_state == "startup_failed":
+                        return False
+                time.sleep(2)
+            return False
+
+        old_pid_exited = _wait_for_old_pid_exit(graceful_timeout)
+        if old_pid_exited and _wait_for_runtime_ready(relaunch_timeout):
+            raise SystemExit(0)
+
+        try:
+            target = f"{_launchd_domain()}/{label}"
+            result = _kickstart_launchd_service_and_wait(
+                target=target,
+                previous_pid=old_pid,
+                timeout=relaunch_timeout,
+                exit_on_detached_failure=False,
+            )
+            if result != "ready":
+                _log(
+                    f"fallback result={result} old_pid={old_pid} target={target}"
+                )
+        except Exception:
+            _log(f"fallback raised unexpectedly for label={label}")
+        """
+    ).strip()
+
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                watcher,
+                str(old_pid),
+                label,
+                str(graceful_timeout),
+                str(relaunch_timeout),
+                str(log_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    return True
+
+
+def _kickstart_launchd_service_and_wait(
+    *,
+    target: str,
+    previous_pid: int | None,
+    timeout: float = 60.0,
+    exit_on_detached_failure: bool = True,
+) -> str:
+    """Run the launchd kickstart/recovery flow and wait for runtime-ready state.
+
+    Returns:
+        ``"ready"`` when a fresh runtime-ready PID was observed.
+        ``"detached"`` when launchd was unsupported and we fell back to a
+        detached background gateway.
+        ``"not_ready"`` when launchctl accepted the restart command but the
+        gateway never reached runtime-ready state.
+    """
+    try:
+        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+    except subprocess.CalledProcessError as exc:
+        if not _launchd_error_indicates_unloaded(exc):
+            if _launchctl_domain_unsupported(exc.returncode):
+                return (
+                    "detached"
+                    if _launchd_fallback_to_detached(
+                        f"launchctl kickstart exit {exc.returncode}",
+                        exit_on_failure=exit_on_detached_failure,
+                    )
+                    else "not_ready"
+                )
+            raise
+        print("↻ launchd job was unloaded; reloading")
+        plist_path = get_launchd_plist_path()
+        try:
+            subprocess.run(
+                ["launchctl", "bootout", target],
+                check=False,
+                timeout=90,
+            )
+            subprocess.run(
+                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+                check=True,
+                timeout=30,
+            )
+            subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
+        except subprocess.CalledProcessError as exc2:
+            if not _launchctl_domain_unsupported(exc2.returncode):
+                raise
+            return (
+                "detached"
+                if _launchd_fallback_to_detached(
+                    f"launchctl exit {exc2.returncode}",
+                    exit_on_failure=exit_on_detached_failure,
+                )
+                else "not_ready"
+            )
+    return (
+        "ready"
+        if _wait_for_launchd_service_restart(
+            previous_pid=previous_pid,
+            timeout=timeout,
+        )
+        else "not_ready"
+    )
 
 
 def _systemd_unit_is_start_limited(props: dict[str, str]) -> bool:
@@ -2655,7 +2898,15 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     path_entries = _build_service_path_dirs()
     resolved_node = shutil.which("node")
     if resolved_node:
-        resolved_node_dir = str(Path(resolved_node).resolve().parent)
+        # Use the directory where ``node`` is *found on PATH*, NOT the
+        # symlink's resolved target. ``~/.local/bin/node`` is often a symlink
+        # into a specific profile's node install (e.g. profiles/jarvis/node/
+        # bin/node); calling .resolve() here would chase that symlink and bake
+        # one profile's node path into *every* profile's service unit. That
+        # cross-profile leak makes systemd_unit_is_current() perpetually false,
+        # so each gateway rewrites its unit + daemon-reload on every boot. Using
+        # the symlink's own parent keeps the generated unit profile-agnostic.
+        resolved_node_dir = str(Path(resolved_node).parent)
         if resolved_node_dir not in path_entries:
             path_entries.append(resolved_node_dir)
 
@@ -3588,6 +3839,86 @@ def _launchctl_bootstrap(
         )
 
 
+def _launchd_reload_log_path() -> Path:
+    """Path the launchd reload watchdog tails for persistent-orphan detection."""
+    return get_hermes_home() / "logs" / "launchd-reload.log"
+
+
+def _append_launchd_reload_log(message: str) -> None:
+    """Append a timestamped line to the launchd reload log (best-effort)."""
+    path = _launchd_reload_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime as _dt
+
+        stamp = _dt.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{stamp}] {message}\n")
+    except OSError:
+        pass
+
+
+def _launchctl_label_registered(label: str) -> bool:
+    """True when ``launchctl list <label>`` reports the job as registered."""
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", label],
+            check=False,
+            timeout=10,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _retry_launchctl_bootstrap_until_registered(
+    domain: str, plist_path, label: str, *, deadline: float
+) -> bool:
+    """Bootstrap with retry until the label is registered or ``deadline`` passes.
+
+    Wraps :func:`_launchctl_bootstrap` (which already recovers the EIO
+    "already loaded" case) in a wall-clock retry loop for the *transient*
+    failure mode: under high load or a launchd race the bootstrap can fail
+    even after ``bootout`` already tore down the prior registration, leaving
+    the service orphaned from ``KeepAlive`` supervision. The reported incident
+    happened during a graceful drain (default ``agent.restart_drain_timeout``
+    = 180s), so a fixed ~10s window is too short — retry until ``deadline``.
+
+    Both ``CalledProcessError`` and ``TimeoutExpired`` are treated as
+    retryable: a ``bootstrap`` that times out after ``bootout`` still leaves
+    the service unloaded, so it must be retried, not allowed to escape. On
+    each failure a timestamped line is appended to the reload log; success is
+    confirmed with ``launchctl list`` (not merely a zero bootstrap exit).
+    Returns True once the label is registered, False if the deadline is hit.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            _launchctl_bootstrap(domain, plist_path, label, timeout=30)
+            if _launchctl_label_registered(label):
+                return True
+            _append_launchd_reload_log(
+                f"bootstrap attempt {attempt} exited 0 but {domain}/{label} "
+                f"is not registered (launchctl list) — retrying"
+            )
+        except subprocess.CalledProcessError as exc:
+            _append_launchd_reload_log(
+                f"bootstrap attempt {attempt} failed (rc={exc.returncode}) "
+                f"for {domain}/{label} — retrying"
+            )
+        except subprocess.TimeoutExpired:
+            _append_launchd_reload_log(
+                f"bootstrap attempt {attempt} timed out for {domain}/{label} "
+                f"— retrying"
+            )
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(2)
+
+
 # ── launchd unsupported marker ─────────────────────────────────────────────
 # When launchd can't manage the domain on this host (error 5/125, macOS 26+),
 # we write a persistent marker so `launchd_status()` can explain that launchd
@@ -3727,7 +4058,13 @@ def generate_launchd_plist() -> str:
     priority_dirs = _build_service_path_dirs()
     resolved_node = shutil.which("node")
     if resolved_node:
-        resolved_node_dir = str(Path(resolved_node).resolve().parent)
+        # Use the directory where ``node`` is *found on PATH*, NOT the symlink's
+        # resolved target. ``~/.local/bin/node`` is often a symlink into a
+        # specific profile's node install; calling .resolve() would chase it and
+        # bake one profile's path into every profile's service definition,
+        # breaking profile isolation and causing perpetual unit rewrites. See
+        # the matching fix in generate_systemd_unit().
+        resolved_node_dir = str(Path(resolved_node).parent)
         if resolved_node_dir not in priority_dirs:
             priority_dirs.append(resolved_node_dir)
     sane_path = ":".join(
@@ -3855,11 +4192,42 @@ def refresh_launchd_plist_if_needed() -> bool:
         # Delegate to a new session: `start_new_session=True` detaches the
         # helper from the gateway's process group, so the bootout that kills
         # the gateway (and us) does not kill the helper before it bootstraps.
+        #
+        # The bootstrap is retried up to 5 times with verification: under
+        # high load (loadavg observed >= 9) or a launchd race, the bootout
+        # can succeed (removing the service from launchd) while the
+        # follow-up bootstrap fails silently. Without retry+verify the
+        # service stays unregistered — KeepAlive can't revive a service
+        # launchd no longer knows about, so the gateway stays dark until a
+        # manual `launchctl bootstrap`. Failures append a timestamped line
+        # to ~/.hermes/logs/launchd-reload.log, which the health watchdog
+        # can tail to detect a persistent orphan. See hermes-restart
+        # rootcause handoff (2026-06-26 incident).
+        reload_log_path = get_hermes_home() / "logs" / "launchd-reload.log"
+        try:
+            reload_log_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        # Retry until launchctl LISTS the label (not merely a zero bootstrap
+        # exit) or the drain window elapses. The failure happens while the old
+        # gateway is still draining (default agent.restart_drain_timeout=180s),
+        # so a fixed ~10s window is too short — bound by that budget instead.
+        _reload_budget = int(max(30.0, _get_restart_drain_timeout()))
         reload_script = (
             f"sleep 2; "
             f"launchctl bootout {shlex.quote(target)} 2>/dev/null; "
             f"sleep 1; "
-            f"launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null"
+            f"_deadline=$(($(date +%s) + {_reload_budget})); "
+            f"while :; do "
+            f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
+            f"  if launchctl list {shlex.quote(label)} >/dev/null 2>&1; then break; fi; "
+            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] bootstrap not yet registered for {shlex.quote(target)} — retrying\" >> {shlex.quote(str(reload_log_path))}; "
+            f"  if [ $(date +%s) -ge $_deadline ]; then break; fi; "
+            f"  sleep 2; "
+            f"done; "
+            f"if ! launchctl list {shlex.quote(label)} >/dev/null 2>&1; then "
+            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] FAILED launchd reload for {shlex.quote(target)} — service NOT registered after {_reload_budget}s of retries\" >> {shlex.quote(str(reload_log_path))}; "
+            f"fi"
         )
         try:
             subprocess.Popen(
@@ -3877,17 +4245,39 @@ def refresh_launchd_plist_if_needed() -> bool:
         )
         return True
 
-    # Bootout/bootstrap so launchd picks up the new definition
+    # Bootout/bootstrap so launchd picks up the new definition. The reported
+    # incident (2026-06-26) happened when bootout succeeded but bootstrap
+    # failed silently under load (loadavg 9.48) during a graceful /restart
+    # drain, leaving the service unregistered — KeepAlive can't revive a job
+    # launchd no longer knows about. Retry the bootstrap (via the shared
+    # _launchctl_bootstrap EIO-recovery helper) until the label is actually
+    # registered or the drain window elapses, verify with `launchctl list`,
+    # and log exhaustion so the reload watchdog can detect a persistent orphan.
     subprocess.run(
         ["launchctl", "bootout", target],
         check=False,
         timeout=90,
     )
-    subprocess.run(
-        ["launchctl", "bootstrap", domain, str(plist_path)],
-        check=False,
-        timeout=30,
-    )
+    # Size the retry window to the restart drain timeout (default 180s), not a
+    # fixed ~10s: the failure mode occurs while the old gateway is still
+    # draining, so a short window can exhaust before launchd settles.
+    _reload_budget = max(30.0, _get_restart_drain_timeout())
+    _deadline = time.monotonic() + _reload_budget
+    if not _retry_launchctl_bootstrap_until_registered(
+        domain, plist_path, label, deadline=_deadline
+    ):
+        _append_launchd_reload_log(
+            f"FAILED launchd reload of {target} — service NOT registered after "
+            f"retrying for {int(_reload_budget)}s (refresh ran outside gateway "
+            f"process tree)"
+        )
+        logger.error(
+            "launchd reload of %s failed — service not registered after %ds of "
+            "retries; see %s",
+            target,
+            int(_reload_budget),
+            _launchd_reload_log_path(),
+        )
     print(
         "↻ Updated gateway launchd service definition to match the current Hermes install"
     )
@@ -4094,76 +4484,64 @@ def _wait_for_gateway_exit(
 
 def launchd_restart():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
+    relaunch_timeout = 60.0
     from gateway.status import get_running_pid
 
-    try:
-        pid = get_running_pid()
-        if pid is not None and _request_gateway_self_restart(pid):
-            print("✓ Service restart requested")
-            _clear_launchd_unsupported_marker()
-            return
-        if pid is not None:
-            # Announce the drain BEFORE waiting on it. This wait can run for
-            # the full drain budget (180s by default) while the old gateway
-            # finishes in-flight agent runs, and it streams into surfaces with
-            # no other feedback — the desktop updater's live output most of
-            # all, where a silent stop here reads as "update stuck" (#44515).
-            # Mirrors the systemd branch's "draining (up to Ns)..." line.
-            print(
-                f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
-                f"(up to {drain_timeout:.0f}s)..."
-            )
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
-                pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(
-                        f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
-                    )
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
-        print("✓ Service restarted")
-        _clear_launchd_unsupported_marker()
-    except subprocess.CalledProcessError as e:
-        if not _launchd_error_indicates_unloaded(e):
-            # Not a "job unloaded" code. If the domain is fundamentally
-            # unmanageable (error 5), degrade to detached; the old process was
-            # already drained/terminated above. Otherwise re-raise.
-            if _launchctl_domain_unsupported(e.returncode):
-                _launchd_fallback_to_detached(f"launchctl kickstart exit {e.returncode}")
+    pid = get_running_pid()
+    self_restart_requested = pid is not None and _request_gateway_self_restart(pid)
+    if self_restart_requested:
+        graceful_timeout = drain_timeout + 5
+        _spawn_launchd_service_restart_watcher(
+            old_pid=pid,
+            label=label,
+            graceful_timeout=graceful_timeout,
+            relaunch_timeout=relaunch_timeout,
+        )
+        print(f"⏳ Service restarting gracefully (PID {pid})...")
+        if _wait_for_pid_exit(pid, graceful_timeout):
+            if _wait_for_launchd_service_restart(
+                previous_pid=pid,
+                timeout=relaunch_timeout,
+            ):
+                _clear_launchd_unsupported_marker()
                 return
-            raise
-        # Job not loaded — bootstrap and start fresh
-        print("↻ launchd job was unloaded; reloading")
-        plist_path = get_launchd_plist_path()
+        print(
+            f"⚠ Graceful restart did not complete cleanly within {int(graceful_timeout)}s; "
+            "forcing launchd restart..."
+        )
+    elif pid is not None:
+        # Announce the drain BEFORE waiting on it. This wait can run for
+        # the full drain budget (180s by default) while the old gateway
+        # finishes in-flight agent runs, and it streams into surfaces with
+        # no other feedback — the desktop updater's live output most of
+        # all, where a silent stop here reads as "update stuck" (#44515).
+        # Mirrors the systemd branch's "draining (up to Ns)..." line.
+        print(
+            f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
+            f"(up to {drain_timeout:.0f}s)..."
+        )
         try:
-            # Restart is the one path where the job is almost always still
-            # registered (we just drained it), so a plain bootstrap would hit
-            # EIO on the common case. Boot the stale label out first — cheaper
-            # and clearer here than routing through _launchctl_bootstrap's
-            # bootstrap-first/retry-on-EIO flow. See #23387, #42914.
-            subprocess.run(
-                ["launchctl", "bootout", target],
-                check=False,
-                timeout=90,
-            )
-            subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
-                check=True,
-                timeout=30,
-            )
-            subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
-        except subprocess.CalledProcessError as e2:
-            if not _launchctl_domain_unsupported(e2.returncode):
-                raise
-            _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
-            return
-        print("✓ Service restarted")
+            terminate_pid(pid, force=False)
+        except (ProcessLookupError, PermissionError, OSError):
+            pid = None
+        if pid is not None:
+            exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
+            if not exited:
+                print(
+                    f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
+                )
+    target = f"{_launchd_domain()}/{label}"
+    result = _kickstart_launchd_service_and_wait(
+        target=target,
+        previous_pid=pid,
+        timeout=relaunch_timeout,
+    )
+    if result == "ready":
         _clear_launchd_unsupported_marker()
+        return
+    if result == "detached":
+        return
 
 
 def launchd_status(deep: bool = False):
