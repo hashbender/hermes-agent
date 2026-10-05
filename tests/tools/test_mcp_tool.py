@@ -47,6 +47,46 @@ def _make_mock_server(name, session=None, tools=None):
     return server
 
 
+class TestFilterMCPChildren:
+    def test_filters_gateway_children_by_argv_marker(self, monkeypatch):
+        """Non-MCP children start with an interpreter/binary, not the marker."""
+        import sys
+
+        import tools.mcp_tool as mcp_tool
+
+        cmdlines = {
+            101: [
+                "/usr/bin/python3",
+                "-m",
+                "tui_gateway.slash_worker",
+                "--session-key",
+                "abc",
+            ],
+            102: [
+                "/usr/bin/java",
+                "-jar",
+                "/opt/jdtls/plugins/org.eclipse.equinox.launcher_1.7.0.jar",
+            ],
+            103: ["/usr/bin/node", "server.js"],
+        }
+
+        class FakeProcess:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def cmdline(self):
+                return cmdlines[self.pid]
+
+        fake_psutil = SimpleNamespace(
+            Process=FakeProcess,
+            NoSuchProcess=ProcessLookupError,
+            AccessDenied=PermissionError,
+        )
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+        assert mcp_tool._filter_mcp_children({101, 102, 103}) == {103}
+
+
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
@@ -234,6 +274,145 @@ class TestSchemaConversion:
 
         assert schema["parameters"]["properties"]["items"]["items"]["$ref"] == "#/$defs/Entry"
         assert schema["parameters"]["$defs"]["Entry"]["properties"]["child"]["$ref"] == "#/$defs/Child"
+
+    def test_definitions_as_property_name_is_preserved(self):
+        """A tool parameter literally named ``definitions`` must not be renamed.
+
+        Regression: the rewrite that promotes the legacy ``definitions``
+        meta-keyword to ``$defs`` used to fire for *any* key named
+        ``definitions`` anywhere in the tree, including inside ``properties``
+        dicts. That turned user-facing parameter names into ``$defs``, which
+        Anthropic and OpenAI both reject because ``$`` is not in the
+        ``^[a-zA-Z0-9_.-]{1,64}$`` property-name pattern. Real-world repro: a
+        CI/pipelines MCP tool whose ``definitions`` parameter is an array of
+        pipeline-definition IDs.
+        """
+        from tools.mcp_tool import _convert_mcp_schema
+
+        mcp_tool = _make_mcp_tool(
+            name="pipelines_build",
+            description="List pipeline builds",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "definitions": {
+                        "description": "Array of build definition IDs to filter builds.",
+                    },
+                    "top": {"type": "integer"},
+                },
+            },
+        )
+
+        schema = _convert_mcp_schema("pipelines", mcp_tool)
+
+        props = schema["parameters"]["properties"]
+        assert "definitions" in props, "user-facing property name was renamed away"
+        assert "$defs" not in props, "user-facing property name was rewritten to $defs"
+        # And the meta-keyword promotion didn't happen at the root either,
+        # because there was no `definitions` meta-keyword to promote.
+        assert "$defs" not in schema["parameters"]
+        assert "definitions" not in schema["parameters"]
+
+    def test_definitions_property_and_meta_keyword_coexist(self):
+        """``definitions`` as both a property name AND a meta-keyword in the
+        same schema. The property name stays; the meta-keyword is promoted.
+
+        Note: Python source can't express both keys as literals (the second
+        would clobber the first), so build the dict explicitly.
+        """
+        from tools.mcp_tool import _convert_mcp_schema
+
+        input_schema = {
+            "type": "object",
+            "properties": {
+                # User-facing parameter literally named "definitions".
+                "definitions": {
+                    "description": "Array of build definition IDs.",
+                },
+                "payload": {"$ref": "#/definitions/Payload"},
+            },
+        }
+        # Meta-keyword (legacy draft-07 reusable defs), set after the literal.
+        input_schema["definitions"] = {
+            "Payload": {
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+            },
+        }
+
+        mcp_tool = _make_mcp_tool(
+            name="mixed",
+            description="Schema with both forms of `definitions`",
+            input_schema=input_schema,
+        )
+
+        schema = _convert_mcp_schema("mixed", mcp_tool)
+
+        # Property name preserved.
+        assert "definitions" in schema["parameters"]["properties"]
+        assert "$defs" not in schema["parameters"]["properties"]
+        # Meta-keyword promoted at the root.
+        assert "$defs" in schema["parameters"]
+        assert "definitions" not in schema["parameters"]
+        # The $ref into the legacy location was rewritten too.
+        assert schema["parameters"]["properties"]["payload"]["$ref"] == "#/$defs/Payload"
+
+    def test_property_named_required_does_not_inject_phantom_params(self):
+        """A tool parameter literally named ``required`` must not spawn
+        phantom ``type`` / ``properties`` parameters.
+
+        Regression: the object-shape repair (fill missing ``type``, ensure a
+        ``properties`` dict) used to recurse into the ``properties`` *map* the
+        same way it recurses into a schema node. When a tool declared a
+        parameter literally named ``required`` (or ``properties``), the map
+        itself looked object-shaped to the repair, so it stamped a ``type:
+        object`` and an empty ``properties`` onto the map — surfacing as
+        parameters ``type`` and ``properties`` that the MCP server never
+        declared, which the model could then fill with junk args. Sibling
+        ``_rewrite_local_refs`` already gates ``properties``; this path did
+        not. Real-world repro: a schema-builder / validation MCP tool whose
+        ``required`` parameter is an array of required field names.
+        """
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {"required": {"type": "boolean"}},
+        })
+
+        assert set(schema["properties"].keys()) == {"required"}
+        assert schema["properties"]["required"] == {"type": "boolean"}
+
+    def test_property_named_properties_does_not_inject_phantom_type(self):
+        """A tool parameter literally named ``properties`` is left untouched."""
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {"properties": {"type": "string"}},
+        })
+
+        assert set(schema["properties"].keys()) == {"properties"}
+        assert schema["properties"]["properties"] == {"type": "string"}
+
+    def test_property_named_required_is_preserved_when_nested(self):
+        """The phantom-param gate also holds inside nested object properties."""
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "properties": {"required": {"type": "boolean"}},
+                },
+            },
+        })
+
+        nested = schema["properties"]["config"]["properties"]
+        assert set(nested.keys()) == {"required"}
+        assert nested["required"] == {"type": "boolean"}
 
     def test_missing_type_on_object_is_coerced(self):
         """Schemas that describe an object but omit ``type`` get type='object'."""
