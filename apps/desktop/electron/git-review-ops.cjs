@@ -20,15 +20,30 @@ const path = require('node:path')
 // drops a node_modules dir at the root of an extraResources copy but keeps a
 // nested one.  Dev mode never hits the fallback -- Node's normal lookup finds
 // the hoisted copy.
-let simpleGit
+//
+// Resolution must NEVER take down startup: a GUI (Finder/Dock) launch that
+// can't resolve simple-git from inside app.asar must still open the window
+// (issue #52735 crashed the main process before any window). So each attempt is
+// guarded and, if none resolve, simpleGit stays null — gitFor() then throws a
+// contained error only when a git-review op is actually used.
+let simpleGit = null
 try {
   simpleGit = require('simple-git')
 } catch {
   const resourcesPath = process.resourcesPath
-  if (!resourcesPath) {
-    throw new Error("git-review IPC: 'simple-git' not found and no resourcesPath to fall back to")
+  if (resourcesPath) {
+    // Primary packaged location (extraResources + stage-native-deps.cjs).
+    try {
+      simpleGit = require(path.join(resourcesPath, 'native-deps', 'vendor', 'node_modules', 'simple-git'))
+    } catch {
+      // Fallback: a plain node_modules copy under Resources.
+      try {
+        simpleGit = require(path.join(resourcesPath, 'node_modules', 'simple-git'))
+      } catch {
+        simpleGit = null
+      }
+    }
   }
-  simpleGit = require(path.join(resourcesPath, 'native-deps', 'vendor', 'node_modules', 'simple-git'))
 }
 
 const { resolveRequestedPathForIpc } = require('./hardening.cjs')
@@ -64,6 +79,10 @@ function runGh(args, cwd, ghBin) {
 }
 
 function gitFor(cwd, gitBin) {
+  if (!simpleGit) {
+    throw new Error('simple-git unavailable: git review operations are disabled in this build')
+  }
+
   return simpleGit({ baseDir: cwd, binary: gitBin || 'git', maxConcurrentProcesses: 4, trimmed: false })
 }
 
