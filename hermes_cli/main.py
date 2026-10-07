@@ -616,6 +616,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_stepfun,
     _model_flow_bedrock_api_key,
     _model_flow_bedrock,
+    _model_flow_vertex,
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
@@ -3109,6 +3110,8 @@ def select_provider_and_model(args=None):
         _model_flow_stepfun(config, current_model)
     elif selected_provider == "bedrock":
         _model_flow_bedrock(config, current_model)
+    elif selected_provider == "vertex":
+        _model_flow_vertex(config, current_model)
     elif selected_provider == "azure-foundry":
         _model_flow_azure_foundry(config, current_model)
     elif selected_provider in {
@@ -5814,6 +5817,28 @@ def _find_stale_dashboard_pids(
 
     Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
     """
+
+    def _strip_profile_selector_tokens(command: str) -> str:
+        try:
+            raw_tokens = shlex.split(command, posix=False)
+        except ValueError:
+            raw_tokens = command.split()
+
+        filtered: list[str] = []
+        skip_next = False
+        for token in raw_tokens:
+            normalized = token.strip("\"'")
+            if skip_next:
+                skip_next = False
+                continue
+            if normalized in {"--profile", "-p"}:
+                skip_next = True
+                continue
+            if normalized.startswith("--profile=") or normalized.startswith("-p="):
+                continue
+            filtered.append(normalized)
+        return " ".join(filtered)
+
     patterns = [
         "hermes dashboard",
         "hermes_cli.main dashboard",
@@ -5860,8 +5885,11 @@ def _find_stale_dashboard_pids(
                     current_cmd = line[len("CommandLine=") :]
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId=") :]
+                    # Hermes accepts profile selectors before the subcommand;
+                    # strip them so profile dashboards still match.
+                    _cmd_norm = _strip_profile_selector_tokens(current_cmd)
                     if (
-                        any(p in current_cmd for p in patterns)
+                        any(p in _cmd_norm for p in patterns)
                         and int(pid_str) != self_pid
                     ):
                         try:
@@ -5894,7 +5922,10 @@ def _find_stale_dashboard_pids(
                     except ValueError:
                         continue
                     command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
+                    # Hermes accepts profile selectors before the subcommand;
+                    # strip them so profile dashboards still match.
+                    _cmd_norm = _strip_profile_selector_tokens(command)
+                    if any(p in _cmd_norm for p in patterns) and pid != self_pid:
                         dashboard_pids.append(pid)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -10027,6 +10058,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _ensure_user_systemd_env,
                 find_gateway_pids,
                 find_profile_gateway_processes,
+                GATEWAY_SYSTEMD_UNIT_GLOB,
                 launch_detached_profile_gateway_restart,
                 _get_service_pids,
                 _graceful_restart_via_sigusr1,
@@ -10133,7 +10165,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 non-interactive sudo (``sudo -n``) — first a blanket probe,
                 then a targeted ``systemctl reset-failed`` probe so a
                 least-privilege sudoers entry scoped to
-                ``systemctl ... hermes-gateway*`` also qualifies
+                ``systemctl ... hermes*gateway*`` also qualifies
                 (``reset-failed`` is an idempotent no-op we run before every
                 privileged restart anyway).  If neither works, return None —
                 the caller must SKIP the restart (without draining the
@@ -10160,7 +10192,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         sudo_ok = _probe.returncode == 0
                         if not sudo_ok:
                             # Blanket sudo refused — a targeted sudoers entry
-                            # (NOPASSWD for systemctl ... hermes-gateway*)
+                            # (NOPASSWD for systemctl ... hermes*gateway*)
                             # may still allow the exact commands we need.
                             _probe = subprocess.run(
                                 sudo_cmd + ["reset-failed", svc_name_],
@@ -10211,7 +10243,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             relaunched_profiles = []
 
             # --- Systemd services (Linux) ---
-            # Discover all hermes-gateway* units (default + profiles)
+            # Discover default and profile gateway units.
             if supports_systemd_services():
                 try:
                     _ensure_user_systemd_env()
@@ -10227,7 +10259,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             scope_cmd
                             + [
                                 "list-units",
-                                "hermes-gateway*",
+                                GATEWAY_SYSTEMD_UNIT_GLOB,
                                 "--plain",
                                 "--no-legend",
                                 "--no-pager",
@@ -11902,7 +11934,7 @@ def _build_provider_choices() -> list[str]:
         # Fallback: static list guarantees the CLI always works
         return [
             "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
-            "anthropic", "gemini", "xai", "bedrock", "azure-foundry",
+            "anthropic", "gemini", "vertex", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
             "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
