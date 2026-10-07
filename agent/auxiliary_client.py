@@ -5905,7 +5905,7 @@ def call_llm(
     temperature: float = None,
     max_tokens: int = None,
     tools: list = None,
-    timeout: float = None,
+    timeout: Optional[float] = None,
     extra_body: dict = None,
     api_mode: str = None,
     stream: bool = False,
