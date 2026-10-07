@@ -30,6 +30,7 @@ import pytest
 from agent.auxiliary_client import (
     call_llm,
     async_call_llm,
+    _build_call_kwargs,
     _is_unsupported_temperature_error,
 )
 
@@ -72,6 +73,32 @@ def _dummy_response():
     # response.choices[0].message.  The tests here patch that out, so
     # any sentinel object is fine.
     return {"ok": True}
+
+
+def test_build_call_kwargs_preserves_openrouter_max_tokens():
+    """Explicit aux output caps must reach OpenRouter instead of using its route default."""
+
+    kwargs = _build_call_kwargs(
+        "openrouter",
+        "z-ai/glm-5.2",
+        [{"role": "user", "content": "title"}],
+        max_tokens=500,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert kwargs["max_tokens"] == 500
+
+
+def test_build_call_kwargs_still_omits_generic_openai_compat_max_tokens():
+    kwargs = _build_call_kwargs(
+        "custom",
+        "local-model",
+        [{"role": "user", "content": "summarize"}],
+        max_tokens=500,
+        base_url="https://example.test/v1",
+    )
+
+    assert "max_tokens" not in kwargs
 
 
 class TestCallLlmUnsupportedTemperatureRetry:
