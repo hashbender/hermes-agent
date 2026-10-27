@@ -469,6 +469,44 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.server_error
         assert result.retryable is True
 
+    # ── 5xx that are actually context overflow ──
+    # Some local inference servers (llama.cpp / llama-server, and vLLM/Ollama
+    # behind a Cloudflare/Tailscale hop) report context overflow with a 5xx
+    # status instead of the standard 400/413. These must route into the
+    # compression-and-retry path, not the blind server_error/overloaded retry
+    # that exhausts and drops the turn.
+
+    @pytest.mark.parametrize("status_code", [500, 502, 503, 529])
+    def test_5xx_context_overflow_routes_to_compression(self, status_code):
+        """Explicit context-overflow wording on any of the codes the fix covers
+        (500/502/503/529) must route to context_overflow + compression, not a
+        blind server_error/overloaded retry. Covers all four branches the code
+        touches (the original PR only asserted 500 and 503)."""
+        e = MockAPIError(
+            "Context size has been exceeded.",
+            status_code=status_code,
+            body={"error": {"code": status_code, "message": "Context size has been exceeded.", "type": "server_error"}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+        assert result.retryable is True
+
+    def test_500_plain_server_error_not_compressed(self):
+        """A genuine 500 crash without overflow wording must NOT be swallowed
+        into compression — it stays a retryable server_error."""
+        e = MockAPIError("Internal Server Error", status_code=500)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.server_error
+        assert result.should_compress is False
+
+    def test_503_plain_overloaded_not_compressed(self):
+        """A genuine 503 overload without overflow wording stays overloaded."""
+        e = MockAPIError("Service Unavailable", status_code=503)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.overloaded
+        assert result.should_compress is False
+
     # ── Model not found ──
 
     def test_404_model_not_found(self):
@@ -1295,6 +1333,25 @@ class TestAdversarialEdgeCases:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.billing
 
+    def test_400_anthropic_extra_usage_exhausted(self):
+        """Anthropic returns 400 with 'out of extra usage' when the user's
+        extra-usage allowance is depleted. Must classify as billing so the
+        fallback chain engages (with credential rotation) instead of the
+        generic format_error path, which never rotates. (#11736, #13170)"""
+        e = MockAPIError(
+            "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
+            status_code=400,
+            body={"error": {
+                "type": "invalid_request_error",
+                "message": "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
+            }},
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.billing
+        assert result.should_fallback is True
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+
     def test_200_with_error_body(self):
         """200 status with error in body — should be unknown, not crash."""
         class WeirdSuccess(Exception):
@@ -1824,3 +1881,77 @@ class TestOpenRouterUpstreamRateLimit:
         # Overload disambiguation runs first; the outer message is the overload
         # phrase, so this is an overload, not an upstream rate-limit.
         assert result.reason == FailoverReason.overloaded
+
+
+# ── HTTP 408 request timeout ────────────────────────────────────────────
+
+class Test408RequestTimeout:
+    """HTTP 408 must never fall through to the non-retryable 'other 4xx'
+    bucket (that abort persists an empty assistant turn — the "disappeared
+    conversation" / blank-bubble symptom). ALL 408s are classified as a transient
+    ``timeout``: retryable, and explicitly NOT should_compress.
+
+    Design decision (field 2026-07-02): even the GitHub Copilot
+    ``user_request_timeout`` / "Timed out reading request body ... use a
+    smaller request size" case is a plain retry, NOT auto-compression. Real
+    data showed the 408 is probabilistic jitter well below the hard prompt
+    ceiling — the same ~785k-token request that 408'd once succeeded on the
+    next attempt at ~786k — so retrying the same body usually works, and
+    auto-compaction would silently delete conversation history for a merely
+    transient timeout. Genuine over-window prompts surface as 413 /
+    context_overflow (their own compression path); users compact 408-prone
+    long sessions deliberately via ``/compress``.
+    """
+
+    def test_copilot_oversized_body_408_retries_as_timeout_not_compress(self):
+        # The exact shape GitHub Copilot returns on a long session. It must
+        # retry (timeout), and must NOT auto-compress.
+        e = MockAPIError(
+            "Error code: 408 - {'error': {'message': 'Timed out reading "
+            "request body. Try again, or use a smaller request size.', "
+            "'code': 'user_request_timeout'}}",
+            status_code=408,
+            body={"error": {"message": "Timed out reading request body. "
+                            "Try again, or use a smaller request size.",
+                            "code": "user_request_timeout"}},
+        )
+        result = classify_api_error(e, provider="copilot", model="claude-opus-4.8")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+        assert result.should_compress is False
+
+    def test_408_never_auto_compresses(self):
+        # Hard guard on the user's explicit preference: a 408 must NEVER
+        # trigger auto-compaction (which would delete history unprompted).
+        # This must FAIL if anyone re-routes 408 to payload_too_large.
+        for msg, body in [
+            ("Timed out reading request body. Use a smaller request size.", {}),
+            ("Request timed out.", {"error": {"code": "user_request_timeout"}}),
+            ("Request Timeout", {}),
+        ]:
+            e = MockAPIError(msg, status_code=408, body=body)
+            result = classify_api_error(e, provider="copilot", model="claude-opus-4.8")
+            assert result.should_compress is False, msg
+            assert result.reason != FailoverReason.payload_too_large, msg
+
+    def test_oversized_body_408_is_not_non_retryable_format_error(self):
+        # Falsification guard: if the 408 branch is removed, this 408 would
+        # be classified as a non-retryable format_error and the turn would
+        # abort into a blank bubble. This assertion must FAIL on buggy code.
+        e = MockAPIError(
+            "Timed out reading request body. Try again, or use a smaller "
+            "request size.",
+            status_code=408,
+        )
+        result = classify_api_error(e, provider="copilot", model="claude-opus-4.8")
+        assert result.retryable is True
+        assert result.reason != FailoverReason.format_error
+
+    def test_plain_408_is_transient_timeout(self):
+        # A generic gateway/request timeout must retry as a transport timeout.
+        e = MockAPIError("Request Timeout", status_code=408)
+        result = classify_api_error(e, provider="openai", model="gpt-5.5")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+        assert result.should_compress is False
+

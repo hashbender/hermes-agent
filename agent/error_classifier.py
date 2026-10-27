@@ -110,6 +110,7 @@ _BILLING_PATTERNS = [
     "exceeded your current quota",
     "account is deactivated",
     "plan does not include",
+    "out of extra usage",  # Anthropic OAuth Pro/Max overage bucket depleted (HTTP 400)
     "out of funds",
     "run out of funds",
     "balance_depleted",
@@ -898,6 +899,41 @@ def _classify_by_status(
             should_compress=True,
         )
 
+    if status_code == 408:
+        # HTTP 408 is a timeout, NOT a permanent client error. Without this
+        # branch it falls through to the generic "other 4xx -> non-retryable
+        # format_error" catch-all at the bottom of this function, which aborts
+        # the turn and persists an empty assistant bubble (the "disappeared
+        # conversation" / blank-turn symptom).
+        #
+        # We classify ALL 408s as a transient ``timeout`` (retryable, NO
+        # compression). This deliberately covers the GitHub Copilot
+        # ``user_request_timeout`` / "Timed out reading request body ... use a
+        # smaller request size" case too, even though that one is nominally
+        # about request SIZE. Field evidence (long copilot/opus-4.8 session,
+        # 2026-07-02): the 408 is PROBABILISTIC/jitter in a wide band well
+        # BELOW the hard prompt ceiling — the same ~785k-token request that
+        # 408'd once succeeded on the very next attempt at ~786k. The edge
+        # occasionally reads the large body too slowly and times out; it is
+        # not a hard "body exceeds the limit" rejection until the prompt
+        # actually approaches the ceiling (~936k for opus-4.8). So the correct,
+        # least-destructive recovery is a plain retry (the SAME body usually
+        # succeeds on the next attempt), NOT auto-compression.
+        #
+        # We intentionally do NOT set should_compress here: auto-compaction on
+        # a 408 would silently delete conversation history the moment a request
+        # merely jitters, which is a heavy, surprising, user-visible side
+        # effect for a transient timeout. Genuine "prompt too large for the
+        # window" is a SEPARATE signal (413 / context_overflow) and stays on
+        # its own compression path. When retries here are exhausted the loop
+        # falls back to another provider (transport-failure eager-fallback
+        # after 2 attempts); the user can always compact deliberately with
+        # ``/compress`` if a long session keeps timing out.
+        return result_fn(
+            FailoverReason.timeout,
+            retryable=True,
+        )
+
     if status_code == 429:
         # Already checked long_context_tier above. Some providers (notably
         # Z.AI / Zhipu) reuse HTTP 429 for server-wide overload — same status
@@ -963,9 +999,31 @@ def _classify_by_status(
                 retryable=False,
                 should_fallback=True,
             )
+        # Some local inference servers (notably llama.cpp / llama-server)
+        # report context overflow with an HTTP 500 instead of the standard
+        # 400/413. The request-validation guard above already ran, so any
+        # remaining explicit context-overflow signal routes into the
+        # compression-and-retry path (mirroring _classify_400) instead of
+        # blind server_error retries that exhaust and drop the turn.
+        if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
+            return result_fn(
+                FailoverReason.context_overflow,
+                retryable=True,
+                should_compress=True,
+            )
         return result_fn(FailoverReason.server_error, retryable=True)
 
     if status_code in {503, 529}:
+        # Same overflow-as-5xx variant (server busy / model-load OOM, or a
+        # Cloudflare/Tailscale hop relabeling the status). Route explicit
+        # overflow bodies into compression; otherwise treat as transient
+        # overload and retry.
+        if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
+            return result_fn(
+                FailoverReason.context_overflow,
+                retryable=True,
+                should_compress=True,
+            )
         return result_fn(FailoverReason.overloaded, retryable=True)
 
     # Other 4xx — non-retryable
